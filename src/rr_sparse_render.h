@@ -84,6 +84,12 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                            "RR current/native-history bindings or layouts unproven; RR blocked");
             return false;
         }
+#ifdef RR_FILTER_DIAGNOSTIC
+        if (LiveRR().NativeFiltering()) {
+            LiveRR().NativeTemporalObserved(native.Get(), output);
+            return false; // Preserve native accumulation; no snapshot or replacement.
+        }
+#endif
         rrinternal::Scope ignoreCopies;
         rrcompute::Tracker::Internal ignoreState;
         if (!SparsePool().Snapshot(native.Get(), input, output))
@@ -95,12 +101,37 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         rrbypass::Fail(device, "RR spatial input proof failed; RR blocked");
         return false;
     }
+#ifdef RR_FILTER_DIAGNOSTIC
+    const bool native_filter = LiveRR().NativeFiltering();
+    if (native_filter ? !LiveRR().NativeSpatialCandidate(native.Get(), input)
+                      : !SparsePool().Pending(native.Get(), input))
+        return false;
+#else
     if (!SparsePool().Pending(native.Get(), input))
         return false;
+#endif
     if (!SparsePair(list, native.Get(), effective, true, 0, output, true)) {
         rrbypass::Fail(device, "RR first spatial output proof failed; RR blocked");
         return false;
     }
+#ifdef RR_FILTER_DIAGNOSTIC
+    if (native_filter) {
+        // The normal dispatch wrapper restored the original native pipeline.
+        // Return false so this and all later spatial passes execute unchanged.
+        if (z != 1 || x != (output.r[0]->GetDesc().Width + 15) / 16 ||
+            y != (output.r[0]->GetDesc().Height + 15) / 16)
+            return false;
+        for (unsigned i = 0; i < 2; ++i) {
+            if (!rrsparsecopy::SameShape(input.r[i].Get(), output.r[i].Get()))
+                return false;
+            for (const auto &source : input.r)
+                if (source == output.r[i]) return false;
+        }
+        const auto health = rrbypass::Health(device);
+        LiveRR().NativeSpatialObserved(native.Get(), input, UINT64(device), health.revision);
+        return false;
+    }
+#endif
     auto scale = rrbypass::Scale(device, binding.pipeline);
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;

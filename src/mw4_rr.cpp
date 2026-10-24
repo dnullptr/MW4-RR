@@ -34,6 +34,13 @@ static rrlive::Controller &LiveRR() {
             return h.temporal && h.spatial && h.sampling && h.corrected && !h.unreplaced &&
                    !h.failed && h.revision == revision;
         };
+#ifdef RR_FILTER_DIAGNOSTIC
+        v->native_lighting_valid = [](UINT64 device, UINT64 revision) {
+            const auto h = rrbypass::Health((reshade::api::device *)device);
+            return h.temporal && h.spatial && h.sampling && !h.unreplaced &&
+                   !h.failed && h.revision == revision;
+        };
+#endif
         return v;
     }();
     return *p;

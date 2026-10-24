@@ -1,4 +1,5 @@
 #define NOMINMAX
+#define RR_FILTER_DIAGNOSTIC
 #include "../src/rr_live.h"
 #include <cassert>
 
@@ -60,6 +61,66 @@ static NVSDK_NGX_Result NVSDK_CONV DestroyParameters(NVSDK_NGX_Parameter *) {
 namespace rrlive {
 struct ControllerCpuTest {
     static void Run() {
+        // Diagnostic route changes must retire existing work, then reset once.
+        Controller diagnostic;
+        diagnostic.SetEnabled(true);
+        assert(!diagnostic.NativeFilterStatus().effective);
+        auto &ds = diagnostic.slots[0];
+        ds.busy = true;
+        ds.pre_live = true;
+        diagnostic.RequestNativeFilter(true);
+        assert(diagnostic.NativeFilterStatus().desired);
+        assert(diagnostic.NativeFilterStatus().pending);
+        assert(!diagnostic.Reconfigure());
+        assert(!diagnostic.NativeFilterStatus().effective);
+        ds.pre_live = false;
+        assert(diagnostic.Reconfigure());
+        assert(diagnostic.NativeFilterStatus().effective);
+        assert(!diagnostic.NativeFilterStatus().pending);
+        assert(diagnostic.policy.Next(10, diagnostic.generation, false));
+        assert(!diagnostic.policy.Next(11, diagnostic.generation, false));
+        diagnostic.RequestNativeFilter(true);
+        assert(!diagnostic.NeedsReconfigure()); // Repeated UI request is inert.
+        diagnostic.RequestNativeFilter(false);
+        assert(diagnostic.Reconfigure());
+        assert(!diagnostic.NativeFilterStatus().effective);
+        assert(diagnostic.policy.Next(12, diagnostic.generation, false));
+        diagnostic.RestartFilterComparison();
+        assert(diagnostic.Reconfigure());
+        assert(diagnostic.policy.Next(13, diagnostic.generation, false));
+        assert(!diagnostic.policy.Next(14, diagnostic.generation, false));
+
+        // Native filtering is never accepted through the raw-light callback.
+        Controller admission;
+        admission.lighting_valid = [](UINT64, UINT64) { return true; };
+        admission.native_lighting_valid = [](UINT64, UINT64) { return true; };
+        auto &as = admission.slots[0];
+        as.raw_corrected = true;
+        assert(admission.LightingValid(as));
+        admission.native_filter_effective = true;
+        assert(!admission.LightingValid(as));
+        as.raw_corrected = false;
+        as.native_filtered = true;
+        assert(as.native_filter_chain.Temporal({11, 22}));
+        assert(as.native_filter_chain.Spatial({11, 22}));
+        assert(admission.LightingValid(as));
+        admission.native_lighting_valid = [](UINT64, UINT64) { return false; };
+        assert(!admission.LightingValid(as));
+        admission.native_filter_effective = false;
+        assert(!admission.LightingValid(as));
+
+        rrfilter::Chain chain;
+        assert(!chain.Spatial({11, 22})); // Spatial without temporal is rejected.
+        rrfilter::Chain null_chain, alias_chain;
+        assert(!null_chain.Temporal({0, 22}));
+        assert(!null_chain.Temporal({11, 22})); // Failed chain stays rejected.
+        assert(!alias_chain.Temporal({11, 11}));
+        assert(chain.Temporal({11, 22}));
+        assert(!chain.Spatial({11, 23}));
+        assert(chain.Spatial({11, 22}));
+        assert(!chain.Spatial({11, 22})); // Only the first spatial use is admitted.
+        assert(!chain.Temporal({11, 22})); // Duplicate temporal invalidates proof.
+        assert(!chain.Accepted());
         // A rejected allocation after preset retirement must wait, then recover.
         // Ready guide slots must remain usable while another slot waits.
         bool deferred = false;

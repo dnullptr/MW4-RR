@@ -12,6 +12,9 @@
 #include "rr_sr_eligibility.h"
 #include <mutex>
 #include <deque>
+#ifdef RR_FILTER_DIAGNOSTIC
+#include "rr_filter_diagnostic.h"
+#endif
 namespace rrlive {
 // Private resources remain retained until native recordings retire and every
 // submitted producer and consumer completes on the tracked fence.
@@ -34,6 +37,11 @@ class Controller {
         UINT frame = UINT_MAX, viewport = UINT_MAX, generation{}, serial{};
         bool raw_corrected{}, native_sampling{}, pre_submitted{}, gate_recorded{}, replaced_sr{};
         UINT64 lighting_device{}, lighting_revision{};
+#ifdef RR_FILTER_DIAGNOSTIC
+        bool native_filtered{};
+        rrfilter::Chain native_filter_chain;
+        std::array<ComPtr<ID3D12Resource>, 2> native_filter_history;
+#endif
         UINT64 fence_value{};
         rrtrace::CameraInfo camera;
         std::array<float, 16> view{}, projection{};
@@ -64,6 +72,9 @@ class Controller {
     rrstatus::Telemetry status;
     rrpreset::Selection preset;
     bool layout_pending{};
+#ifdef RR_FILTER_DIAGNOSTIC
+    bool native_filter_desired{}, native_filter_effective{};
+#endif
     rreval::Options observed_options;
     HistoryPolicy policy;
     bool transparency_enabled{}, transparency_failed{};
@@ -222,6 +233,11 @@ class Controller {
         policy.Reject();
         preset.Retired();
         layout_pending = false;
+#ifdef RR_FILTER_DIAGNOSTIC
+        native_filter_effective = native_filter_desired;
+        Log(native_filter_effective ? "Diagnostic: native lighting filtering applied; RR history restarted"
+                                    : "Diagnostic: raw lighting applied; RR history restarted");
+#endif
         return true;
     }
     bool Key(const rreval::Options &o, HMODULE mod, UINT64 epoch, ID3D12Device *d, UINT viewport) {
@@ -430,6 +446,65 @@ class Controller {
     }
     void (*logger)(const char *){};
     bool (*lighting_valid)(UINT64, UINT64){};
+#ifdef RR_FILTER_DIAGNOSTIC
+    bool (*native_lighting_valid)(UINT64, UINT64){};
+    void RequestNativeFilter(bool value) {
+        std::lock_guard lock(mutex);
+        if (native_filter_desired == value) return;
+        native_filter_desired = value;
+        QueueReconfigure();
+    }
+    void RestartFilterComparison() {
+        std::lock_guard lock(mutex);
+        QueueReconfigure();
+    }
+    rrfilter::Status NativeFilterStatus() {
+        std::lock_guard lock(mutex);
+        return {native_filter_desired, native_filter_effective, NeedsReconfigure()};
+    }
+    bool NativeFiltering() {
+        std::lock_guard lock(mutex);
+        return native_filter_effective;
+    }
+    void NativeTemporalObserved(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &output) {
+        std::lock_guard lock(mutex);
+        if (!native_filter_effective) return;
+        for (auto &s : slots) if (RawSlot(s, cl)) {
+            s.native_filtered = false;
+            if (s.native_filter_chain.Temporal({UINT64(output.r[0].Get()), UINT64(output.r[1].Get())}))
+                s.native_filter_history = output.r;
+        }
+    }
+    bool NativeSpatialCandidate(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &input) {
+        std::lock_guard lock(mutex);
+        if (!native_filter_effective) return false;
+        for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling &&
+            s.native_filter_chain.Matches({UINT64(input.r[0].Get()), UINT64(input.r[1].Get())}))
+            return true;
+        return false;
+    }
+    void NativeSpatialObserved(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &input,
+                               UINT64 device, UINT64 revision) {
+        std::lock_guard lock(mutex);
+        if (!native_filter_effective) return;
+        for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling &&
+            s.native_filter_chain.Spatial({UINT64(input.r[0].Get()), UINT64(input.r[1].Get())})) {
+            s.native_filtered = true;
+            s.lighting_device = device;
+            s.lighting_revision = revision;
+        }
+    }
+#endif
+  private:
+    bool LightingValid(const Slot &s) const {
+#ifdef RR_FILTER_DIAGNOSTIC
+        if (native_filter_effective)
+            return !s.raw_corrected && s.native_filtered && s.native_filter_chain.Accepted() &&
+                   native_lighting_valid && native_lighting_valid(s.lighting_device, s.lighting_revision);
+#endif
+        return s.raw_corrected && lighting_valid && lighting_valid(s.lighting_device, s.lighting_revision);
+    }
+  public:
 
     rrstatus::Snapshot Status() {
         std::lock_guard lock(mutex);
@@ -691,9 +766,8 @@ class Controller {
             return;
         }
         try {
-            Require(safe && s->raw_corrected && lighting_valid &&
-                        lighting_valid(s->lighting_device, s->lighting_revision),
-                    "RR SR rejected: raw lighting correction or pipeline revision unproven");
+            Require(safe && LightingValid(*s),
+                    "RR SR rejected: lighting route or pipeline revision unproven");
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
             Require(bool(cl), "live native SR list missing");
             s->options = actual;
@@ -777,8 +851,7 @@ class Controller {
             return false;
         try {
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
-            Require(s->raw_corrected && lighting_valid &&
-                        lighting_valid(s->lighting_device, s->lighting_revision) && safe &&
+            Require(LightingValid(*s) && safe &&
                         NVSDK_NGX_SUCCEED(result) && cl.Get() == s->sr.Get() && scope.valid &&
                         scope.feature == sl::kFeatureDLSS && mod,
                     "live original SR failed or scope changed");
@@ -1044,8 +1117,7 @@ class Controller {
                 s.sealed = true;
                 const bool baseline = queue_ready && a >= 0 && b >= a && !s.pre_submitted &&
                                       !failed && s.gate_recorded && s.inference_ok &&
-                                      s.raw_corrected && lighting_valid &&
-                                      lighting_valid(s.lighting_device, s.lighting_revision);
+                                      LightingValid(s);
                 const bool sss_accept =
                     s.sss_used && s.sss.written &&
                     rrsss::Admit(a, c, b, s.pre_submitted, s.sss.submitted, baseline);

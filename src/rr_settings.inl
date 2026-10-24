@@ -84,6 +84,22 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         ApplyEnabled();
         SaveToggles();
     }
+#ifdef RR_FILTER_DIAGNOSTIC
+    ImGui::Separator();
+    ImGui::TextUnformatted("Development diagnostic: lighting filtering");
+    auto filter = LiveRR().NativeFilterStatus();
+    bool native_filter = filter.desired;
+    if (ImGui::Checkbox("Retain native lighting filtering (comparison only)", &native_filter))
+        LiveRR().RequestNativeFilter(native_filter);
+    if (ImGui::Button("Restart comparison history"))
+        LiveRR().RestartFilterComparison();
+    filter = LiveRR().NativeFilterStatus();
+    ImGui::Text("Applied lighting: %s", filter.effective ? "Native filtered" : "Raw (normal RR path)");
+    if (filter.pending)
+        ImGui::TextUnformatted("Waiting for pending frames to retire...");
+    ImGui::TextWrapped("Session-only comparison. Switching paths restarts RR history. Native filtering may soften the image.");
+    ImGui::Separator();
+#endif
     auto preset = LiveRR().PresetStatus();
     int selected = 3;
     for (int i = 0; i < 4; ++i)
