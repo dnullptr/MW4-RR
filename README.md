@@ -29,7 +29,7 @@ This is a game-specific rendering integration, not a screen-space ReShade effect
 
 The addon observes relevant Direct3D 12 and NGX calls, identifies the campaign's lighting passes, prepares RR inputs, and records a private RR evaluation. Raw lighting is weighted using the game's native variable ray-sampling probabilities. Native temporal lighting history is retained for the game's own consumers.
 
-The Transparency Guide uses an image taken before transparency composition. The Subsurface Scattering Guide is generated through an instrumented variant of a recognized game shader. Guide use depends on matching resources, frame/view identity, and GPU submission order; an enabled guide can still be unavailable for a particular frame.
+The Transparency Guide uses an image taken before transparency composition. The Subsurface Scattering Guide is generated through an instrumented variant of a recognized game shader. That variant is prepared in memory from the game-supplied shader when its pipeline loads, validated against the expected result, and reused for the session. Game shader bytecode is not embedded in the addon. Guide use depends on matching resources, frame/view identity, and GPU submission order; an enabled guide can still be unavailable for a particular frame.
 
 Eligible evaluations replace native DLSS Super Resolution. When replacement is unavailable, the native call is retained and RR may run afterward if its own requirements are met. A replacement rejected during GPU execution uses a current-frame spatial upscale, which can appear softer or noisier. Native Super Resolution history is reset when native evaluations resume after being skipped. The ReShade panel reports the completed reconstruction path.
 
@@ -77,24 +77,15 @@ Required tools:
 - NVIDIA DLSS SDK headers exposing NGX API 1.5.0, supplied separately.
 - DirectX Shader Compiler 1.8.2505.1, including its x64 tools and DLLs.
 
-Dependency snapshots are recorded in `external/DEPENDENCIES.json`. Public dependency headers/source and their notices are included under `external/`; the NGX SDK and native shader inputs are separate requirements.
-
-The build requires these exact native shader inputs, supplied privately outside the repository:
-
-| File | Bytes | SHA256 |
-| --- | ---: | --- |
-| `d63e707761558424.cso` | 11680 | `5dc4063eab5a84e6aa834f8912e623fc31d4d59fc50296363f8812007107270d` |
-| `9ee7cea57f70d741.cso` | 56388 | `3632196273fba431d92b8ae659cb9dac09444c43c6244205ba4b4fefab02e591` |
-
-These are copyrighted game inputs, not project-owned source. The preparation tool validates their bytes and hashes before applying transformations; it does not extract or download them. The public source package alone is therefore insufficient for a complete rebuild.
+Dependency snapshots are recorded in `external/DEPENDENCIES.json`. Public dependency headers/source and their notices are included under `external/`; the NGX SDK and DXC tools are separate requirements. Building the addon does not require a game installation or captured game shaders.
 
 From the repository root:
 
 ```bat
-build.cmd "path\to\NGX\include" "path\to\dxc\bin\x64" "path\to\private-native-shaders"
+build.cmd "path\to\NGX\include" "path\to\dxc\bin\x64"
 ```
 
-Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers and native-derived bytecode remain build artifacts.
+Outputs are written under `build/`. The companion DLL is the unmodified x64 DXC `dxcompiler.dll`, renamed `mw4-rr-dxcompiler.dll`. Generated shader headers contain only the project-owned HLSL compiled by the build. Runtime-generated game shader variants remain in memory and are not written to disk.
 
 ## Tests and validation
 
@@ -134,7 +125,7 @@ Support continued development and testing through [Buy Me a Coffee](https://buym
 
 ## License and acknowledgments
 
-Project code is licensed under the **GNU General Public License, version 3 only (GPL-3.0-only)**. Copyright (c) 2026 Fever308. You may use, modify, and redistribute covered code, including commercially, under those terms. Distribution of covered binaries must provide the Corresponding Source as required by GPLv3. See [LICENSE](LICENSE) for the unmodified license text. Third-party components and inherited portions retain their notices; see [THIRD_PARTY.md](THIRD_PARTY.md). The project license does not grant rights over game assets, native-derived shader portions, or NVIDIA model/runtime DLLs.
+Project code is licensed under the **GNU General Public License, version 3 only (GPL-3.0-only)**. Copyright (c) 2026 Fever308. You may use, modify, and redistribute covered code, including commercially, under those terms. Distribution of covered binaries must provide the Corresponding Source as required by GPLv3. See [LICENSE](LICENSE) for the unmodified license text. Third-party components and inherited portions retain their notices; see [THIRD_PARTY.md](THIRD_PARTY.md). The project license does not grant rights over game assets or NVIDIA model/runtime DLLs.
 
 Uses ReShade, Dear ImGui, MinHook, NVIDIA SDK interfaces, and DirectX Shader Compiler. Inherited helper portions retain attribution to Jean-Laurent ROUZIES / DLSS5-Feeder and NIGos / dlss5-dx11-bridge.
 

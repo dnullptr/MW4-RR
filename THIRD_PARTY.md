@@ -11,11 +11,11 @@
 
 The DXC release's license mapping assigns `LICENSE-MIT.txt` to `d3d12shader.h` and `LICENSE-LLVM.txt` to its other files. The included licenses preserve the vendor's full notices. `dxil.dll` and `dxc.exe` are build tools and are not required beside the addon. Runtime reflection uses only the renamed `dxcompiler.dll`, SHA256 `5888d3e590f5bfd8743484e7f31313996734adec5741506271a5c6368cbe8ba9`.
 
-The native game shader files required by the build are user-supplied copyrighted inputs, not original project source. The preparation tool emits modified native-derived shader bytecode into the ignored build directory. The project's license does not grant rights over those inputs or native-derived portions; any redistribution must independently respect the game's applicable terms. No captured game shader or generated native bytecode is included in the source package.
+The addon does not distribute native game shader bytecode. It recognizes a supported shader supplied by the running game and applies its guide transformation in memory. The generated variant is retained only for that session. The project license does not grant rights over game assets or the game-supplied shader.
 
 Inherited helper portions retain DLSS5-Feeder's MIT notice (Jean-Laurent ROUZIES) and its attribution to dlss5-dx11-bridge (NIGos). The project license does not override any third-party terms.
 
-The project uses GPL-3.0-only. Inherited portions and separately supplied components retain their notices and applicable terms; GPL does not grant additional rights over proprietary inputs or waive their distribution requirements.
+The project uses GPL-3.0-only. Inherited portions and separately supplied components retain their notices and applicable terms; GPL does not grant additional rights over separately supplied proprietary components.
 
 ## Inherited helper license notice
 

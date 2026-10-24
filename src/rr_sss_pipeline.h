@@ -10,7 +10,7 @@
 #include "rr_sss_pipeline_proof.h"
 #include "rr_sss_stencil_shader.h"
 #include "rr_sss_vertex_proof.h"
-#include "../build/sss-owned-shader/rr_sss.generated.h"
+#include "rr_sss_runtime_shader.h"
 namespace rrsss {
 // Borrowed nonchanged subobject payloads are valid only during init_pipeline.
 // Create the alternate synchronously; never save this patch for a later draw.
@@ -18,6 +18,7 @@ struct PipelinePatch {
     std::array<reshade::api::pipeline_subobject, 64> objects{};
     std::array<reshade::api::format, 4> formats{};
     reshade::api::shader_desc shader{};
+    std::shared_ptr<const std::vector<unsigned char>> prepared;
     reshade::api::blend_desc blend{};
     reshade::api::depth_stencil_desc inverse{};
     unsigned count{};
@@ -208,8 +209,11 @@ struct PipelinePatch {
             return false;
         }
         std::copy_n(source, n, objects.begin());
-        shader.code = RRSSSMrt;
-        shader.code_size = sizeof(RRSSSMrt);
+        prepared = RuntimeShader().Get(shader.code, shader.code_size, ReplayCompiler(), status);
+        if (!prepared)
+            return false;
+        shader.code = prepared->data();
+        shader.code_size = prepared->size();
         objects[pi].data = &shader;
         blend.blend_enable[1] = blend.logic_op_enable[1] = false;
         blend.render_target_write_mask[1] = 1;
@@ -259,12 +263,12 @@ struct PipelinePatch {
         }
         return true;
     }
-    static NativePipelineObservation Expected(const NativePipelineObservation &original,
-                                              bool helper) {
+    NativePipelineObservation Expected(const NativePipelineObservation &original,
+                                       bool helper) const {
         auto o = original;
         const void *code = helper ? static_cast<const void *>(RRSSSStencilPS)
-                                  : static_cast<const void *>(RRSSSMrt);
-        const size_t bytes = helper ? sizeof(RRSSSStencilPS) : sizeof(RRSSSMrt);
+                                  : static_cast<const void *>(prepared->data());
+        const size_t bytes = helper ? sizeof(RRSSSStencilPS) : prepared->size();
         o.shaders[1] = {bytes, true, PipelineProof::ByteHash(code, bytes)};
         o.cached_bytes = 0;
         o.cached_present = false;
@@ -330,7 +334,7 @@ class PipelineRegistry {
                 reinterpret_cast<ID3D12PipelineState *>(original.handle));
             PipelinePatch patch;
             if (!patch.Prepare(n, objects)) {
-                Report("SSS pipeline description unsupported");
+                Report(patch.status);
                 return;
             }
             auto native_device = fg::NativeObject<ID3D12Device>(
@@ -364,7 +368,7 @@ class PipelineRegistry {
             stencil.samples = observed.sample;
             auto create = [&](PipelinePatch &description, bool helper,
                               Microsoft::WRL::ComPtr<ID3D12PipelineState> &out) {
-                const auto expected = PipelinePatch::Expected(observed, helper);
+                const auto expected = description.Expected(observed, helper);
                 PipelineProof::QualityScope quality(native_device.Get(), expected);
                 reshade::api::pipeline made{};
                 if (!device->create_pipeline(layout, description.count, description.objects.data(),
