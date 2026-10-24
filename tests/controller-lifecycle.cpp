@@ -234,6 +234,58 @@ struct ControllerCpuTest {
         assert(!rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, true));
         assert(rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, false));
 
+        // Spatial-only keeps raw preparation, but requires an actual later native filter.
+        assert(rrfilter::Valid(rrfilter::Mode::SpatialRemaining));
+        assert(!rrfilter::Native(rrfilter::Mode::SpatialRemaining));
+        rrfilter::SpatialChain spatial;
+        assert(!spatial.Accepted());
+        assert(spatial.Seed({11,22}));
+        assert(!spatial.Accepted()); // A seed without a later filter is not enough.
+        assert(spatial.Observe({11,22}, {33,44}));
+        assert(spatial.Accepted());
+        assert(spatial.Observe({33,44}, {11,22})); // Native ping-pong is valid.
+        assert(!spatial.Observe({99,100}, {55,66}));
+        assert(!spatial.Accepted());
+        rrfilter::SpatialChain unseeded, duplicated, alias_spatial;
+        assert(!unseeded.Observe({11,22}, {33,44}));
+        assert(duplicated.Seed({11,22}));
+        assert(!duplicated.Seed({33,44}));
+        assert(!duplicated.Observe({11,22}, {33,44}));
+        assert(alias_spatial.Seed({11,22}));
+        assert(!alias_spatial.Observe({11,22}, {22,33}));
+        assert(!alias_spatial.Accepted());
+
+        Controller spatial_mode;
+        spatial_mode.SetEnabled(true);
+        auto &ss = spatial_mode.slots[0];
+        ss.generation = spatial_mode.generation;
+        ss.pre_live = ss.native_sampling = ss.raw_corrected = true;
+        spatial_mode.lighting_valid = [](UINT64,UINT64) { return true; };
+        assert(spatial_mode.RawSpatialPassthrough(nullptr));
+        assert(spatial_mode.RequestFilterMode(rrfilter::Mode::SpatialRemaining));
+        assert(!spatial_mode.Reconfigure());
+        assert(spatial_mode.NativeFilterStatus().effective == rrfilter::Mode::Raw);
+        ss.pre_live = false;
+        assert(spatial_mode.Reconfigure());
+        auto &fresh = spatial_mode.slots[0];
+        fresh.generation = spatial_mode.generation;
+        fresh.pre_live = fresh.native_sampling = fresh.raw_corrected = true;
+        assert(!spatial_mode.RawSpatialPassthrough(nullptr));
+        assert(!spatial_mode.LightingValid(fresh));
+        assert(fresh.spatial_only_chain.Seed({11,22}));
+        assert(!spatial_mode.LightingValid(fresh));
+        assert(fresh.spatial_only_chain.Observe({11,22}, {33,44}));
+        assert(spatial_mode.LightingValid(fresh));
+        fresh.raw_corrected = false;
+        assert(!spatial_mode.LightingValid(fresh));
+        fresh.raw_corrected = true;
+        fresh.spatial_only_chain.Invalidate();
+        assert(!spatial_mode.LightingValid(fresh));
+        fresh.pre_live = false;
+        spatial_mode.RestartFilterComparison();
+        assert(spatial_mode.Reconfigure());
+        assert(!spatial_mode.slots[0].spatial_only_chain.Accepted());
+
         // A rejected allocation after preset retirement must wait, then recover.
         // Ready guide slots must remain usable while another slot waits.
         bool deferred = false;

@@ -751,10 +751,11 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
             LiveRR().RawCorrected(native.Get(), UINT64(device), health.revision);
             return true;
         }
-        // Only later spatial passes in this successfully corrected recording use
-        // passthrough. Missing guides, proof failure and OFF all execute native.
+        // Only later spatial passes in a successfully corrected recording use
+        // passthrough, unless the diagnostic explicitly retains those filters.
+        // Missing guides, proof failure and OFF all execute native.
         if (b.shader == rrbypass::Spatial && !rrbypass::Health(device).failed &&
-            LiveRR().RawWasCorrected(native.Get()))
+            LiveRR().RawSpatialPassthrough(native.Get()))
             rrbypass::Bind(list, reshade::api::pipeline_stage::all_compute, {b.pipeline});
     } catch (...) {
         RestoreLightingPipeline(list);

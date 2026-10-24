@@ -3,9 +3,10 @@
 #include <cstdint>
 #include <d3d12.h>
 namespace rrfilter {
-enum class Mode { Raw, TemporalSpatial, TemporalOnly };
+enum class Mode { Raw, TemporalSpatial, TemporalOnly, SpatialRemaining };
 inline bool Valid(Mode value) {
-    return value == Mode::Raw || value == Mode::TemporalSpatial || value == Mode::TemporalOnly;
+    return value == Mode::Raw || value == Mode::TemporalSpatial || value == Mode::TemporalOnly ||
+           value == Mode::SpatialRemaining;
 }
 inline bool Native(Mode value) {
     return value == Mode::TemporalSpatial || value == Mode::TemporalOnly;
@@ -15,6 +16,7 @@ inline const char *Label(Mode value) {
     case Mode::Raw: return "Raw (normal RR path)";
     case Mode::TemporalSpatial: return "Native temporal + spatial";
     case Mode::TemporalOnly: return "Native temporal only";
+    case Mode::SpatialRemaining: return "Spatial only - remaining passes";
     default: return "Invalid";
     }
 }
@@ -57,6 +59,29 @@ public:
         return true;
     }
     bool Bypassed() const { return Accepted() && bypassed; }
+};
+// Seed is the weighted current-frame output, not the native temporal history.
+// An accepted result requires at least one later native spatial consumer.
+class SpatialChain {
+    std::array<uint64_t,2> next{};
+    bool seeded{}, filtered{}, invalid{};
+public:
+    void Invalidate() { invalid = true; }
+    bool Seed(std::array<uint64_t,2> pair) {
+        if (seeded || invalid || !pair[0] || !pair[1] || pair[0] == pair[1]) {
+            Invalidate(); return false;
+        }
+        seeded = true; next = pair; return true;
+    }
+    bool Observe(std::array<uint64_t,2> input, std::array<uint64_t,2> output) {
+        if (!seeded || invalid || input != next || !output[0] || !output[1] ||
+            output[0] == output[1] || output[0] == input[0] || output[0] == input[1] ||
+            output[1] == input[0] || output[1] == input[1]) {
+            Invalidate(); return false;
+        }
+        filtered = true; next = output; return true;
+    }
+    bool Accepted() const { return seeded && filtered && !invalid; }
 };
 // Pure CPU validation shared by the dispatch path and regression fixtures.
 struct Surface { uint64_t identity{}; D3D12_RESOURCE_DESC desc{}; D3D12_RESOURCE_STATES state{}; };

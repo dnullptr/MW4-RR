@@ -102,6 +102,22 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         return false;
     }
 #ifdef RR_FILTER_DIAGNOSTIC
+    // The first spatial pass is still replaced by current-frame preparation.
+    // In this diagnostic only the later passes run native, with exact linkage
+    // to that prepared output. No temporal history resource is overwritten.
+    if (LiveRR().SpatialOnlyFiltering() && LiveRR().RawWasCorrected(native.Get())) {
+        bool valid = SparsePair(list, native.Get(), effective, true, 0, output, true);
+        if (valid) {
+            std::array<rrfilter::Surface,2> source{}, destination{};
+            for (unsigned i = 0; i < 2; ++i) {
+                source[i] = {UINT64(input.r[i].Get()), input.r[i]->GetDesc(), input.state[i]};
+                destination[i] = {UINT64(output.r[i].Get()), output.r[i]->GetDesc(), output.state[i]};
+            }
+            valid = rrfilter::SpatialPassValid(source, destination, x, y, z, false);
+        }
+        LiveRR().ObserveSpatialOnly(native.Get(), input, output, valid);
+        return false; // Execute native filtering; never bind raw passthrough here.
+    }
     const bool native_filter = LiveRR().NativeFiltering();
     const bool native_first = native_filter && LiveRR().NativeSpatialCandidate(native.Get(), input);
     const std::array<UINT64,2> input_ids{UINT64(input.r[0].Get()), UINT64(input.r[1].Get())};
@@ -178,8 +194,12 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     const bool replaced = SparsePool().Apply(
         native.Get(), input, output, scale.Get(), (ID3D12PipelineState *)effective, x, y, z, &rates,
         cbvs.valid ? &cbvs : nullptr, cbvs.valid ? nullptr : &privateRestore);
-    if (replaced)
+    if (replaced) {
+#ifdef RR_FILTER_DIAGNOSTIC
+        LiveRR().SeedSpatialOnly(native.Get(), output);
+#endif
         rrbypass::Corrected(device);
+    }
     else
         rrbypass::Fail(
             device,

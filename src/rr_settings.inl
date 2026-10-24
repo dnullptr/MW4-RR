@@ -90,9 +90,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     auto filter = LiveRR().NativeFilterStatus();
     const char *filter_names[] = {rrfilter::Label(rrfilter::Mode::Raw),
                                  rrfilter::Label(rrfilter::Mode::TemporalSpatial),
-                                 rrfilter::Label(rrfilter::Mode::TemporalOnly)};
+                                 rrfilter::Label(rrfilter::Mode::TemporalOnly),
+                                 rrfilter::Label(rrfilter::Mode::SpatialRemaining)};
     int filter_choice = static_cast<int>(filter.desired);
-    if (ImGui::Combo("Lighting comparison", &filter_choice, filter_names, 3))
+    if (ImGui::Combo("Lighting comparison", &filter_choice, filter_names, 4))
         LiveRR().RequestFilterMode(static_cast<rrfilter::Mode>(filter_choice));
     if (ImGui::Button("Restart comparison history"))
         LiveRR().RestartFilterComparison();
@@ -100,7 +101,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::Text("Applied lighting: %s", rrfilter::Label(filter.effective));
     if (filter.pending)
         ImGui::TextUnformatted("Waiting for pending frames to retire...");
-    ImGui::TextWrapped("Session-only comparison. Switching paths restarts RR history. Temporal only keeps native lighting history and bypasses spatial filtering. Temporal + spatial is the previous checkbox-on mode.");
+    ImGui::TextWrapped("Session-only comparison. Switching paths restarts RR history. Temporal only keeps native lighting history and bypasses spatial filtering. Temporal + spatial is the previous checkbox-on mode. Spatial only keeps raw preparation in place of the first spatial pass, then runs the remaining native spatial passes; it is not the complete native spatial chain.");
     ImGui::Separator();
 #endif
     auto preset = LiveRR().PresetStatus();
