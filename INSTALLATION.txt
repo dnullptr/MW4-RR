@@ -26,12 +26,12 @@ REQUIREMENTS
 - The MW4 campaign with ray tracing enabled.
 - ReShade 6.8.0 with full add-on support. Other versions have not been
   verified. ReShade itself is not included.
-- A compatible NVIDIA Ray Reconstruction runtime, nvngx_dlssd.dll.
-  Use version 310.7.128.0; other versions have not been verified.
-  The NVIDIA runtime is NOT included. Compatibility with the stock game
-  runtime or other versions is unverified. If updating it, back up the
-  existing file and use a legally obtained compatible NVIDIA runtime in
-  the location used by your campaign installation.
+- A working NVIDIA Ray Reconstruction runtime (nvngx_dlssd.dll) loaded
+  by the game. Keep the existing DLL when installing this addon; you do
+  not need to replace it just to install the mod. NVIDIA's runtime is
+  not included in this download. Testing used version 310.7.128.0;
+  the addon does not enforce that exact version, and other versions
+  have not been verified.
 - Microsoft Visual C++ x64 runtime.
 
 This package is for the campaign. Multiplayer, DMZ, and COD HQ are not supported.

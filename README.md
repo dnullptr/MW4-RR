@@ -55,7 +55,7 @@ Resource ownership follows command-recording and fence lifetimes. Preset or reso
 - Windows x64 and an NVIDIA RTX GPU with working DLSS Ray Reconstruction support.
 - The campaign executable `sp26-cod.exe`, using Direct3D 12 and ray tracing.
 - ReShade 6.8.0 with full add-on support. The source targets ReShade API 20 and ImGui 1.92.5; other runtime versions are unverified.
-- A compatible `nvngx_dlssd.dll`, supplied separately. Version 310.7.128.0 is the integration baseline; stock and other versions are not verified.
+- A working NVIDIA Ray Reconstruction runtime (`nvngx_dlssd.dll`) loaded by the game. Keep the existing DLL when installing this addon; a separate replacement is not an installation requirement. Testing used version 310.7.128.0. The addon does not enforce that exact version, and other versions have not been verified.
 - Microsoft Visual C++ x64 runtime.
 
 The addon and its shader-reflection companion must be placed together beside the campaign executable:
