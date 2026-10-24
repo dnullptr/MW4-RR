@@ -64,31 +64,76 @@ struct ControllerCpuTest {
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);
-        assert(!diagnostic.NativeFilterStatus().effective);
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::Raw);
         auto &ds = diagnostic.slots[0];
         ds.busy = true;
         ds.pre_live = true;
-        diagnostic.RequestNativeFilter(true);
-        assert(diagnostic.NativeFilterStatus().desired);
+        diagnostic.RequestFilterMode(rrfilter::Mode::TemporalSpatial);
+        assert(diagnostic.NativeFilterStatus().desired == rrfilter::Mode::TemporalSpatial);
         assert(diagnostic.NativeFilterStatus().pending);
         assert(!diagnostic.Reconfigure());
-        assert(!diagnostic.NativeFilterStatus().effective);
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::Raw);
         ds.pre_live = false;
         assert(diagnostic.Reconfigure());
-        assert(diagnostic.NativeFilterStatus().effective);
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::TemporalSpatial);
         assert(!diagnostic.NativeFilterStatus().pending);
         assert(diagnostic.policy.Next(10, diagnostic.generation, false));
         assert(!diagnostic.policy.Next(11, diagnostic.generation, false));
-        diagnostic.RequestNativeFilter(true);
+        diagnostic.RequestFilterMode(rrfilter::Mode::TemporalSpatial);
         assert(!diagnostic.NeedsReconfigure()); // Repeated UI request is inert.
-        diagnostic.RequestNativeFilter(false);
+        diagnostic.RequestFilterMode(rrfilter::Mode::Raw);
         assert(diagnostic.Reconfigure());
-        assert(!diagnostic.NativeFilterStatus().effective);
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::Raw);
         assert(diagnostic.policy.Next(12, diagnostic.generation, false));
         diagnostic.RestartFilterComparison();
         assert(diagnostic.Reconfigure());
         assert(diagnostic.policy.Next(13, diagnostic.generation, false));
         assert(!diagnostic.policy.Next(14, diagnostic.generation, false));
+
+        // Temporal-only selection uses the same retirement/reset boundary.
+        assert(!diagnostic.RequestFilterMode(static_cast<rrfilter::Mode>(99)));
+        assert(!diagnostic.NeedsReconfigure());
+        diagnostic.slots[0].pre_live = true;
+        assert(diagnostic.RequestFilterMode(rrfilter::Mode::TemporalOnly));
+        assert(!diagnostic.Reconfigure());
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::Raw);
+        diagnostic.slots[0].pre_live = false;
+        assert(diagnostic.Reconfigure());
+        assert(diagnostic.NativeFilterStatus().effective == rrfilter::Mode::TemporalOnly);
+        assert(diagnostic.policy.Next(15, diagnostic.generation, false));
+        assert(!diagnostic.policy.Next(16, diagnostic.generation, false));
+        assert(diagnostic.RequestFilterMode(rrfilter::Mode::TemporalOnly));
+        assert(!diagnostic.NeedsReconfigure());
+
+        // Bypass is restricted to temporal-only and a proven current recording.
+        Controller bypass;
+        bypass.SetEnabled(true);
+        auto &bs = bypass.slots[0];
+        bs.generation = bypass.generation;
+        bs.pre_live = bs.native_sampling = true;
+        bypass.native_filter_effective = rrfilter::Mode::TemporalOnly;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        assert(bs.native_filter_chain.Temporal({11,22}));
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        assert(bs.native_filter_chain.Spatial({11,22}));
+        bs.native_filtered = true;
+        assert(bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bypass.native_filter_effective = rrfilter::Mode::TemporalSpatial;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bypass.native_filter_effective = rrfilter::Mode::Raw;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bypass.native_filter_effective = rrfilter::Mode::TemporalOnly;
+        bs.poisoned = true;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bs.poisoned = false;
+        bs.pending_sr = true;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bs.pending_sr = false;
+        bs.generation++;
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
+        bs.generation--;
+        assert(!bs.native_filter_chain.Temporal({11,22}));
+        assert(!bypass.NativeSpatialBypass(nullptr, {11,22}));
 
         // Native filtering is never accepted through the raw-light callback.
         Controller admission;
@@ -97,7 +142,7 @@ struct ControllerCpuTest {
         auto &as = admission.slots[0];
         as.raw_corrected = true;
         assert(admission.LightingValid(as));
-        admission.native_filter_effective = true;
+        admission.native_filter_effective = rrfilter::Mode::TemporalSpatial;
         assert(!admission.LightingValid(as));
         as.raw_corrected = false;
         as.native_filtered = true;
@@ -106,8 +151,27 @@ struct ControllerCpuTest {
         assert(admission.LightingValid(as));
         admission.native_lighting_valid = [](UINT64, UINT64) { return false; };
         assert(!admission.LightingValid(as));
-        admission.native_filter_effective = false;
+        admission.native_filter_effective = rrfilter::Mode::Raw;
         assert(!admission.LightingValid(as));
+
+        admission.native_filter_effective = rrfilter::Mode::TemporalOnly;
+        admission.native_lighting_valid = [](UINT64, UINT64) { return true; };
+        assert(!admission.LightingValid(as)); // Seeing the consumer alone is insufficient.
+        assert(as.native_filter_chain.Forward({11,22}, {33,44}));
+        assert(admission.LightingValid(as));
+        admission.SetEnabled(true);
+        as.generation = admission.generation;
+        as.pre_live = as.native_sampling = true;
+        assert(admission.NativeSpatialBypass(nullptr, {33,44}));
+        assert(!admission.NativeSpatialBypass(nullptr, {99,100}));
+        admission.RejectNativeSpatial(nullptr);
+        assert(!admission.LightingValid(as));
+        assert(!admission.NativeSpatialBypass(nullptr, {33,44}));
+        as.pre_live = false;
+        admission.RestartFilterComparison();
+        assert(admission.Reconfigure());
+        assert(!admission.slots[0].native_filter_chain.Accepted());
+        assert(!admission.slots[0].native_filtered);
 
         rrfilter::Chain chain;
         assert(!chain.Spatial({11, 22})); // Spatial without temporal is rejected.
@@ -121,6 +185,55 @@ struct ControllerCpuTest {
         assert(!chain.Spatial({11, 22})); // Only the first spatial use is admitted.
         assert(!chain.Temporal({11, 22})); // Duplicate temporal invalidates proof.
         assert(!chain.Accepted());
+        rrfilter::Chain passes;
+        assert(passes.Temporal({11,22}) && passes.Spatial({11,22}));
+        assert(!passes.Bypassed());
+        assert(passes.Next({11,22}));
+        assert(passes.Forward({11,22}, {33,44}));
+        assert(passes.Bypassed());
+        assert(!passes.Next({11,22}));
+        assert(!passes.Next({55,66}));
+        assert(passes.Forward({33,44}, {55,66}));
+        assert(passes.Next({55,66}));
+        assert(!passes.Forward({33,44}, {77,88})); // Reordering invalidates the slot.
+        assert(!passes.Accepted() && !passes.Bypassed());
+        rrfilter::Chain alias_pass;
+        assert(alias_pass.Temporal({11,22}) && alias_pass.Spatial({11,22}));
+        assert(!alias_pass.Forward({11,22}, {33,11}));
+        assert(!alias_pass.Accepted());
+        rrfilter::Chain other_recording;
+        assert(!other_recording.Next({55,66}));
+
+        using Surface = rrfilter::Surface;
+        D3D12_RESOURCE_DESC color{};
+        color.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        color.Width = 1280; color.Height = 720;
+        color.MipLevels = color.DepthOrArraySize = color.SampleDesc.Count = 1;
+        color.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+        auto weights = color; weights.Format = DXGI_FORMAT_R32_UINT;
+        std::array<Surface,2> input{{{11,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+                                    {22,weights,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE}}};
+        std::array<Surface,2> output{{{33,color,D3D12_RESOURCE_STATE_UNORDERED_ACCESS},
+                                     {44,weights,D3D12_RESOURCE_STATE_UNORDERED_ACCESS}}};
+        assert(rrfilter::SpatialPassValid(input, output, 80, 45, 1, true));
+        assert(!rrfilter::SpatialPassValid(input, output, 79, 45, 1, true));
+        assert(!rrfilter::SpatialPassValid(input, output, 80, 45, 2, true));
+        auto bad = output; bad[1].identity = 11;
+        assert(!rrfilter::SpatialPassValid(input, bad, 80, 45, 1, true));
+        bad = output; bad[0].desc.Width = 1279;
+        assert(!rrfilter::SpatialPassValid(input, bad, 80, 45, 1, true));
+        bad = output; bad[1].state = D3D12_RESOURCE_STATE_COMMON;
+        assert(!rrfilter::SpatialPassValid(input, bad, 80, 45, 1, true));
+        auto bad_input = input; bad_input[0].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        assert(!rrfilter::SpatialPassValid(bad_input, output, 80, 45, 1, true));
+        bad_input = input; bad_input[0].desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        bad = output; bad[0].desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        assert(!rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, true));
+        assert(rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, false));
+        bad_input[1].desc.Format = bad[1].desc.Format = DXGI_FORMAT_R32_FLOAT;
+        assert(!rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, true));
+        assert(rrfilter::SpatialPassValid(bad_input, bad, 80, 45, 1, false));
+
         // A rejected allocation after preset retirement must wait, then recover.
         // Ready guide slots must remain usable while another slot waits.
         bool deferred = false;

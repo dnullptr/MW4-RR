@@ -40,7 +40,7 @@ class Controller {
 #ifdef RR_FILTER_DIAGNOSTIC
         bool native_filtered{};
         rrfilter::Chain native_filter_chain;
-        std::array<ComPtr<ID3D12Resource>, 2> native_filter_history;
+        std::array<ComPtr<ID3D12Resource>, 2> native_filter_history, native_filter_next;
 #endif
         UINT64 fence_value{};
         rrtrace::CameraInfo camera;
@@ -73,7 +73,7 @@ class Controller {
     rrpreset::Selection preset;
     bool layout_pending{};
 #ifdef RR_FILTER_DIAGNOSTIC
-    bool native_filter_desired{}, native_filter_effective{};
+    rrfilter::Mode native_filter_desired{}, native_filter_effective{};
 #endif
     rreval::Options observed_options;
     HistoryPolicy policy;
@@ -235,8 +235,10 @@ class Controller {
         layout_pending = false;
 #ifdef RR_FILTER_DIAGNOSTIC
         native_filter_effective = native_filter_desired;
-        Log(native_filter_effective ? "Diagnostic: native lighting filtering applied; RR history restarted"
-                                    : "Diagnostic: raw lighting applied; RR history restarted");
+        char filter_log[160];
+        snprintf(filter_log, sizeof(filter_log), "Diagnostic: %s applied; RR history restarted",
+                 rrfilter::Label(native_filter_effective));
+        Log(filter_log);
 #endif
         return true;
     }
@@ -448,11 +450,14 @@ class Controller {
     bool (*lighting_valid)(UINT64, UINT64){};
 #ifdef RR_FILTER_DIAGNOSTIC
     bool (*native_lighting_valid)(UINT64, UINT64){};
-    void RequestNativeFilter(bool value) {
+    bool RequestFilterMode(rrfilter::Mode value) {
         std::lock_guard lock(mutex);
-        if (native_filter_desired == value) return;
-        native_filter_desired = value;
-        QueueReconfigure();
+        if (!rrfilter::Valid(value)) return false;
+        if (native_filter_desired != value) {
+            native_filter_desired = value;
+            QueueReconfigure();
+        }
+        return true;
     }
     void RestartFilterComparison() {
         std::lock_guard lock(mutex);
@@ -464,11 +469,11 @@ class Controller {
     }
     bool NativeFiltering() {
         std::lock_guard lock(mutex);
-        return native_filter_effective;
+        return rrfilter::Native(native_filter_effective);
     }
     void NativeTemporalObserved(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &output) {
         std::lock_guard lock(mutex);
-        if (!native_filter_effective) return;
+        if (!rrfilter::Native(native_filter_effective)) return;
         for (auto &s : slots) if (RawSlot(s, cl)) {
             s.native_filtered = false;
             if (s.native_filter_chain.Temporal({UINT64(output.r[0].Get()), UINT64(output.r[1].Get())}))
@@ -477,16 +482,46 @@ class Controller {
     }
     bool NativeSpatialCandidate(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &input) {
         std::lock_guard lock(mutex);
-        if (!native_filter_effective) return false;
+        if (!rrfilter::Native(native_filter_effective)) return false;
         for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling &&
             s.native_filter_chain.Matches({UINT64(input.r[0].Get()), UINT64(input.r[1].Get())}))
             return true;
         return false;
     }
+    // A proven first spatial consumer permits passthrough only in temporal-only mode.
+    // Never reuse this proof across recording, retirement, or feature boundaries.
+    bool NativeSpatialBypass(ID3D12GraphicsCommandList *cl, std::array<UINT64,2> input) {
+        std::lock_guard lock(mutex);
+        if (native_filter_effective != rrfilter::Mode::TemporalOnly) return false;
+        for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling &&
+            !s.raw_corrected && s.native_filtered && s.native_filter_chain.Next(input))
+            return true;
+        return false;
+    }
+    void RejectNativeSpatial(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        if (native_filter_effective != rrfilter::Mode::TemporalOnly) return;
+        for (auto &s : slots) if (RawSlot(s, cl) && s.native_filtered) {
+            s.native_filter_chain.Invalidate();
+            s.native_filtered = false;
+        }
+    }
+    bool AdvanceNativeSpatial(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &input,
+                              const rrsparsecopy::Pair &output) {
+        std::lock_guard lock(mutex);
+        if (native_filter_effective != rrfilter::Mode::TemporalOnly) return false;
+        for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling && s.native_filtered &&
+            s.native_filter_chain.Forward({UINT64(input.r[0].Get()), UINT64(input.r[1].Get())},
+                                          {UINT64(output.r[0].Get()), UINT64(output.r[1].Get())})) {
+            s.native_filter_next = output.r;
+            return true;
+        }
+        return false;
+    }
     void NativeSpatialObserved(ID3D12GraphicsCommandList *cl, const rrsparsecopy::Pair &input,
                                UINT64 device, UINT64 revision) {
         std::lock_guard lock(mutex);
-        if (!native_filter_effective) return;
+        if (!rrfilter::Native(native_filter_effective)) return;
         for (auto &s : slots) if (RawSlot(s, cl) && s.native_sampling &&
             s.native_filter_chain.Spatial({UINT64(input.r[0].Get()), UINT64(input.r[1].Get())})) {
             s.native_filtered = true;
@@ -498,8 +533,9 @@ class Controller {
   private:
     bool LightingValid(const Slot &s) const {
 #ifdef RR_FILTER_DIAGNOSTIC
-        if (native_filter_effective)
+        if (rrfilter::Native(native_filter_effective))
             return !s.raw_corrected && s.native_filtered && s.native_filter_chain.Accepted() &&
+                   (native_filter_effective != rrfilter::Mode::TemporalOnly || s.native_filter_chain.Bypassed()) &&
                    native_lighting_valid && native_lighting_valid(s.lighting_device, s.lighting_revision);
 #endif
         return s.raw_corrected && lighting_valid && lighting_valid(s.lighting_device, s.lighting_revision);
