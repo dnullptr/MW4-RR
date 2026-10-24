@@ -70,6 +70,7 @@ class Controller {
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
     bool sss_enabled{}, sss_failed{};
+    UINT64 sss_retry_after{};
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
@@ -83,6 +84,24 @@ class Controller {
             logger(s);
     }
 
+    template <class Prepare>
+    bool PrepareSssAllocation(UINT64 now, bool ready, Prepare prepare) {
+        // Preparation records no GPU commands. Retain partial allocations and
+        // retry them after budget pressure subsides; ready slots remain usable.
+        if (!ready && now < sss_retry_after)
+            return false;
+        try {
+            prepare();
+            if (!ready)
+                sss_retry_after = 0;
+            return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            if (!sss_retry_after)
+                Log("Subsurface Scattering guide waiting for GPU memory; allocation will retry");
+            sss_retry_after = now + 1000;
+            return false;
+        }
+    }
     bool Complete(const Slot &s) const {
         if (s.poisoned)
             return false;
@@ -364,7 +383,10 @@ class Controller {
             Check(cl->GetDevice(IID_PPV_ARGS(&d)), "SSS producer device missing");
             Require(fg::SameNativeObject(d.Get(), pipelines.device.Get()),
                     "SSS producer device mismatch");
-            s.gpu.sss.Prepare(s.gpu, pipelines, budget, stencil.samples);
+            if (!PrepareSssAllocation(GetTickCount64(), s.gpu.sss.ready, [&] {
+                    s.gpu.sss.Prepare(s.gpu, pipelines, budget, stencil.samples);
+                }))
+                return false;
             if (early) {
                 s.busy = true;
                 s.awaiting_prepass = true;

@@ -137,9 +137,9 @@ struct Pipelines {
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
-        Check(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e),
+        rrprivate::CheckAllocation(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e),
               "live root serialization failed");
-        Check(device->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(),
+        rrprivate::CheckAllocation(device->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(),
                                           IID_PPV_ARGS(&r)),
               "live root creation failed");
     }
@@ -164,7 +164,7 @@ struct Pipelines {
         D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
         d.pRootSignature = r;
         d.CS = {code, bytes};
-        Check(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p)),
+        rrprivate::CheckAllocation(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p)),
               "live pipeline creation failed");
     }
 };
@@ -232,12 +232,12 @@ struct GpuFrame {
         Require(info.SizeInBytes && info.SizeInBytes <= b.limit &&
                     b.bytes <= b.limit - info.SizeInBytes,
                 "live frame-pool memory reserve exceeded");
-        Require(b.AdmitAllocation(p.device.Get(), info.SizeInBytes, type),
-                "live allocation exceeds current device memory budget or query unavailable");
+        if (!b.AdmitAllocation(p.device.Get(), info.SizeInBytes, type))
+            throw rrprivate::AllocationDeferred();
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
         ComPtr<ID3D12Resource> r;
-        Check(p.device->CreateCommittedResource(
+        rrprivate::CheckAllocation(p.device->CreateCommittedResource(
                   &hp, D3D12_HEAP_FLAG_NONE, &d,
                   type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
                   : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
