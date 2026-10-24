@@ -1,0 +1,45 @@
+#include "../src/rr_spatial_fallback.h"
+// Private full-frame presentation gate. Persistent state is initialized once
+// outside replayable game recordings. A replayed reset must never clear it.
+cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Padding;}
+Texture2D<uint> Status:register(t0);
+Texture2D<float4> Reconstructed:register(t1);
+Texture2D<float4> CurrentColor:register(t2);
+RWTexture2D<float4> GameOutput:register(u0);
+RWByteAddressBuffer Stats:register(u1); // bad frame, copied frame
+RWByteAddressBuffer History:register(u2); // blocked history, latest serial
+[numthreads(1,1,1)]void BeginFrame(uint3 id:SV_DispatchThreadID){
+ uint last=History.Load(4);
+ bool fresh=Serial!=0&&Serial>last;
+ bool ordered=ResetHistory!=0||(last!=0&&Serial==last+1);
+ uint bad=(!fresh||!ordered||Accepted==0)?1u:0u;
+ uint blocked=History.Load(0);
+ if(fresh){History.Store(4,Serial);if(ResetHistory!=0)blocked=0;}
+ if(bad!=0)blocked=1;
+ History.Store(0,blocked);
+ // One unconditional write also avoids FXC dropping an initial zero store
+ // when later branches conditionally overwrite the same raw buffer address.
+ Stats.Store2(0,uint2(bad,0));
+}
+[numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){
+ if(id.x>=RenderW||id.y>=RenderH)return;
+ uint status=Status.Load(int3(id.xy,0));
+ if(status<1||status>3){uint old;Stats.InterlockedOr(0,1,old);History.InterlockedOr(0,1,old);}
+}
+[numthreads(8,8,1)]void Display(uint3 id:SV_DispatchThreadID){
+ if(id.x>=OutputW||id.y>=OutputH)return;
+ bool rejected=Stats.Load(0)!=0,blocked=History.Load(0)!=0;
+ if(rejected||blocked){
+  if(!rrspatial::UseFallback(Replacement!=0,rejected,blocked))return;
+  rrspatial::Axis x=rrspatial::Coordinate(id.x,RenderW,OutputW);
+  rrspatial::Axis y=rrspatial::Coordinate(id.y,RenderH,OutputH);
+  float3 a=lerp(CurrentColor.Load(int3(ColorX+x.first,ColorY+y.first,0)).rgb,
+                CurrentColor.Load(int3(ColorX+x.second,ColorY+y.first,0)).rgb,x.fraction);
+  float3 b=lerp(CurrentColor.Load(int3(ColorX+x.first,ColorY+y.second,0)).rgb,
+                CurrentColor.Load(int3(ColorX+x.second,ColorY+y.second,0)).rgb,x.fraction);
+  GameOutput[id.xy]=float4(lerp(a,b,y.fraction),1);
+  return;
+ }
+ GameOutput[id.xy]=float4(Reconstructed.Load(int3(id.xy,0)).rgb,1);
+ if(id.x==0&&id.y==0)Stats.Store(4,1);
+}

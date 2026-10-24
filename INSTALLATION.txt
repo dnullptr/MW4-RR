@@ -1,0 +1,182 @@
+MW4 RAY RECONSTRUCTION - BETA 1
+By Fever308
+
+ReShade addon for the MW4 campaign executable sp26-cod.exe.
+Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering
+Guide are enabled by default. The initial Ray Reconstruction preset is F.
+Your choices are saved between sessions.
+
+CAMPAIGN ONLY - ANTI-CHEAT WARNING
+
+This addon has NOT been tested at all in Multiplayer or DMZ. Those modes
+use anti-cheat. DO NOT install or load this addon in either mode.
+Install only for sp26-cod.exe, never for COD HQ, Multiplayer, or DMZ.
+
+Campaign-only use does NOT guarantee anti-cheat safety or exemption from
+enforcement. This project does not claim Activision approval or that
+anti-cheat ignores the campaign executable. Use at your own risk. To the
+extent permitted by applicable law, the author and contributors accept no
+liability for account bans, suspensions, lost access, or other consequences.
+Activision's Security and Enforcement Policy:
+https://support.activision.com/articles/call-of-duty-security-and-enforcement-policy
+
+REQUIREMENTS
+
+- Windows x64 and an NVIDIA RTX GPU with working DLSS Ray Reconstruction.
+- The MW4 campaign with ray tracing enabled.
+- ReShade 6.8.0 with full add-on support. Other versions have not been
+  verified. ReShade itself is not included.
+- A compatible NVIDIA Ray Reconstruction runtime, nvngx_dlssd.dll.
+  Use version 310.7.128.0; other versions have not been verified.
+  The NVIDIA runtime is NOT included. Compatibility with the stock game
+  runtime or other versions is unverified. If updating it, back up the
+  existing file and use a legally obtained compatible NVIDIA runtime in
+  the location used by your campaign installation.
+- Microsoft Visual C++ x64 runtime.
+
+This package is for the campaign. Multiplayer, DMZ, and COD HQ are not supported.
+
+INSTALLATION
+
+1. Fully close the campaign and COD HQ. Back up your addon files and game
+   configuration before making changes.
+2. Find the campaign's sp26 folder. A Steam example is:
+   C:\Program Files (x86)\Steam\steamapps\common\Call of Duty HQ\sp26
+   Your Steam library may be on another drive.
+3. Install addon-enabled ReShade for sp26-cod.exe using DirectX 12 if you
+   do not already have a compatible installation.
+4. Copy ONLY these two runtime files from this ZIP beside sp26-cod.exe
+   and the campaign's ReShade DLL:
+     mw4-rr.addon64
+     mw4-rr-dxcompiler.dll
+   Keep both files together. The companion DLL is needed by the addon.
+5. Load only one copy of this RR addon. When updating, remove the previous
+   version from the addon directory before installing.
+   Do not remove unrelated addons or replace unrelated DLLs.
+6. Apply the configuration below before launching the game.
+
+REQUIRED GAME CONFIGURATION
+
+With the game and COD HQ fully closed:
+
+1. Press Win+R, paste the following path, and press Enter:
+   %LOCALAPPDATA%\Activision\Call of Duty\players
+2. Back up s.1.0.cod26.txt. Right-click the original file > Properties.
+   Clear Read-only and select Apply so that you can edit it.
+3. Open the original file in a text editor. Find each EXISTING entry by
+   the name before its @ suffix. Change only its value after the = sign.
+   Keep the entire @ suffix and the comments. Do not paste new duplicate
+   keys or use the example suffix below as your own.
+
+   Setting name                 Required value
+   ------------                 --------------
+   MotionBlur                   Off
+   WeaponMotionBlur             false
+   EnableVelocityBasedBlur      false
+   DofEnable                    Off
+   DofWeaponDisable             true
+   DofWorldDisable              true
+   AATechniquePreferredMP       DLSS
+   DLSSModeMP                   DLSS
+   DLSSModelUI                  TRANSFORMER
+   DxrDenoiser                  DLSS Ray Reconstruction
+   DynamicSceneResolution       false
+
+   "Script" depth of field and "Cinematic Only" motion blur are NOT off.
+   Use the values above for all six blur/depth-of-field entries.
+
+   DxrMode has entries with different meanings. The @0 entry
+   uses On, while the @1 entry selects a ray-tracing quality such as High.
+   Follow the allowed values in each entry's comment; do not set both to On.
+
+   VRS can be true or false. Keep exactly one VRS entry. VRS on is supported.
+   Enhanced FOV must be OFF in the game's settings. Set it before making
+   the config read-only. A numeric normal FOV setting is not the same option.
+
+4. Choose DLSS quality using the EXISTING DLSSPerfModeMP entry:
+
+   Config value          Quality choice
+   ------------          --------------
+   Ultra Performance     Ultra Performance
+   Maximum Performance   Performance
+   Balanced              Balanced
+   Maximum Quality       Quality
+   Native Resolution     Native resolution
+
+   Example of the change (keep YOUR actual suffix and comment):
+   Before: DLSSPerfModeMP@... = Maximum Performance // ...
+   After:  DLSSPerfModeMP@... = Balanced // ...
+
+   Quality changes require a full game restart in this beta. The in-game
+   selector may be greyed out or display Filmic SMAA; use this config entry.
+
+5. Save the file. Right-click it > Properties > check Read-only > Apply.
+   Read-only is REQUIRED: the addon will not enable RR if this file is writable.
+   To change quality later, close the game/HQ, clear Read-only, edit the value,
+   save, and restore Read-only before launching again. Read-only can also
+   prevent other game settings from being saved to this file.
+
+CONTROLS AND STATUS
+
+Open ReShade and select its Add-ons panel. Find MW4 Ray Reconstruction.
+
+- Ray Reconstruction, Transparency Guide, and Subsurface Scattering Guide
+  have separate checkboxes. Both guides require Ray Reconstruction.
+- RR preset choices: Default, D, E, F. F is the initial default.
+  Presets can be changed live. Applying one may take a moment or briefly hitch.
+- F8: toggle Ray Reconstruction.
+- F9: toggle the Transparency Guide.
+- F11: toggle the Subsurface Scattering Guide.
+
+The status panel shows whether each feature is working:
+- Off: disabled.
+- Active: currently working.
+- Waiting: switched on, but currently unavailable in the scene.
+- Error: the addon encountered a problem; see troubleshooting below.
+
+CURRENT BETA LIMITATIONS
+
+- Enhanced FOV, motion blur, and depth of field must remain disabled.
+- Some noise or blotches can remain on skin, clothing, and other materials
+  with Subsurface Scattering, particularly during movement.
+- Transparency coverage varies by scene. Some surfaces may still show noise,
+  loss of detail, or Waiting status. The guide is not guaranteed on every surface.
+- The image may briefly look softer or noisier when RR is unavailable.
+- DLSS quality requires a config edit and restart. RR presets switch live.
+- Game updates may require an addon update.
+- If RR becomes unavailable after changing graphics settings, restart the game.
+- This beta is still being tested. Compatibility and image quality can vary
+  by mission, hardware, settings, and other addons. An FPS increase is not
+  guaranteed.
+
+IF RR DOES NOT ACTIVATE
+
+Confirm the settings file is read-only, contains one valid VRS entry, and uses
+the required DLSS/ray-tracing settings. Check ReShade's Add-ons panel for the
+reported state and make sure only one RR addon is installed. For a bug report,
+include the campaign ReShade.log, panel screenshot, game/driver versions,
+GPU, output resolution, DLSS quality, affected mission, and reproduction steps.
+Save the log after the affected run before launching again.
+
+UNINSTALL / ROLLBACK
+
+Close the campaign and COD HQ. Remove mw4-rr.addon64 and mw4-rr-dxcompiler.dll
+from the campaign folder. Restore your own backups if rolling back, including
+your game configuration if desired. Leave unrelated addon files intact.
+
+SUPPORT DEVELOPMENT
+
+https://buymeacoffee.com/fever308
+Contributions help cover AI tokens used for coding, shader research, and
+debugging, giving me more room to keep improving these projects. Thank you!
+
+LICENSES
+
+MW4 Ray Reconstruction is licensed under GNU GPL version 3 only
+(GPL-3.0-only). Commercial use is allowed. If you distribute covered
+binaries, provide the Corresponding Source as required by GPLv3.
+Third-party components retain their own notices and applicable terms.
+
+See LICENSE and the notices in licenses/. Required third-party notices are
+included with the addon. ReShade and NVIDIA runtime DLLs are not included.
+Unofficial project; unaffiliated with NVIDIA, ReShade, or the game developer.

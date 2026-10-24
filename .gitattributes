@@ -1,0 +1,2 @@
+# Preserve the exact vendored bytes recorded in external/DEPENDENCIES.json.
+* -text
