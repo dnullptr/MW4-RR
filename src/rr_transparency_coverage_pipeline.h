@@ -12,6 +12,7 @@
 #include "rr_sss_pipeline_proof.h"
 #include "rr_sss_vertex_proof.h"
 #include "rr_transparency_blend_policy.h"
+#include "rr_transparency_pixel_proof.h"
 // Variant PSOs of the transparency composites (rrblend::Targets). A variant is
 // the native PSO (same shaders, root signature, raster, depth-stencil and sample
 // state) whose only target is the owned R10G10B10A2_UNORM coverage target and
@@ -116,7 +117,8 @@ struct CoveragePatch {
     reshade::api::blend_desc blend{};
     reshade::api::format target = reshade::api::format::r10g10b10a2_unorm;
     reshade::api::format dsv = reshade::api::format::unknown;
-    const reshade::api::shader_desc *vertex{}; // borrowed, for VertexReplayProof
+    const reshade::api::shader_desc *vertex{};       // borrowed, for VertexReplayProof
+    const reshade::api::shader_desc *pixel_shader{}; // borrowed, for PixelReplayProof
     unsigned count{};
     unsigned problem = ~0u; // the refused subobject type, if one was
     const char *status = "not-prepared";
@@ -131,7 +133,7 @@ struct CoveragePatch {
         using namespace reshade::api;
         using T = pipeline_subobject_type;
         count = 0;
-        vertex = nullptr;
+        vertex = pixel_shader = nullptr;
         problem = ~0u;
         auto refuse = [&](const char *why, unsigned type = ~0u) {
             status = why;
@@ -163,6 +165,7 @@ struct CoveragePatch {
                 const auto *s = static_cast<const shader_desc *>(o.data);
                 if (o.count != 1 || !s->code || s->code_size != pixel.bytes)
                     return refuse("pixel-shader", type);
+                pixel_shader = s;
                 break;
             }
             case T::blend_state: {
@@ -363,7 +366,7 @@ class CoveragePipelineRegistry {
     }
     // One line per native PSO. why is a static string; an unknown native PSO is
     // described as "unobserved".
-    void Refused(uint64_t hash, const char *why, unsigned problem,
+    void Refused(uint64_t hash, const char *why, unsigned problem, uint64_t detail,
                  ID3D12PipelineState *native) noexcept {
         try {
             {
@@ -375,6 +378,8 @@ class CoveragePipelineRegistry {
                                Label(Reason::NoPipeline) + ": " + why;
             if (problem != ~0u)
                 text += " subobject=" + std::to_string(problem);
+            if (detail != ~0ull)
+                text += " detail=" + Hex(detail);
             text += " (" + Description(native) + ")";
             Report(text);
         } catch (...) {
@@ -397,7 +402,7 @@ class CoveragePipelineRegistry {
     const char *Create(reshade::api::device *device, reshade::api::pipeline_layout layout,
                        unsigned n, const reshade::api::pipeline_subobject *objects,
                        reshade::api::pipeline original, const Target &pixel,
-                       ID3D12PipelineState *native, unsigned &problem,
+                       ID3D12PipelineState *native, unsigned &problem, uint64_t &detail,
                        std::shared_ptr<const Entry> &out) {
         using namespace rrsss;
         if (!original.handle || !layout.handle)
@@ -430,8 +435,10 @@ class CoveragePipelineRegistry {
         const char *why = nullptr;
         if (!CoverageFormatSupported(native_device.Get(), why))
             return why;
-        // The replay runs the vertex stage again, so it must be read-only.
+        // The replay runs both stages again, so both must be read-only.
         if (!VertexReplayProof(patch.vertex->code, patch.vertex->code_size, why))
+            return why;
+        if (!PixelReplayProof(patch.pixel_shader->code, patch.pixel_shader->code_size, why, detail))
             return why;
         {
             std::lock_guard lock(mutex);
@@ -493,14 +500,15 @@ class CoveragePipelineRegistry {
                 native = fg::NativeObject<ID3D12PipelineState>(
                     reinterpret_cast<ID3D12PipelineState *>(original.handle));
             unsigned problem = ~0u;
+            uint64_t detail = ~0ull;
             std::shared_ptr<const Entry> entry;
             if (const char *why = Create(device, layout, n, objects, original, *pixel, native.Get(),
-                                         problem, entry))
-                Refused(hash, why, problem, native.Get());
+                                         problem, detail, entry))
+                Refused(hash, why, problem, detail, native.Get());
             else
                 Accepted(hash, *entry, native.Get());
         } catch (...) {
-            Refused(hash, "pipeline-preparation-exception", ~0u, nullptr);
+            Refused(hash, "pipeline-preparation-exception", ~0u, ~0ull, nullptr);
         }
     }
     // The variant of a native PSO on this device, or nullptr.

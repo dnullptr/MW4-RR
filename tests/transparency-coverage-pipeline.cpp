@@ -209,7 +209,7 @@ static void KeptOthers(const Native &n, const CoveragePatch &patch, bool dsv_kep
     else
         assert(*static_cast<const api::format *>(dsv->data) == api::format::unknown);
     assert(n.Find(patch, T::blend_state)->data == &patch.blend);
-    assert(patch.vertex == &n.vs_desc);
+    assert(patch.vertex == &n.vs_desc && patch.pixel_shader == &n.ps_desc);
 }
 
 static void DisabledSlots(const api::blend_desc &b) {
@@ -676,6 +676,224 @@ static void TestFormatSupport() {
     assert(!CoverageFormatSupported(nullptr, status));
 }
 
+// Fake reflection of a pixel shader: only what PixelReplayGate reads.
+struct FakeReflection final : ID3D12ShaderReflection {
+    UINT version = UINT(D3D12_SHVER_PIXEL_SHADER) << 16 | 0x61; // ps_6_1
+    UINT64 flags = 0;
+    std::vector<D3D_SHADER_INPUT_TYPE> bindings{D3D_SIT_CBUFFER, D3D_SIT_SAMPLER, D3D_SIT_TEXTURE};
+    std::vector<D3D_NAME> outputs{D3D_NAME_TARGET};
+    UINT bound = ~0u; // BoundResources when not bindings.size()
+    HRESULT desc_result = S_OK, binding_result = S_OK, output_result = S_OK;
+    unsigned binding_reads = 0, output_reads = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **out) noexcept override {
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() noexcept override {
+        return 2;
+    }
+    ULONG STDMETHODCALLTYPE Release() noexcept override {
+        return 1;
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc(D3D12_SHADER_DESC *desc) noexcept override {
+        *desc = {};
+        desc->Version = version;
+        desc->BoundResources = bound != ~0u ? bound : UINT(bindings.size());
+        desc->OutputParameters = UINT(outputs.size());
+        return desc_result;
+    }
+    ID3D12ShaderReflectionConstantBuffer *STDMETHODCALLTYPE
+    GetConstantBufferByIndex(UINT) noexcept override {
+        return nullptr;
+    }
+    ID3D12ShaderReflectionConstantBuffer *STDMETHODCALLTYPE
+    GetConstantBufferByName(LPCSTR) noexcept override {
+        return nullptr;
+    }
+    HRESULT STDMETHODCALLTYPE
+    GetResourceBindingDesc(UINT i, D3D12_SHADER_INPUT_BIND_DESC *desc) noexcept override {
+        assert(i < bindings.size());
+        ++binding_reads;
+        *desc = {};
+        desc->Name = "binding";
+        desc->Type = bindings[i];
+        desc->BindCount = 1;
+        return binding_result;
+    }
+    HRESULT STDMETHODCALLTYPE
+    GetInputParameterDesc(UINT, D3D12_SIGNATURE_PARAMETER_DESC *) noexcept override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE
+    GetOutputParameterDesc(UINT i, D3D12_SIGNATURE_PARAMETER_DESC *desc) noexcept override {
+        assert(i < outputs.size());
+        ++output_reads;
+        *desc = {};
+        desc->SemanticName = "SV_Target";
+        desc->SemanticIndex = i;
+        desc->Register = i;
+        desc->SystemValueType = outputs[i];
+        return output_result;
+    }
+    HRESULT STDMETHODCALLTYPE
+    GetPatchConstantParameterDesc(UINT, D3D12_SIGNATURE_PARAMETER_DESC *) noexcept override {
+        return E_NOTIMPL;
+    }
+    ID3D12ShaderReflectionVariable *STDMETHODCALLTYPE GetVariableByName(LPCSTR) noexcept override {
+        return nullptr;
+    }
+    HRESULT STDMETHODCALLTYPE
+    GetResourceBindingDescByName(LPCSTR, D3D12_SHADER_INPUT_BIND_DESC *) noexcept override {
+        return E_NOTIMPL;
+    }
+    UINT STDMETHODCALLTYPE GetMovInstructionCount() noexcept override {
+        return 0;
+    }
+    UINT STDMETHODCALLTYPE GetMovcInstructionCount() noexcept override {
+        return 0;
+    }
+    UINT STDMETHODCALLTYPE GetConversionInstructionCount() noexcept override {
+        return 0;
+    }
+    UINT STDMETHODCALLTYPE GetBitwiseInstructionCount() noexcept override {
+        return 0;
+    }
+    D3D_PRIMITIVE STDMETHODCALLTYPE GetGSInputPrimitive() noexcept override {
+        return D3D_PRIMITIVE_UNDEFINED;
+    }
+    BOOL STDMETHODCALLTYPE IsSampleFrequencyShader() noexcept override {
+        return FALSE;
+    }
+    UINT STDMETHODCALLTYPE GetNumInterfaceSlots() noexcept override {
+        return 0;
+    }
+    HRESULT STDMETHODCALLTYPE GetMinFeatureLevel(D3D_FEATURE_LEVEL *) noexcept override {
+        return E_NOTIMPL;
+    }
+    UINT STDMETHODCALLTYPE GetThreadGroupSize(UINT *, UINT *, UINT *) noexcept override {
+        return 0;
+    }
+    UINT64 STDMETHODCALLTYPE GetRequiresFlags() noexcept override {
+        return flags;
+    }
+};
+
+static bool Gate(FakeReflection &r, const char *&status, uint64_t &detail) {
+    status = nullptr;
+    detail = 0;
+    return PixelReplayGate(&r, status, detail);
+}
+
+static void TestPixelProof() {
+    const char *status = nullptr;
+    uint64_t detail = 0;
+    {
+        // a36d: cb3, s1, five Texture2DMS and one Texture2D, dual-source
+        // SV_Target0/1, [earlydepthstencil] (/tmp/claude-0/glass/a36d.txt).
+        FakeReflection a36d;
+        a36d.bindings = {D3D_SIT_CBUFFER, D3D_SIT_SAMPLER, D3D_SIT_TEXTURE, D3D_SIT_TEXTURE,
+                         D3D_SIT_TEXTURE, D3D_SIT_TEXTURE, D3D_SIT_TEXTURE, D3D_SIT_TEXTURE};
+        a36d.outputs = {D3D_NAME_TARGET, D3D_NAME_TARGET};
+        a36d.flags = D3D_SHADER_REQUIRES_EARLY_DEPTH_STENCIL;
+        assert(Gate(a36d, status, detail));
+        assert(!strcmp(status, "pixel-read-only-reflection-proven") && detail == ~0ull);
+        assert(a36d.binding_reads == 8 && a36d.output_reads == 2);
+    }
+    {
+        // Every read-only binding type and every allowed requirement.
+        FakeReflection r;
+        r.bindings = {D3D_SIT_CBUFFER, D3D_SIT_TBUFFER,    D3D_SIT_TEXTURE,
+                      D3D_SIT_SAMPLER, D3D_SIT_STRUCTURED, D3D_SIT_BYTEADDRESS};
+        r.flags = D3D_SHADER_REQUIRES_DOUBLES | D3D_SHADER_REQUIRES_MINIMUM_PRECISION |
+                  D3D_SHADER_REQUIRES_11_1_DOUBLE_EXTENSIONS | D3D_SHADER_REQUIRES_INT64_OPS |
+                  D3D_SHADER_REQUIRES_NATIVE_16BIT_OPS | D3D_SHADER_REQUIRES_EARLY_DEPTH_STENCIL;
+        assert(Gate(r, status, detail) && detail == ~0ull);
+        // No bindings and no outputs is read-only too.
+        FakeReflection empty;
+        empty.bindings.clear();
+        empty.outputs.clear();
+        assert(Gate(empty, status, detail));
+    }
+    // UAVs and other non-read bindings, after read-only ones, are refused by type.
+    for (auto type : {D3D_SIT_UAV_RWTYPED, D3D_SIT_UAV_RWSTRUCTURED, D3D_SIT_UAV_RWBYTEADDRESS,
+                      D3D_SIT_UAV_APPEND_STRUCTURED, D3D_SIT_UAV_CONSUME_STRUCTURED,
+                      D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER, D3D_SIT_RTACCELERATIONSTRUCTURE,
+                      D3D_SIT_UAV_FEEDBACKTEXTURE, D3D_SHADER_INPUT_TYPE(99)}) {
+        FakeReflection r;
+        r.bindings.push_back(type);
+        assert(!Gate(r, status, detail));
+        assert(!strcmp(status, "pixel-replay-writable-or-unknown-binding") &&
+               detail == uint64_t(type));
+    }
+    // Waves, UAV and bindless features, outputs by capability and unknown bits.
+    for (UINT64 flag :
+         {UINT64(D3D_SHADER_REQUIRES_UAVS_AT_EVERY_STAGE), UINT64(D3D_SHADER_REQUIRES_64_UAVS),
+          UINT64(D3D_SHADER_REQUIRES_11_1_SHADER_EXTENSIONS),
+          UINT64(D3D_SHADER_REQUIRES_STENCIL_REF), UINT64(D3D_SHADER_REQUIRES_INNER_COVERAGE),
+          UINT64(D3D_SHADER_REQUIRES_TYPED_UAV_LOAD_ADDITIONAL_FORMATS),
+          UINT64(D3D_SHADER_REQUIRES_ROVS), UINT64(D3D_SHADER_REQUIRES_WAVE_OPS),
+          UINT64(D3D_SHADER_REQUIRES_VIEW_ID), UINT64(D3D_SHADER_REQUIRES_BARYCENTRICS),
+          UINT64(D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING),
+          UINT64(D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING),
+          UINT64(D3D_SHADER_REQUIRES_WRITEABLE_MSAA_TEXTURES),
+          UINT64(D3D_SHADER_REQUIRES_EXTENDED_COMMAND_INFO), UINT64(1) << 40}) {
+        FakeReflection r;
+        r.flags = flag | D3D_SHADER_REQUIRES_EARLY_DEPTH_STENCIL;
+        assert(!Gate(r, status, detail));
+        assert(!strcmp(status, "pixel-replay-requires-unsupported-capabilities") && detail == flag);
+        assert(!r.binding_reads && !r.output_reads);
+    }
+    // Any output but SV_Target, after a target, is refused by system value.
+    for (auto name : {D3D_NAME_DEPTH, D3D_NAME_COVERAGE, D3D_NAME_DEPTH_GREATER_EQUAL,
+                      D3D_NAME_DEPTH_LESS_EQUAL, D3D_NAME_STENCIL_REF, D3D_NAME_UNDEFINED}) {
+        FakeReflection r;
+        r.outputs.push_back(name);
+        assert(!Gate(r, status, detail));
+        assert(!strcmp(status, "pixel-replay-output-not-render-target") &&
+               detail == uint64_t(name));
+    }
+    {
+        // Not a pixel stage, no description, too many bindings or no reflection.
+        FakeReflection vertex;
+        vertex.version = UINT(D3D12_SHVER_VERTEX_SHADER) << 16 | 0x61;
+        assert(!Gate(vertex, status, detail));
+        assert(!strcmp(status, "pixel-stage-or-description-unsupported") && detail == ~0ull);
+        FakeReflection failed;
+        failed.desc_result = E_FAIL;
+        assert(!Gate(failed, status, detail));
+        assert(!strcmp(status, "pixel-stage-or-description-unsupported"));
+        FakeReflection many;
+        many.bound = 129;
+        assert(!Gate(many, status, detail));
+        assert(!strcmp(status, "pixel-stage-or-description-unsupported") && !many.binding_reads);
+        assert(!PixelReplayGate(nullptr, status, detail));
+        assert(!strcmp(status, "pixel-stage-or-description-unsupported"));
+    }
+    {
+        // A binding or output that cannot be read is refused.
+        FakeReflection binding;
+        binding.binding_result = E_FAIL;
+        assert(!Gate(binding, status, detail));
+        assert(!strcmp(status, "pixel-replay-writable-or-unknown-binding") && detail == ~0ull);
+        FakeReflection output;
+        output.output_result = E_FAIL;
+        assert(!Gate(output, status, detail));
+        assert(!strcmp(status, "pixel-replay-output-not-render-target") && detail == ~0ull);
+    }
+    // The bytecode itself: absent, empty or oversized, then not reflectable here.
+    assert(!PixelReplayProof(nullptr, 64, status, detail));
+    assert(!strcmp(status, "pixel-bytecode-invalid") && detail == ~0ull);
+    const char garbage[] = "not a shader container, not DXBC and not DXIL at all.";
+    assert(!PixelReplayProof(garbage, 0, status, detail));
+    assert(!strcmp(status, "pixel-bytecode-invalid"));
+    assert(!PixelReplayProof(garbage, 4 * 1024 * 1024 + 1, status, detail));
+    assert(!strcmp(status, "pixel-bytecode-invalid"));
+    assert(!PixelReplayProof(garbage, sizeof(garbage), status, detail));
+    assert(!strcmp(status, "pixel-dxc-companion-unavailable") ||
+           !strcmp(status, "pixel-dxil-reflection-unavailable"));
+}
+
 static std::vector<std::string> logged;
 static void Log(const char *text) {
     logged.push_back(text);
@@ -730,7 +948,9 @@ int main() {
                  api::blend_factor::source_alpha, api::blend_factor::one_minus_source_color,
                  DepthClass::NoDsv);
     TestFormatSupport();
+    TestPixelProof();
     TestRegistry();
     puts("PASS: transparency coverage variant target hash, blend factor mapping, subobject "
-         "patch and refusals, expected observation equivalence, format support, registry");
+         "patch and refusals, expected observation equivalence, format support, pixel replay "
+         "proof, registry");
 }
