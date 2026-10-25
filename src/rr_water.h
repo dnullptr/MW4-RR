@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include "rr_gate_stats.h"
 namespace rrwater {
 // Development tests for running water, which RR blurs. Water pixels are the
 // game prepass's special surfaces, PackedSurface.w bit 1 (value 2): its water
@@ -62,11 +63,12 @@ inline constexpr unsigned Flags(bool responsivity, bool discard, bool sss_mask,
 // Pixel counts per cs_prepass flag, so the log and panel show which kind of
 // special surface the water is. The guide shader codes each surface pixel
 // (RRWaterCode) and shaders/rr_water_masks.hlsl counts them into the stats
-// buffer at PrepassOffset, the free tail after the gate's non-finite counts, in
+// buffer at PrepassOffset (bytes 264..283, after the gate's non-finite counts), in
 // this order: special (w&2), water flag (w&4), override (w&8), NormalGloss
 // bit 31, and special pixels the guide shader rejected.
 enum Prepass : unsigned { Special, Marked, Override, Bit31, SpecialRejected, PrepassCount };
-inline constexpr unsigned PrepassOffset = 236;
+inline constexpr unsigned PrepassOffset = RR_STATS_WATER_PREPASS;
+static_assert(PrepassCount == 5, "rr_gate_stats.h sizes the water flags as 5 words");
 struct Counts {
     std::uint32_t water{}; // stats byte 16
     std::array<std::uint32_t, PrepassCount> prepass{};

@@ -9,9 +9,10 @@ Texture2D<float4> CurrentColor:register(t2);
 RWTexture2D<float4> GameOutput:register(u0);
 // Stats bytes: 0 bad frame, 4 copied frame, 8 isolated guide pixels, 12 sanitized SSS samples,
 // 16 water pixels (rr_water_masks.hlsl), 20..63 hit distance statistics (rr_hit_condition.hlsl),
-// 64..227 ray density (rr_vrrt_probability.hlsl), then rr_gate_stats.h: 228 non-finite color
-// pixels RR receives, 232 non-finite pixels of the RR output Display shows (none on a frame
-// it rejects or blocks), 236..255 water prepass flags (rr_water_masks.hlsl).
+// 64..255 ray density (rr_vrrt_probability.hlsl), then rr_gate_stats.h: 256 non-finite color
+// pixels RR receives, 260 non-finite pixels of the RR output Display shows (none on a frame
+// it rejects or blocks), 264..283 water prepass flags (rr_water_masks.hlsl). The buffer is
+// rrgatestats::StatsBytes (512) long.
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
 // Flags bit0: tolerate isolated unusable guide pixels. Each such pixel keeps
@@ -34,8 +35,8 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  // One unconditional write also avoids FXC dropping an initial zero store
  // when later branches conditionally overwrite the same raw buffer address.
  Stats.Store4(0,uint4(bad,0,0,0));
- // Not 16..227: the water, hit distance and density passes zero those. The density pass's
- // zero copy covers 228..255 too, from the slot's pre list, which runs before this.
+ // Not 16..255: the water, hit distance and density passes zero those. Nothing else zeroes
+ // the non-finite counts, which follow the density words.
  Stats.Store2(RR_STATS_NON_FINITE_COLOR,uint2(0,0));
 }
 [numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){

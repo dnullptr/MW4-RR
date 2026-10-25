@@ -32,6 +32,7 @@
 #include "rr_specular_distance.h"
 #include "rr_hit_condition.h"
 #include "rr_ray_density.h"
+#include "rr_ray_copies.h"
 #include "rr_water.h"
 #include "rr_gate_stats.h"
 namespace rrlive {
@@ -130,6 +131,15 @@ struct Pipelines {
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
+    // The ray budget governor (shaders/rr_vrrt_governor.hlsl) on a game root signature, one PSO per
+    // root. An entry keeps its root alive, so a cached address cannot be reused by another root;
+    // `pipelines = {}` (after full retirement) releases them.
+    struct GovernorEntry {
+        ComPtr<ID3D12RootSignature> root;
+        ComPtr<ID3D12PipelineState> pso;
+        HRESULT failed = S_OK;
+    };
+    std::array<GovernorEntry, 4> governors;
     UINT stride{};
     void Initialize(ID3D12Device *d) {
         Require(d && !device, "live pipelines already initialized");
@@ -231,6 +241,45 @@ struct Pipelines {
         Root(desc, probability_root);
         Pipeline(probability_root.Get(), RRVrrtProbability, sizeof(RRVrrtProbability), probability);
     }
+    // pso, else why not: hr E_INVALIDARG (no root or device, or a root of another device; nothing
+    // cached), E_OUTOFMEMORY (nothing cached, worth a retry), another failure of the creation
+    // (cached: every later call answers the same), or `full` (every entry holds another root).
+    // created: CreateComputePipelineState ran for this root (now or, for a cached failure,
+    // earlier); false for a root this device cannot use (E_INVALIDARG) and a full cache.
+    struct GovernorPipeline {
+        ID3D12PipelineState *pso{};
+        HRESULT hr = S_OK;
+        bool full{}, created{};
+    };
+    GovernorPipeline Governor(ID3D12RootSignature *root) noexcept {
+        ComPtr<ID3D12Device> owner;
+        if (!root || !device || FAILED(root->GetDevice(IID_PPV_ARGS(&owner))) ||
+            !fg::SameNativeObject(owner.Get(), device.Get()))
+            return {nullptr, E_INVALIDARG, false, false};
+        GovernorEntry *empty{};
+        for (auto &e : governors) {
+            if (e.root.Get() == root)
+                return {e.pso.Get(), e.pso ? S_OK : e.failed, false, true};
+            if (!e.root && !empty)
+                empty = &e;
+        }
+        if (!empty)
+            return {nullptr, S_OK, true, false};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+        d.pRootSignature = root;
+        d.CS = {RRVrrtGovernor, sizeof(RRVrrtGovernor)};
+        empty->root = root;
+        const HRESULT hr = device->CreateComputePipelineState(&d, IID_PPV_ARGS(&empty->pso));
+        if (SUCCEEDED(hr) && empty->pso)
+            return {empty->pso.Get(), S_OK, false, true};
+        if (hr == E_OUTOFMEMORY) {
+            *empty = {};
+            return {nullptr, E_OUTOFMEMORY, false, true};
+        }
+        empty->pso.Reset();
+        empty->failed = FAILED(hr) ? hr : E_FAIL;
+        return {nullptr, empty->failed, false, true};
+    }
     // Hit distance conditioning: SRV table t0-t4, target UAV table, 4 root
     // constants, statistics root UAV u1. Created on first use.
     void HitConditionPipeline() {
@@ -305,13 +354,14 @@ struct GpuFrame {
         // The hit distance copy is also the conditioning target (a UAV).
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)))
             return 0;
-        if (!add(rrprivate::Buffer(HeaderBytes)))
+        auto buffer = rrprivate::Buffer(HeaderBytes); // header
+        if (!add(buffer))
             return 0;
-        auto buffer = rrprivate::Buffer(256);
+        buffer = rrprivate::Buffer(StatsBytes); // stats
         buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (!add(buffer))
             return 0;
-        buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+        buffer.Flags = D3D12_RESOURCE_FLAG_NONE; // readback
         if (!add(buffer))
             return 0;
         buffer = rrprivate::Buffer(rrvrrt::Bytes(w, h));
@@ -350,6 +400,28 @@ struct GpuFrame {
     static constexpr UINT WeaponTarget = 17;
     // Hit distance conditioning: five sources (ConditionDistance), then its target.
     static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;
+    // The header (the gate's constants): the CPU writes bytes 0..HeaderWritten-1 every frame
+    // (Header, WaterHeader) and the contrast knee at ContrastWord, past ZeroTailEnd. Bytes
+    // HeaderWritten..ZeroTailEnd-1 are never written, stay zero, and are the source of every
+    // stats zeroing copy. Then the stats UAV with its readback (layout at Prepare,
+    // rr_gate_stats.h).
+    static constexpr UINT HeaderBytes = 512, HeaderWritten = 64, ZeroTailEnd = 256,
+                          ContrastWord = 64, StatsBytes = rrgatestats::StatsBytes;
+    static_assert(ContrastWord * 4 >= ZeroTailEnd && ContrastWord * 4 + 4 <= HeaderBytes,
+                  "the contrast knee lies outside the zeroing tail");
+    static constexpr UINT FiniteOffset = RR_STATS_NON_FINITE_COLOR;
+    // The whole stats layout, disjoint and inside StatsBytes: 0..19 health (gate 0..15, water
+    // pixels 16), 20..63 hit, 64..255 ray density, 256..263 non-finite, 264..283 water flags.
+    static_assert(rrhitcond::StatsOffset == 20 &&
+                      rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
+                      rrdensity::Offset == 64 && rrdensity::Offset + 4 * rrdensity::Count == 256 &&
+                      RR_STATS_NON_FINITE_COLOR == 256 &&
+                      RR_STATS_NON_FINITE_OUTPUT == RR_STATS_NON_FINITE_COLOR + 4 &&
+                      rrwater::PrepassOffset == RR_STATS_NON_FINITE_OUTPUT + 4 &&
+                      rrwater::PrepassOffset == 264 &&
+                      rrwater::PrepassOffset + 4 * rrwater::PrepassCount == 284 &&
+                      rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= StatsBytes,
+                  "stats ranges are disjoint and fit the buffer");
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
     // Water guide mode Convert used for this frame (rrwater::Guide).
@@ -369,6 +441,31 @@ struct GpuFrame {
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
     bool use_depth{}, hit_ready{}, water_written{};
+    // The ray budget test (every offset is in rr_ray_copies.h): ray_cb (DEFAULT 64 KiB, COMMON
+    // outside a patch) is the patched resolve's b1, ray_values (UPLOAD 256 B) stays mapped at
+    // ray_map, ray_log (READBACK 256 B) collects the copies. ray_bytes is their share of `bytes`:
+    // optional, so never multiplied into the per-slot base; every pool projection counts them once
+    // in its persistent term (PersistentBytes). Until Retire: ray_sources holds the native
+    // buffers this recording copied (resolve b1, b3, t0; apply b1, b3; patch b1), ray_serial the
+    // nonzero serial written into ray_values (0: none yet, so no logging copy), ray_patch_open
+    // whether ray_cb waits for EndPatch.
+    static constexpr unsigned RaySourceSlots = 6;
+    ComPtr<ID3D12Resource> ray_cb, ray_values, ray_log;
+    UINT *ray_map{};
+    UINT64 ray_bytes{};
+    std::array<ComPtr<ID3D12Resource>, RaySourceSlots> ray_sources;
+    UINT ray_serial{};
+    bool ray_patch_open{};
+    // A site's ray_sources slots: from `first`, one per native rrraycopy::Source it reads, in
+    // Source order (B1, B3, Stats).
+    struct RaySite {
+        unsigned first, slots;
+    };
+    static constexpr RaySite RayResolveSite{0, rrraycopy::NativeSlots(rrraycopy::ResolveItems)},
+        RayApplySite{RayResolveSite.first + RayResolveSite.slots,
+                     rrraycopy::NativeSlots(rrraycopy::ApplyItems)},
+        RayPatchSite{RayApplySite.first + RayApplySite.slots,
+                     rrraycopy::NativeSlots(rrraycopy::PatchFill(3))};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
@@ -456,16 +553,18 @@ struct GpuFrame {
         void *m{};
         Check(header->Map(0, &empty, &m), "live association upload map failed");
         header_map = (UINT *)m;
-        memset(m, 0, 256);
-        // stats bytes (rr_live_gate.hlsl): 0 bad, 4 copied, 8 isolated, 12 sanitized SSS
-        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterCounts); 20..63 hit
-        // distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..227 ray density
-        // (ReadRates); 228 non-finite color, 232 non-finite displayed output (rr_gate_stats.h,
-        // ReadFinite); 236..255 water prepass flags (rrwater::PrepassOffset, ReadWaterCounts).
-        auto bd = rrprivate::Buffer(256);
+        memset(m, 0, HeaderBytes);
+        // stats bytes (rr_live_gate.hlsl), StatsBytes long: 0 bad, 4 copied, 8 isolated, 12
+        // sanitized SSS (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterCounts); 20..63
+        // hit distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..255 ray density
+        // (rr_vrrt_probability.hlsl, ReadRates); 256 non-finite color, 260 non-finite displayed
+        // output (rr_gate_stats.h, ReadFinite); 264..283 water prepass flags
+        // (rrwater::PrepassOffset, ReadWaterCounts). The views are root UAVs, or (the VRRT
+        // reader's) a raw view of the whole buffer.
+        auto bd = rrprivate::Buffer(StatsBytes);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
-        readback = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
+        readback = Allocate(p, b, rrprivate::Buffer(StatsBytes), D3D12_HEAP_TYPE_READBACK);
     }
     // Water test storage for a w x h guide: the classification and two masks.
     static UINT64 WaterBytes(ID3D12Device *device, UINT w, UINT h) {
@@ -584,7 +683,8 @@ struct GpuFrame {
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // Zero the pass's statistics from the header's never-written tail.
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(stats.Get(), rrhitcond::StatsOffset, header.Get(), 64,
+        static_assert(HeaderWritten + rrhitcond::StatCount * 4 <= ZeroTailEnd);
+        cl->CopyBufferRegion(stats.Get(), rrhitcond::StatsOffset, header.Get(), HeaderWritten,
                              rrhitcond::StatCount * 4);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -702,10 +802,11 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Change(cl, guides[3].Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // Zero the rate statistics from the header's never-written tail. This also clears the
-        // gate's non-finite counts (rr_gate_stats.h): fine, as it runs on the pre list, before
-        // the gate's BeginFrame on the SR list.
-        constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 256 - rrdensity::Offset;
+        // Zero the rate statistics (64..255, nothing past them: the gate's BeginFrame zeroes its
+        // non-finite counts) from the header's never-written tail.
+        constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 4 * rrdensity::Count;
+        static_assert(rates >= HeaderWritten && rates + rate_bytes <= ZeroTailEnd &&
+                      rates + rate_bytes <= FiniteOffset);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(stats.Get(), rates, header.Get(), rates, rate_bytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -899,7 +1000,7 @@ struct GpuFrame {
         Change(cl, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 256);
+        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, StatsBytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
     // SR time, after the SSS resolve. Counts this frame's classification codes,
@@ -930,12 +1031,14 @@ struct GpuFrame {
             Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Zero the water pixel count (stats byte 16) and the prepass flag counts
         // (rrwater::PrepassOffset) from the header's never-written tail.
+        // The source is header+HeaderWritten for both, inside the zero tail.
         static_assert(rrwater::PrepassOffset == RR_STATS_NON_FINITE_OUTPUT + 4 &&
-                      rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= 256);
+                      rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= StatsBytes &&
+                      HeaderWritten + 4 * rrwater::PrepassCount <= ZeroTailEnd);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(stats.Get(), 16, header.Get(), 64, 4);
-        cl->CopyBufferRegion(stats.Get(), rrwater::PrepassOffset, header.Get(), 64,
+        cl->CopyBufferRegion(stats.Get(), 16, header.Get(), HeaderWritten, 4);
+        cl->CopyBufferRegion(stats.Get(), rrwater::PrepassOffset, header.Get(), HeaderWritten,
                              4 * rrwater::PrepassCount);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -964,7 +1067,7 @@ struct GpuFrame {
         header_map[15] = flags;
     }
     // Water pixels counted by the latest WaterPass on this frame. Two maps, so each
-    // reads only the water bytes (16, and 236..255), not the statistics between them.
+    // reads only the water bytes (16, and 264..283), not the statistics between them.
     rrwater::Counts ReadWaterCounts() {
         rrwater::Counts v{};
         const auto read = [&](UINT offset, void *out, UINT size) {
@@ -987,6 +1090,7 @@ struct GpuFrame {
         memcpy(&strength, &responsivity, sizeof(strength));
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
                     color_x, color_y, tolerate ? 1u : 0u, strength, 0, 0, 0};
+        static_assert(sizeof(c) <= HeaderWritten, "the stats zeroing source stays zero");
         memcpy(header_map, c, sizeof(c));
         header_map[ContrastWord] = 0;
     }
@@ -1004,9 +1108,7 @@ struct GpuFrame {
     }
     // Knee of the contrast test, whose compression the gate's Display undoes on RR's
     // output (rrcontrast::ExpandFactor) before OutputScale; 0 = none. Header clears it.
-    // It lives past byte 256: bytes 64-255 are the never-written tail that zeroes stats.
-    static constexpr UINT HeaderBytes = 512, ContrastWord = 64;
-    static_assert(ContrastWord * 4 >= 256 && ContrastWord * 4 + 4 <= HeaderBytes);
+    // It lives at ContrastWord (byte 256), past the never-written zeroing tail (64..255).
     void OutputContrast(float knee) {
         memcpy(&header_map[ContrastWord], &knee, sizeof(knee));
     }
@@ -1023,11 +1125,10 @@ struct GpuFrame {
     }
     // Pixels with a non-finite channel: in the color RR receives, in the RR output the gate
     // displays (none if rejected or blocked). Their stats bytes follow the hit distance
-    // statistics and the ray density.
-    static constexpr UINT FiniteOffset = RR_STATS_NON_FINITE_COLOR;
+    // statistics and the ray density, which ends at byte 256.
     static_assert(rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
-                  rrdensity::Offset + 4 * rrdensity::Count <= FiniteOffset &&
-                  RR_STATS_NON_FINITE_OUTPUT == FiniteOffset + 4 && FiniteOffset + 8 <= 256);
+                  rrdensity::Offset + 4 * rrdensity::Count <= FiniteOffset && FiniteOffset >= 256 &&
+                  RR_STATS_NON_FINITE_OUTPUT == FiniteOffset + 4 && FiniteOffset + 8 <= StatsBytes);
     std::array<UINT, 2> ReadFinite() {
         std::array<UINT, 2> v{};
         void *m{};
@@ -1049,6 +1150,137 @@ struct GpuFrame {
         readback->Unmap(0, &r);
         return v;
     }
+    // Ensures ray_log and ray_values (ray_values mapped once). False, with nothing new allocated,
+    // when a size is unusable or the ceiling cannot be raised by the missing buffers' bytes. Throws
+    // AllocationDeferred or runtime_error from Allocate (the raised ceiling is then given back for
+    // what was not allocated), or runtime_error when the first Map of ray_values fails (the next
+    // call maps again). Idempotent.
+    bool PrepareRayLog(Pipelines &p, Budget &b) {
+        using rrprivate::Buffer;
+        if (!AllocateRay(p, b,
+                         {{&ray_log, Buffer(rrraycopy::LogBytes), D3D12_HEAP_TYPE_READBACK},
+                          {&ray_values, Buffer(rrraycopy::ValuesBytes), D3D12_HEAP_TYPE_UPLOAD}}))
+            return false;
+        if (!ray_map) {
+            D3D12_RANGE empty{};
+            void *m{};
+            Check(ray_values->Map(0, &empty, &m), "ray budget upload map failed");
+            memset(m, 0, rrraycopy::ValuesBytes);
+            ray_map = static_cast<UINT *>(m);
+        }
+        return true;
+    }
+    // PrepareRayLog, then ray_cb the same way. Idempotent. It can return false (or throw) with the
+    // log buffers already allocated: they stay, counted in ray_bytes, and logging can use them.
+    bool PrepareRayPatch(Pipelines &p, Budget &b) {
+        const RayBuffer cb{&ray_cb, rrprivate::Buffer(rrraycopy::CbBytes), D3D12_HEAP_TYPE_DEFAULT};
+        return PrepareRayLog(p, b) && AllocateRay(p, b, {cb});
+    }
+    // CPU writes into ray_values while this slot records (not in flight), like header_map.
+    // Serials are nonzero (rr_ray_copies.h): 0 is ignored.
+    void WriteRaySerial(UINT serial) noexcept {
+        if (!ray_map || !serial)
+            return;
+        ray_map[rrraycopy::ValuesSerial / 4] = serial;
+        ray_serial = serial;
+    }
+    // The plan's words of ray_values (rrraycopy::ValuesImage, PlanRanges); the serial is untouched.
+    void WriteRayPlan(const rrraybudget::Plan &plan) noexcept {
+        if (!ray_map)
+            return;
+        rrraycopy::ApplyPlan(plan, [this](std::uint32_t at, std::uint32_t word) {
+            memcpy(reinterpret_cast<char *>(ray_map) + at, &word, sizeof(word));
+        });
+    }
+    // The logging copies at the native resolve and at the native VRRT apply: the recorded Log bits,
+    // 0 when nothing was recorded (no ray_log/ray_map, no serial written in this recording, this
+    // site already recorded in this recording, or nothing to copy). A source outside its buffer is
+    // dropped; t0 is copied only when its tracked state is a known read-only shader-resource state
+    // (without PIXEL_SHADER_RESOURCE on a non-direct list, where a barrier may not name it), inside
+    // a transition pair to state | COPY_SOURCE unless it already has COPY_SOURCE.
+    unsigned LogResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                        const rrvrrt::RayConstant &b3, const rrvrrt::RayStats &stats) noexcept {
+        if (!cl || !ray_log || !ray_map || !ray_serial || RaySiteUsed(RayResolveSite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        from.Set(rrraycopy::Source::B3, b3.resource.Get(), b3.offset);
+        from.Set(rrraycopy::Source::Stats, stats.resource.Get(), stats.offset);
+        const bool readable = stats.known && rrsparsecopy::Readable(stats.state) &&
+                              (cl->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                               !(stats.state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        const auto list = rrraycopy::ResolveLog(
+            RayAvail(b1.resource.Get(), b1.offset, b1.avail), b1.upload,
+            RayAvail(b3.resource.Get(), b3.offset, b3.avail), b3.upload,
+            readable ? RayAvail(stats.resource.Get(), stats.offset, stats.avail) : 0);
+        return RecordRayLog(cl, list, from, RayResolveSite, stats.state);
+    }
+    unsigned LogApply(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                      const rrvrrt::RayConstant &b3) noexcept {
+        if (!cl || !ray_log || !ray_map || !ray_serial || RaySiteUsed(RayApplySite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        from.Set(rrraycopy::Source::B3, b3.resource.Get(), b3.offset);
+        const auto list =
+            rrraycopy::ApplyLog(RayAvail(b1.resource.Get(), b1.offset, b1.avail), b1.upload,
+                                RayAvail(b3.resource.Get(), b3.offset, b3.avail), b3.upload);
+        return RecordRayLog(cl, list, from, RayApplySite, {});
+    }
+    // ray_cb's GPU VA after recording the copies that fill it (the game's first 608 bytes of b1
+    // with the plan's targets and governor constants), its barrier to VERTEX_AND_CONSTANT_BUFFER |
+    // COPY_SOURCE and the Executed copy; 0 with nothing recorded. The caller binds the VA,
+    // dispatches, runs the governor, restores, then calls EndPatch.
+    UINT64 PatchResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                        const rrraybudget::Plan &plan) noexcept {
+        if (!cl || !ray_cb || !ray_map || !ray_log || !ray_serial || !b1.upload ||
+            RayAvail(b1.resource.Get(), b1.offset, b1.avail) < rrraycopy::GameBytes ||
+            RaySiteUsed(RayPatchSite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        const auto fill = rrraycopy::PatchFill(plan.mask); // empty unless the mask is valid
+        const UINT64 va = ray_cb->GetGPUVirtualAddress();
+        if (!fill.count || !from.Covers(fill) || !va)
+            return 0;
+        ray_sources[RayPatchSite.first] = b1.resource;
+        WriteRayPlan(plan);
+        ray_patch_open = true;
+        Change(cl, ray_cb.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (unsigned i = 0; i < fill.count; ++i)
+            RecordRay(cl, fill.copies[i], from);
+        Change(cl, ray_cb.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_COPY_SOURCE);
+        RecordRay(cl, rrraycopy::Executed, from);
+        return va;
+    }
+    // After a PatchResolve that returned a VA, once the patched dispatch and the governor are
+    // recorded. Returns ray_cb to COMMON only while a patch is open, so it is safe on any restore
+    // path and idempotent.
+    void EndPatch(ID3D12GraphicsCommandList *cl) noexcept {
+        if (!cl || !ray_cb || !ray_patch_open)
+            return;
+        Change(cl, ray_cb.Get(),
+               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+        ray_patch_open = false;
+    }
+    // The gate's words of ray_log. Valid only after the recording's GPU work completed.
+    bool ReadRayLog(std::array<std::uint32_t, rrraybudget::LogWords> &out) noexcept {
+        static_assert(sizeof(out) == rrraycopy::LogRead, "the gate's words of the ray log");
+        out = {};
+        if (!ray_log)
+            return false;
+        void *m{};
+        D3D12_RANGE r{0, rrraycopy::LogRead};
+        if (FAILED(ray_log->Map(0, &r, &m)))
+            return false;
+        if (m)
+            memcpy(out.data(), m, sizeof(out));
+        r = {0, 0};
+        ray_log->Unmap(0, &r);
+        return m != nullptr;
+    }
     // Valid only for a frame whose hit distance was conditioned (ConditionDistance).
     rrhitcond::Frame ReadHitStats() {
         rrhitcond::Frame v{};
@@ -1068,16 +1300,165 @@ struct GpuFrame {
         hit_source.Reset();
         hit_weights.Reset();
         hit_ready = false;
+        ray_sources = {};
+        ray_serial = 0;
+        ray_patch_open = false;
         water_written = false;
     }
     void Release(Budget &b) {
         if (header_map)
             header->Unmap(0, nullptr);
+        if (ray_map)
+            ray_values->Unmap(0, nullptr);
         Require(b.bytes >= bytes, "live allocation ledger underflow");
         b.bytes -= bytes;
         *this = {};
     }
+
+  private:
+    // What each rrraycopy::Source reads: a buffer and the byte its offsets count from.
+    struct RayFrom {
+        static constexpr unsigned Sources = unsigned(rrraycopy::Source::Count);
+        std::array<ID3D12Resource *, Sources> resource{};
+        std::array<UINT64, Sources> start{};
+        void Set(rrraycopy::Source s, ID3D12Resource *r, UINT64 offset) noexcept {
+            resource[unsigned(s)] = r;
+            start[unsigned(s)] = offset;
+        }
+        bool Covers(const rrraycopy::Copy &c) const noexcept {
+            return unsigned(c.source) < resource.size() && resource[unsigned(c.source)];
+        }
+        bool Covers(const rrraycopy::List &l) const noexcept {
+            if (l.count > l.copies.size())
+                return false;
+            for (unsigned i = 0; i < l.count; ++i)
+                if (!Covers(l.copies[i]))
+                    return false;
+            return true;
+        }
+    };
+    struct RayBuffer {
+        ComPtr<ID3D12Resource> *resource;
+        D3D12_RESOURCE_DESC desc;
+        D3D12_HEAP_TYPE type;
+    };
+    // Allocates the missing `buffers` after raising the pool ceiling by their sum on top of the
+    // current limit (rrraycopy::RayCeiling, overflow-checked). The controller counts that growth
+    // (Controller::RayPrepare) and gives it back at Reconfigure.
+    bool AllocateRay(Pipelines &p, Budget &b, std::initializer_list<RayBuffer> buffers) {
+        if (!p.device)
+            return false;
+        UINT64 needed{};
+        for (const auto &x : buffers)
+            if (!*x.resource) {
+                const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &x.desc).SizeInBytes;
+                if (!n || n == UINT64_MAX || needed > UINT64_MAX - n)
+                    return false;
+                needed += n;
+            }
+        if (!needed)
+            return true;
+        // On top of the ceiling, not out of the headroom below it (rrraycopy::RayCeiling).
+        const UINT64 floor = b.limit, ceiling = rrraycopy::RayCeiling(floor, needed);
+        if (!ceiling || !b.Reserve(p.device.Get(), ceiling))
+            return false;
+        UINT64 added{};
+        try {
+            for (const auto &x : buffers)
+                if (!*x.resource) {
+                    const UINT64 before = bytes;
+                    *x.resource = Allocate(p, b, x.desc, x.type);
+                    added += bytes - before;
+                    ray_bytes += bytes - before;
+                }
+        } catch (...) {
+            // Keep the ceiling for what was allocated only, so retries do not inflate it.
+            b.limit = floor + added;
+            throw;
+        }
+        return true;
+    }
+    RayFrom RayOwn() const noexcept {
+        RayFrom f;
+        f.Set(rrraycopy::Source::Values, ray_values.Get(), 0);
+        f.Set(rrraycopy::Source::Cb, ray_cb.Get(), 0);
+        return f;
+    }
+    // `avail` when [offset, offset + avail) lies inside the buffer `r`, else 0 (no copy reads it).
+    static UINT64 RayAvail(ID3D12Resource *r, UINT64 offset, UINT64 avail) noexcept {
+        if (!r)
+            return 0;
+        const auto d = r->GetDesc();
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && offset <= d.Width &&
+                       avail <= d.Width - offset
+                   ? avail
+                   : 0;
+    }
+    bool RaySiteUsed(const RaySite &site) const noexcept {
+        for (unsigned i = site.first; i < site.first + site.slots && i < ray_sources.size(); ++i)
+            if (ray_sources[i])
+                return true;
+        return false;
+    }
+    // The ray_sources slot of a native source at `site`, or nullptr when the site has none for it.
+    ComPtr<ID3D12Resource> *RaySlot(const RaySite &site, rrraycopy::Source s) noexcept {
+        const auto at = site.first + unsigned(s);
+        return rrraycopy::Native(s) && unsigned(s) < site.slots && at < ray_sources.size()
+                   ? &ray_sources[at]
+                   : nullptr;
+    }
+    // One copy of the plan; the caller has checked it (RayFrom::Covers) before the first command.
+    void RecordRay(ID3D12GraphicsCommandList *cl, const rrraycopy::Copy &c,
+                   const RayFrom &from) noexcept {
+        const auto s = unsigned(c.source);
+        cl->CopyBufferRegion(c.target == rrraycopy::Target::Log ? ray_log.Get() : ray_cb.Get(),
+                             c.at, from.resource[s], from.start[s] + c.from, c.bytes);
+    }
+    // LogResolve/LogApply after their checks: retains the native sources in the site's
+    // ray_sources slots, then records the list; the t0 copies (Source::Stats) go last, inside the
+    // transition pair unless `stats_state` already has COPY_SOURCE.
+    unsigned RecordRayLog(ID3D12GraphicsCommandList *cl, const rrraycopy::List &list,
+                          const RayFrom &from, const RaySite &site,
+                          D3D12_RESOURCE_STATES stats_state) noexcept {
+        if (!list.count || !from.Covers(list))
+            return 0;
+        bool stats = false;
+        for (unsigned i = 0; i < list.count; ++i) {
+            const auto s = list.copies[i].source;
+            stats = stats || s == rrraycopy::Source::Stats;
+            if (rrraycopy::Native(s) && !RaySlot(site, s))
+                return 0;
+        }
+        for (unsigned i = 0; i < list.count; ++i)
+            if (const auto s = list.copies[i].source; rrraycopy::Native(s))
+                *RaySlot(site, s) = from.resource[unsigned(s)];
+        for (unsigned i = 0; i < list.count; ++i)
+            if (list.copies[i].source != rrraycopy::Source::Stats)
+                RecordRay(cl, list.copies[i], from);
+        if (stats) {
+            auto *t0 = from.resource[unsigned(rrraycopy::Source::Stats)];
+            const auto read = stats_state | D3D12_RESOURCE_STATE_COPY_SOURCE;
+            Change(cl, t0, stats_state, read);
+            for (unsigned i = 0; i < list.count; ++i)
+                if (list.copies[i].source == rrraycopy::Source::Stats)
+                    RecordRay(cl, list.copies[i], from);
+            Change(cl, t0, read, stats_state);
+        }
+        return list.bits;
+    }
 };
+// Each site has a slot per native source it reads; the sites' slots are disjoint and fit.
+static_assert(GpuFrame::RayResolveSite.first == 0 &&
+                  GpuFrame::RayResolveSite.slots == rrraycopy::NativeSources &&
+                  GpuFrame::RayApplySite.first ==
+                      GpuFrame::RayResolveSite.first + GpuFrame::RayResolveSite.slots &&
+                  GpuFrame::RayApplySite.slots == unsigned(rrraycopy::Source::B3) + 1 &&
+                  GpuFrame::RayPatchSite.first ==
+                      GpuFrame::RayApplySite.first + GpuFrame::RayApplySite.slots &&
+                  GpuFrame::RayPatchSite.slots == unsigned(rrraycopy::Source::B1) + 1 &&
+                  GpuFrame::RayPatchSite.first + GpuFrame::RayPatchSite.slots ==
+                      GpuFrame::RaySourceSlots,
+              "resolve b1, b3, t0; apply b1, b3; patch b1");
 inline bool SlotReservationParts(ID3D12Device *device, const rrlive::GpuFrame &frame, UINT64 limit,
                                  UINT64 &base, UINT64 &depth) {
     base = depth = 0;

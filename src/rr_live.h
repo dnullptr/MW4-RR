@@ -69,6 +69,21 @@ class Controller {
         std::array<float, 16> view{}, projection{};
         std::array<Observed, 4> states{};
         rreval::Options options;
+        // The ray budget test (rr_ray_budget.h); `s = {}` clears it at retirement. ray_lists is
+        // this recording's apply proof, ray_budget/ray_armed the raised lobes and arming snapshot
+        // of the Budget that apply read, ray_patched/ray_written/ray_patch_armed the patch's,
+        // ray_serial the recording's ray-log serial (0 until a ray site ran), ray_done that the
+        // recording was judged or counted unverified. ray_resolve_budget_* is the Budget identity
+        // its resolve proved (0 when not proven): an apply reading it is same-frame (A2).
+        // ray_old_mark: an apply consumed a mark of an older generation (counted unverified).
+        rrraybudget::Lists ray_lists;
+        UINT64 ray_apply_cb{}, ray_resolve_cb{};
+        UINT64 ray_resolve_budget_resource{}, ray_resolve_budget_offset{};
+        unsigned ray_logged{}, ray_patched{}, ray_budget{};
+        std::array<UINT, 2> ray_written{};
+        bool ray_resolved{}, ray_applied{}, ray_done{}, ray_old_mark{};
+        UINT ray_serial{};
+        rrraybudget::Armed ray_armed{}, ray_patch_armed{};
         rrcapture::Capture captured; // The frame recorded on this slot, if any.
         rrcapture::Lighting lighting; // What its first spatial passes prepared, while capturing.
         // Held until the slot retires: a replayed SR recording must never copy into freed memory.
@@ -451,6 +466,7 @@ class Controller {
             parameters = nullptr;
         }
         for (auto &s : slots) {
+            RayUnverified(s);
             s.gpu.Release(budget);
             s = {};
         }
@@ -460,14 +476,17 @@ class Controller {
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
-        // The test textures were in the persistent ledger; give back the reserve
-        // they added, never below what is still allocated.
+        // The test textures were in the persistent ledger and the ray buffers in the slots;
+        // give back the reserve they added (test_reserve, ray_reserve, saturating), never below
+        // what is still allocated.
         sky_edge_test = color_test = depth_test = wide_output = weapon_test = hit_scratch = {};
         weapon_linear = false;
         weapon_logged = {};
-        budget.limit = (std::max)({Budget::Minimum, budget.bytes,
-                                   budget.limit - (std::min)(test_reserve, budget.limit)});
-        test_reserve = 0;
+        const UINT64 reserved =
+            test_reserve > UINT64_MAX - ray_reserve ? UINT64_MAX : test_reserve + ray_reserve;
+        budget.limit = (std::max)(
+            {Budget::Minimum, budget.bytes, budget.limit - (std::min)(reserved, budget.limit)});
+        test_reserve = ray_reserve = 0;
         applied_color_scale = 1.0f;
         applied_contrast_knee = 0.0f;
         init_list.Reset();
@@ -486,6 +505,10 @@ class Controller {
         api = {};
         selected_view = UINT_MAX;
         key = {};
+        RayRestart(); // the ray budget test proves the new generation's lists again
+        for (auto &p : rrraybudget::published)
+            p.store(0, std::memory_order_relaxed);
+        ray_list_offsets = {};
         if (++generation == 0) {
             Failure("RR feature generation overflow");
             return false;
@@ -537,8 +560,12 @@ class Controller {
                 // A frame whose gate never ran never reached RR: no guide counts for it.
                 health.Frame(v, {finite[0], finite[1], sss, glass, s.gate_recorded && s.hit_used,
                                  s.gate_recorded && s.responsivity_used});
-                if (s.gate_recorded && s.native_sampling)
-                    density.Add(s.gpu.ReadRates());
+                if (s.gate_recorded && s.native_sampling) {
+                    const auto rates = s.gpu.ReadRates();
+                    density.Add(rates);
+                    RayCompleted(s, rates);
+                } else
+                    RayUnverified(s); // raised frames without reader stats are not verified
                 if (s.gate_recorded && s.hit_conditioned)
                     hit_pixels.Add(s.gpu.ReadHitStats(), s.hit_mode, UINT64(s.gpu.w) * s.gpu.h);
                 else if (s.gate_recorded && s.hit_used && s.hit_test_on)
@@ -570,6 +597,7 @@ class Controller {
             }
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
                 !s.pending_sr && Complete(s, done)) {
+                RayUnverified(s);
                 // Another session's buffer is only dropped (s = {} below), never pooled.
                 if (s.captured.buffer && s.captured.session == capture.session) {
                     try {
@@ -596,15 +624,17 @@ class Controller {
             if (!done.empty())
                 WriteCaptureLocked(std::move(done));
         }
+        const UINT64 now = GetTickCount64();
         std::string report;
-        if (health.Report(GetTickCount64(), report))
+        if (health.Report(now, report))
             Log(report.c_str());
-        if (density.Report(GetTickCount64(), report))
+        if (density.Report(now, report))
             Log(report.c_str());
         if (hit_pixels.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (water_stats.Report(GetTickCount64(), report, water))
             Log(report.c_str());
+        RayReport(now);
     }
     // A submitted SR recording that resolves its guide hands it to later
     // SSS-masked lighting if admitted. A rejected one writes zeros, so a record
@@ -932,6 +962,7 @@ class Controller {
             capture.Finished(capture_outcome->ok, std::move(capture_outcome->text));
         CaptureChanged();
     }
+#include "rr_live_ray.inl"
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
@@ -1297,16 +1328,20 @@ class Controller {
             if (!s.gpu.rr_output) {
                 return false;
             }
-            UINT64 base = 0, depth = 0, water_bytes = 0;
+            UINT64 base = 0, depth = 0, water_bytes = 0, kept = 0;
             for (const auto &slot : slots) {
                 UINT64 b{}, d{};
                 if (!SlotReservationParts(pipelines.device.Get(), slot.gpu, budget.limit, b, d) ||
-                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.water.bytes)
+                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.water.bytes ||
+                    b - slot.gpu.sss.bytes - slot.gpu.water.bytes < slot.gpu.ray_bytes)
                     return false;
-                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.water.bytes);
+                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.water.bytes -
+                                            slot.gpu.ray_bytes);
                 depth = (std::max)(depth, d);
                 water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
+            if (!PersistentBytes(kept))
+                return false;
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
@@ -1323,10 +1358,10 @@ class Controller {
                                                                 s.gpu.h, stencil.samples);
             // Water test storage (rr_water.h) takes the otherwise unused hit term.
             if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, water_bytes,
-                                        persistent.bytes, required) ||
+                                        kept, required) ||
                 !budget.Reserve(pipelines.device.Get(), required) ||
-                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, water_bytes,
-                                        budget.limit, slots.size())) {
+                !rrsss::FitsOwnedBudget(base, depth, kept, optional_sss, water_bytes, budget.limit,
+                                        slots.size())) {
                 return false;
             }
         }
@@ -1555,6 +1590,7 @@ class Controller {
         if (enabled == value)
             return;
         enabled = value;
+        RayRestart(); // either edge: the ray budget test proves its lists again
         // Collecting holds readback buffers; an Armed capture keeps waiting for RR.
         if (!value && capture.state == rrcapture::State::Collecting)
             CaptureFailed("RR was turned off");
@@ -1724,6 +1760,10 @@ class Controller {
             s.gpu.WaterTarget(pipelines, rrwater::Wanted(water) && !water_failed &&
                                              PrepareWater(s.gpu, GetTickCount64()));
             s.pre = cl;
+            if (ray_early == cl) { // a resolve ran on this list before its guide prepass
+                ray_summary.BeforePrepass();
+                ray_early = nullptr;
+            }
             s.pre_live = true;
             s.awaiting_prepass = false;
             s.frame = camera_frame;
@@ -1814,6 +1854,79 @@ class Controller {
     }
     bool SamplingReady(ID3D12GraphicsCommandList *cl) {
         return bool(SamplingData(cl).buffer);
+    }
+    // The ray budget test's entry points (rr_vrrt_budget_render.h). All noexcept: they take the
+    // mutex, never call ComputeState or the trackers, and never fail RR.
+    // At the game's cs_vrrt_resolve: true once the patched native Dispatch was recorded (then
+    // `dispatched` is set and the caller skips the original), false to run it natively.
+    bool RayBudgetResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &in, UINT x,
+                          UINT y, UINT z, bool &dispatched) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            return RayResolveLocked(cl, in, x, y, z, dispatched);
+        } catch (...) {
+            return dispatched;
+        }
+    }
+    // Every cs_vrrt_resolve dispatch the hook sees, RR enabled or not: the Budget marks age by
+    // these. Lock-free (an atomic counter), so it is safe before any other check.
+    void RayBudgetResolveSeen() noexcept {
+        ray_resolves.fetch_add(1, std::memory_order_relaxed);
+    }
+    // At every recognised native VRRT apply: its list proof (ListsUnproven when not proven) and
+    // the constants its logging copies read.
+    void RayBudgetApply(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lists,
+                        const rrvrrt::RayApply &log) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            RayApplyLocked(cl, lists, log);
+        } catch (...) {
+        }
+    }
+    // At the game's cs_vrrt_clear_counters: counted inside or outside an RR guide recording.
+    void RayBudgetClear(ID3D12GraphicsCommandList *cl) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            bool in = false;
+            for (const auto &s : slots)
+                in |= RawSlot(s, cl);
+            ray_summary.Clear(in);
+        } catch (...) {
+        }
+    }
+    // An indirect command that read the published ray list `handle` of lobe `c.lobe`. The hook
+    // passes the argument buffer's offset through unchanged; it is made relative to the list's
+    // view here, with the view offset of the same apply that published the handle. A handle that
+    // is no longer published (a later apply or Reconfigure replaced it) is ignored.
+    void RayBudgetConsumer(rrraybudget::Consumer c, std::uint64_t handle) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            if (c.lobe >= 2 || !handle ||
+                rrraybudget::published[c.lobe].load(std::memory_order_relaxed) != handle)
+                return;
+            if (c.offset >= ray_list_offsets[c.lobe])
+                c.offset -= ray_list_offsets[c.lobe];
+            ray_summary.Consumer(c);
+        } catch (...) {
+        }
+    }
+    // An exception in a ray budget hook: stops the test for the session; RR is unaffected.
+    void RayBudgetException() noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            RayStop(rrraybudget::Why::Exception, "in a ray budget hook");
+        } catch (...) {
+        }
+    }
+    rrraybudget::Status RayBudgetStatus() noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            return StatusLocked(GetTickCount64());
+        } catch (...) {
+            rrraybudget::Status s;
+            s.mode = rrraybudget::Valid(rrraybudget::mode.load(std::memory_order_relaxed));
+            return s;
+        }
     }
     // The lighting a first spatial pass on cl prepared, on the slot SamplingData gives it rates
     // for; masked as in rrcapture::Meta. Without a capture this is one relaxed load.
@@ -2445,6 +2558,8 @@ class Controller {
     }
     void Reset(ID3D12GraphicsCommandList *cl) {
         std::lock_guard lock(mutex);
+        if (ray_early == cl)
+            ray_early = nullptr;
         for (auto &s : slots) {
             if (s.pre.Get() == cl)
                 s.pre_live = false;

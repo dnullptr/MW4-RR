@@ -6,6 +6,8 @@
 #include "../src/rr_live_policy.h"
 #include "../src/rr_guide_health.h"
 #include "../src/rr_ray_density.h"
+#include "../src/rr_ray_budget.h"
+#include "../src/rr_vrrt_rate.h"
 #include "../src/rr_lighting_source.h"
 #include "../src/rr_sss_mask.h"
 #include "../src/rr_responsivity.h"
@@ -18,8 +20,14 @@
 #include "../src/rr_hit_condition.h"
 #include "../src/rr_water.h"
 #include "../src/rr_guide_test.h"
+#include "../src/rr_gate_stats.h"
 #include <algorithm>
+#include <bit>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -125,6 +133,30 @@ static_assert(!rrsettings::HotkeyToggles(true, true, false, true));
 static_assert(!rrsettings::HotkeyToggles(true, false, true, true));
 static_assert(!rrsettings::HotkeyToggles(true, false, false, false));
 static_assert(!rrsettings::HotkeyToggles(false, false, false, true));
+// More rays: the readback frame appends the extra rays (bytes 228, 232), the raw requested rays
+// (236, 240), the largest raw codes (244, 248) and the requested pixels the reader could not model
+// (252); the ray density words end at byte 256, where the gate's non-finite counts start.
+static_assert(rrdensity::Limits == 34 && rrdensity::Settings1 == 38 && rrdensity::Extra == 41 &&
+              rrdensity::RawRays == 43 && rrdensity::RawMax == 45 && rrdensity::Unsupported == 47 &&
+              rrdensity::Count == 48);
+static_assert(rrdensity::Offset + 4 * rrdensity::Limits == 200 &&
+              rrdensity::Offset + 4 * rrdensity::Extra == 228 &&
+              rrdensity::Offset + 4 * rrdensity::RawRays == 236 &&
+              rrdensity::Offset + 4 * rrdensity::RawMax == 244 &&
+              rrdensity::Offset + 4 * rrdensity::Unsupported == 252 &&
+              rrdensity::Offset + 4 * rrdensity::Count == 256);
+// The slot's stats buffer: hit distance statistics, ray density words and the gate's non-finite
+// counts and the water prepass flags do not overlap, and all fit the 512 bytes: 0..19 health,
+// 20..63 hit, 64..255 ray density, 256..263 non-finite, 264..283 water flags.
+static_assert(rrhitcond::StatsOffset == 20 &&
+              rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
+              rrdensity::Offset == 64 &&
+              rrdensity::Offset + 4 * rrdensity::Count <= RR_STATS_NON_FINITE_COLOR &&
+              RR_STATS_NON_FINITE_COLOR == 256 && RR_STATS_NON_FINITE_OUTPUT == 260 &&
+              rrwater::PrepassOffset == RR_STATS_NON_FINITE_OUTPUT + 4 &&
+              rrwater::PrepassOffset + 4 * rrwater::PrepassCount == 284 &&
+              rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= rrgatestats::StatsBytes &&
+              rrgatestats::StatsBytes == 512);
 
 // Settings file lines as the game writes them, CRLF included.
 static std::string ConfigLine(const std::string &key, const std::string &value) {
@@ -624,11 +656,23 @@ int main() {
            "RR ray density (10s): frames=1"
            " | lobe1 raysPerRequestedPixel=1.000 raysPerScreenPixel=1.000 noFreshRay=0.0% "
            "allPixels[full=100.0% 1/2-1/4=0.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
-           "notRequested=0.0%] threshold=7 boundary=0"
+           "notRequested=0.0%] threshold=7 boundary=0 scheduledRaysPerScreenPixel=1.000 "
+           "extraRays=0 rawRays=0 rawMax=0"
            " | lobe2 raysPerRequestedPixel=0.250 raysPerScreenPixel=0.125 noFreshRay=87.5% "
            "allPixels[full=0.0% 1/2-1/4=50.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
-           "notRequested=50.0%] threshold=0 boundary=0"
-           " | enabled=0 promote=0 clamp=1");
+           "notRequested=50.0%] threshold=0 boundary=0 scheduledRaysPerScreenPixel=0.125 "
+           "extraRays=0 rawRays=0 rawMax=0"
+           " | enabled=0 promote=0 clamp=1 | unsupported=0");
+    assert(report.find("lobe1 raysPerRequestedPixel=1.000 raysPerScreenPixel=1.000 noFreshRay=0.0% "
+                       "allPixels[full=100.0%") != std::string::npos);
+    assert(report.find("lobe2 raysPerRequestedPixel=0.250 raysPerScreenPixel=0.125 "
+                       "noFreshRay=87.5% allPixels[full=0.0% 1/2-1/4=50.0%") != std::string::npos);
+    assert(report.find("notRequested=50.0%] threshold=0") != std::string::npos);
+    assert(report.find("lobe1 raysPerRequestedPixel=1.000 raysPerScreenPixel=1.000 noFreshRay=0.0% "
+                       "allPixels[full=100.0% 1/2-1/4=0.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
+                       "notRequested=0.0%] threshold=7") != std::string::npos);
+    assert(report.find("clamp=1") != std::string::npos);
+    assert(report.ends_with(" | enabled=0 promote=0 clamp=1 | unsupported=0"));
     report.clear();
     assert(!density.Report(1000 + 2 * rrdensity::Tracker::Interval, report) && report.empty());
 
@@ -650,21 +694,153 @@ int main() {
            "RR ray density (10s): frames=2"
            " | lobe1 raysPerRequestedPixel=0.383 raysPerScreenPixel=0.306 noFreshRay=69.4% "
            "allPixels[full=10.0% 1/2-1/4=30.0% 1/5-1/8=20.0% 1/9-1/15=10.0% 1/16+=10.0% "
-           "notRequested=20.0%] threshold=16 boundary=28"
+           "notRequested=20.0%] threshold=16 boundary=28 scheduledRaysPerScreenPixel=0.306 "
+           "extraRays=0 rawRays=0 rawMax=0"
            " | lobe2 raysPerRequestedPixel=0.333 raysPerScreenPixel=0.167 noFreshRay=83.3% "
            "allPixels[full=0.0% 1/2-1/4=50.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
-           "notRequested=50.0%] threshold=-1 boundary=5"
-           " | enabled=1 promote=1 clamp=0");
+           "notRequested=50.0%] threshold=-1 boundary=5 scheduledRaysPerScreenPixel=0.167 "
+           "extraRays=0 rawRays=0 rawMax=0"
+           " | enabled=1 promote=1 clamp=0 | unsupported=0");
     // The longest numbers the budget fields can print still fit (this line outgrew 512 bytes).
-    rrdensity::Tracker widest;
-    assert(!widest.Report(0, report));
+    rrdensity::Tracker budget_widest;
+    assert(!budget_widest.Report(0, report));
     rrdensity::Frame extreme = mix;
     for (unsigned i = 2 * rrdensity::Buckets; i < rrdensity::Count; ++i)
         extreme[i] = 0x80000000u;
-    widest.Add(extreme);
-    assert(widest.Report(rrdensity::Tracker::Interval, report));
+    budget_widest.Add(extreme);
+    assert(budget_widest.Report(rrdensity::Tracker::Interval, report));
     assert(report.size() > 512);
-    assert(report.ends_with(" | enabled=-2147483648 promote=-2147483648 clamp=-2147483648"));
+    assert(report.ends_with(" | enabled=-2147483648 promote=-2147483648 clamp=-2147483648"
+                            " | unsupported=2147483648"));
+
+    // Extra rays at pixels granted several rays are summed per window next to the raw requested
+    // rays (raw code - 15 of the pixels asking for one or more) and the largest raw code. They feed
+    // ScreenRays, never the per requested pixel density, whose value stays what the base report
+    // gave.
+    rrdensity::Tracker screen;
+    assert(!screen.Report(5000, report));
+    rrdensity::Frame granted{};
+    granted[1] = 100;                  // lobe 1: 100 pixels at full rate
+    granted[rrdensity::Buckets] = 100; // lobe 2: 100 pixels not requested
+    granted[rrdensity::Extra] = 50;
+    granted[rrdensity::RawRays] = 80;
+    granted[rrdensity::RawMax] = 20;
+    granted[rrdensity::Limits] = std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
+    granted[rrdensity::Unsupported] = 3; // requested pixels the reader could not model
+    screen.Add(granted);
+    assert(screen.Density(0) == 1.0 && screen.Density(1) == 0);
+    assert(screen.ScreenRays(0) == 1.5 && screen.ScreenRays(1) == 0);
+    granted[rrdensity::Extra] = 10;
+    granted[rrdensity::RawRays] = 5;
+    granted[rrdensity::RawMax] = 30;
+    granted[rrdensity::Extra + 1] = 7;
+    granted[rrdensity::RawRays + 1] = 9;
+    granted[rrdensity::RawMax + 1] = 4;
+    granted[rrdensity::Limits] = 0;
+    granted[rrdensity::Unsupported] = 4;
+    screen.Add(granted); // sums 60 / 85 / 7 / 9 and 7 unsupported; maxima 30 / 4
+    assert(screen.Density(0) == 1.0 && screen.ScreenRays(0) == 1.3); // (200 + 60) / 200
+    assert(screen.ScreenRays(1) == 7.0 / 200);                       // 7 extra rays, 200 pixels
+    assert(screen.Report(5000 + rrdensity::Tracker::Interval, report));
+    assert(report.find("threshold=0 boundary=0 scheduledRaysPerScreenPixel=1.300 extraRays=60 "
+                       "rawRays=85 rawMax=30 | lobe2 raysPerRequestedPixel=0.000") !=
+           std::string::npos);
+    assert(report.find(" scheduledRaysPerScreenPixel=0.035 extraRays=7 rawRays=9 rawMax=4 | "
+                       "enabled=0") != std::string::npos);
+    // The per screen pixel rate leaves the extra rays out.
+    assert(report.find("lobe1 raysPerRequestedPixel=1.000 raysPerScreenPixel=1.000 ") !=
+           std::string::npos);
+    assert(report.ends_with(" clamp=0 | unsupported=7"));
+    assert(screen.ScreenRays(0) == 0 && screen.ScreenRays(1) == 0); // the window starts over
+    // Lobe 2 has its own pixel counts: 60 pixels at full rate, 40 at 1/2, 100 not requested.
+    rrdensity::Frame second{};
+    second[rrdensity::Buckets] = 100;
+    second[rrdensity::Buckets + 1] = 60;
+    second[rrdensity::Buckets + 2] = 40;
+    second[rrdensity::Extra + 1] = 30;
+    screen.Add(second);
+    assert(screen.Density(1) == 80.0 / 100 && screen.ScreenRays(1) == (60 + 20 + 30) / 200.0);
+    assert(screen.ScreenRays(0) == 0);
+    // An unsupported threshold (INT_MIN) is printed as the int it is.
+    granted = {};
+    granted[1] = 1;
+    granted[rrdensity::Limits] = std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
+    screen.Add(granted);
+    assert(screen.Report(5000 + 2 * rrdensity::Tracker::Interval, report));
+    assert(report.find("threshold=-2147483648 boundary=0 scheduledRaysPerScreenPixel=") !=
+           std::string::npos);
+    // The longest report: every count at its widest stays inside the 1024-char buffer, untruncated.
+    rrdensity::Tracker widest;
+    assert(!widest.Report(0, report));
+    rrdensity::Frame full{};
+    for (auto &word : full)
+        word = 0xFFFFFFFFu;
+    for (unsigned i = 0; i < 2 * rrdensity::Buckets; ++i)
+        full[i] = 1;
+    for (unsigned i = rrdensity::Limits; i < rrdensity::Extra; ++i)
+        full[i] = std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
+    for (unsigned k = 0; k < 100000; ++k)
+        widest.Add(full);
+    assert(widest.Report(rrdensity::Tracker::Interval * 100000, report));
+    assert(report.size() < 1024 && report.find("frames=100000") != std::string::npos);
+    assert(report.find("rawMax=4294967295 | enabled=-2147483648 promote=-2147483648 "
+                       "clamp=-2147483648") != std::string::npos);
+    assert(report.ends_with(" clamp=-2147483648 | unsupported=429496729500000"));
+    std::printf("longest density report: %zu chars\n", report.size());
+
+    // Extra rays per pixel come from the shared rate rule: a request code of 16 or more is
+    // code - 15 rays, so code - 16 beyond the first. The denominator is unchanged.
+    // rate(packed, enabled, threshold, clamp, promote, boundary, ring); no budget unless enabled.
+    auto rate = [](unsigned packed, int enabled = 0, int threshold = 0, int clamp = 0,
+                   int promote = 0, int boundary = 0, int ring = 0) {
+        return rrvrrt::InverseRate(packed, enabled, promote, clamp, threshold, boundary, ring);
+    };
+    for (unsigned code = 0; code < 256; ++code) { // no budget: the code alone decides
+        const rrvrrt::Rate r = rate(code);
+        assert(r.supported && r.denominator == (code >= 16 ? 1u : 16u - code));
+        assert(r.extra == (code >= 16 ? code - 16 : 0u));
+    }
+    assert(rate(15).extra == 0 && rate(16).extra == 0 && rate(17).extra == 1);
+    assert(rate(200).extra == 184 && rate(200).denominator == 1 && rate(255).extra == 239);
+    // The code is the low byte of the low 16 bits; 0xFFFF alone means "not requested".
+    assert(rate(0x1211).extra == 1 && rate(0x10000 | 17).extra == 1);
+    assert(rate(0x00FF).extra == 239);
+    const rrvrrt::Rate none = rate(0xFFFF);
+    assert(none.supported && none.denominator == 0 && none.extra == 0);
+    const rrvrrt::Rate high = rate(0x0011FFFFu); // bits above the low 16 do not count
+    assert(high.supported && high.denominator == 0 && high.raw == 0 && high.extra == 0);
+    // Budget clamping happens first. Threshold 18 allows codes below 17; codes 17 and above become
+    // 16 inside a tile ring at or below the boundary and 17 outside it.
+    assert(rate(30, 1, 18, 1, 0, 0, 1).extra == 1 && rate(30, 1, 18, 1, 0, 0, 0).extra == 0);
+    assert(rate(30, 1, 18, 1, 0, 2, 2).extra == 0 && rate(30, 1, 18, 1, 0, 1, 2).extra == 1);
+    assert(rate(255, 1, 18, 1, 0, 0, 1).extra == 1);
+    assert(rate(17, 1, 18, 1, 0, 0, 1).extra == 1 && rate(17, 1, 18, 1, 0, 0, 0).extra == 0);
+    assert(rate(30, 1, 18, 1, 0, 0, 1).denominator == 1 && rate(5, 1, 18, 1, 0, 0, 1).extra == 0);
+    assert(rate(5, 1, 18, 1, 0, 0, 1).denominator == 11 && rate(16, 1, 18, 1, 0, 0, 1).extra == 0);
+    assert(rate(255, 1, 100, 1, 0, 0, 0).extra == 82 && rate(255, 1, 100, 1, 0, 0, 1).extra == 83);
+    assert(rate(30, 1, 18, 0, 0, 0, 1).extra == 14); // clamping off
+    assert(rate(30, 0, 18, 1, 0, 0, 1).extra == 14); // budget control off
+    assert(rate(30, 1, 0, 1, 0, 0, 1).extra == 14 && rate(30, 1, -18, 1, 0, 0, 1).extra == 14);
+    assert(rate(30, 1, 1, 1, 0, 0, 0).extra == 0 && rate(30, 1, 1, 1, 0, 0, 0).denominator == 17);
+    // A negative threshold promotes codes up to its limit to the limit (+1 outside the boundary).
+    assert(rate(3, 1, -18, 1, 1, 0, 0).extra == 1 && rate(3, 1, -18, 1, 1, 0, 1).extra == 2);
+    assert(rate(17, 1, -18, 1, 1, 0, 0).extra == 1 && rate(18, 1, -18, 1, 1, 0, 0).extra == 2);
+    assert(rate(30, 1, -18, 1, 1, 0, 1).extra == 14 && rate(3, 1, -18, 1, 0, 0, 1).extra == 0);
+    assert(rate(3, 1, 18, 1, 1, 0, 1).extra == 0 && rate(3, 1, 18, 1, 1, 0, 1).denominator == 13);
+    // An unsupported budget gives no rays and no extra.
+    const rrvrrt::Rate unsupported = rate(200, 1, (std::numeric_limits<int>::min)());
+    assert(!unsupported.supported && unsupported.denominator == 0 && unsupported.extra == 0);
+    assert(rate(200, 0, (std::numeric_limits<int>::min)()).extra == 184); // only when enabled
+
+    // raw is the request code before the budget transform (0 when nothing is requested), so the
+    // rays the game asked for can be told apart from the ones the transform adds.
+    for (unsigned code = 0; code < 256; ++code)
+        assert(rate(code).raw == code && rate(0x1200 | code).raw == code);
+    assert(rate(0xFFFF).raw == 0 && rate(0xFFFF, 1, 18, 1, 0, 0, 1).raw == 0);
+    assert(rate(30, 1, 18, 1, 0, 0, 1).raw == 30 && rate(30, 1, 18, 1, 0, 0, 1).extra == 1);
+    assert(rate(3, 1, -18, 1, 1, 0, 1).raw == 3 && rate(3, 1, -18, 1, 1, 0, 1).extra == 2);
+    assert(unsupported.raw == 200 && rate(200, 1, (std::numeric_limits<int>::min)()).raw == 200);
+    assert(none.raw == 0 && rate(0).raw == 0 && rate(0).denominator == 16);
 
     // Water responsivity needs preset F, a nonzero strength and this frame's water.
     rrwater::Settings water;
@@ -714,7 +890,7 @@ int main() {
            report.empty() && coverage.Last() == 0.0);
     // The latest frame stays on the panel across reports.
     assert(coverage.LastPrepass(rrwater::Special) == 0.1);
-    static_assert(rrwater::PrepassCount == 5 && rrwater::PrepassOffset == 236);
+    static_assert(rrwater::PrepassCount == 5 && rrwater::PrepassOffset == 264);
 
     // Specular hit distance tests: classification, hole filling and the summaries.
     {

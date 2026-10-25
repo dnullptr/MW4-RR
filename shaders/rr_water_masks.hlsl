@@ -1,5 +1,6 @@
 // Development masks for running water (src/rr_water.h). Runs at SR time on
 // the water classification the guide shader wrote at this frame's prepass.
+#include "../src/rr_gate_stats.h" // RR_STATS_WATER_PREPASS
 cbuffer Control:register(b0){uint Width,Height,OutputW,OutputH;uint Serial,ResetHistory,Accepted,SssAccepted;uint Replacement,ColorX,ColorY,Flags;float Responsivity,OutputScale,WaterResponsivity;uint WaterFlags;}
 // The SSS responsivity mask this frame's SSS resolve wrote; a null view
 // unless WaterFlags bit2 says it is merged.
@@ -12,11 +13,11 @@ RWTexture2D<float> Disocclusion:register(u1);
 // In: the guide shader's water code/255 (RRWaterCode in rr_convert_guides.hlsl).
 // Out: 1 on water, 0 elsewhere, which is also RR's animated texture mask.
 RWTexture2D<float> Water:register(u2);
-// Byte 16: water pixels this frame. Bytes 236-255 (rrwater::PrepassOffset):
+// Byte 16: water pixels this frame. Bytes 264-283 (rrwater::PrepassOffset):
 // pixels per code bit, in rrwater::Prepass order. GpuFrame::WaterPass zeroes both
 // first.
 RWByteAddressBuffer Stats:register(u3);
-static const uint FlagResponsivity=1,FlagDiscard=2,FlagSssMask=4,FlagOffset=236;
+static const uint FlagResponsivity=1,FlagDiscard=2,FlagSssMask=4,FlagOffset=RR_STATS_WATER_PREPASS;
 void Count(bool value,uint offset){
  uint count=WaveActiveCountBits(value);
  if(count!=0&&WaveIsFirstLane()){uint old;Stats.InterlockedAdd(offset,count,old);}

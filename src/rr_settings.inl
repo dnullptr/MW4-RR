@@ -6,6 +6,7 @@
 #include "rr_water.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
+#include "rr_ray_budget.h"
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
@@ -278,6 +279,22 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "tests.");
     if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
         ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
+    // Session only: the combo never sets `changed`, so the test is never saved or loaded.
+    int ray_budget = static_cast<int>(rrraybudget::Valid(rrraybudget::mode));
+    if (ImGui::Combo("Ray budget test (experimental)", &ray_budget, rrraybudget::labels,
+                     rrraybudget::Count))
+        rrraybudget::mode = rrraybudget::Valid(static_cast<unsigned>(ray_budget));
+    char ray_status[192];
+    rrraybudget::Describe(LiveRR().RayBudgetStatus(), ray_status, sizeof(ray_status));
+    ImGui::Text("Ray budget test: %s", ray_status);
+    ImGui::TextWrapped("%s", "Session only, never saved. Raises the target of the game's own ray "
+                             "budget (1.5x, 2x, or up to about one ray per requested pixel) so it "
+                             "traces more rays. Pixels the game asks to multi-sample normally keep "
+                             "their extra rays; in a frame that would overfill the ray lists, a "
+                             "raised lobe is held to one ray per pixel. Starts only after the ray "
+                             "lists are proven large enough over 120 frames, costs GPU time, and "
+                             "stops itself for the session with a ReShade.log line if any check "
+                             "fails.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
         LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();
