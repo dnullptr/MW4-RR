@@ -332,10 +332,7 @@ class Controller {
         return responsivity_active && enabled && !failed && !retired && sss_enabled &&
                !sss_failed &&
                rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
-                                   preset.has_effective, preset.effective) &&
-               !rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
-                               rrskyedge::strength.load(std::memory_order_relaxed),
-                               preset.has_effective, preset.effective);
+                                   preset.has_effective, preset.effective);
     }
     // Whether the latest evaluation sent the sky edge mask and it would still be sent now.
     bool SkyEdgeActive() {
@@ -491,8 +488,8 @@ class Controller {
                 base = (std::max)(base, b - slot.gpu.sss.bytes);
                 depth = (std::max)(depth, d);
             }
-            auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
-            texture.Flags = D3D12_RESOURCE_FLAG_NONE;
+            // Same flags as the private depth copy (PrepareSR).
+            const auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
             const auto texture_bytes =
                            pipelines.device->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes,
@@ -1187,9 +1184,11 @@ class Controller {
                                sky_edge_strength, preset.has_effective, preset.effective);
             if (sky_edge_active) {
                 try {
-                    s->gpu.PrepareSkyEdge(pipelines, budget);
+                    sky_edge_active = s->gpu.PrepareSkyEdge(pipelines, budget);
                 } catch (const rrprivate::AllocationDeferred &) {
                     sky_edge_active = false;
+                }
+                if (!sky_edge_active) {
                     static bool reported{};
                     if (!reported) {
                         reported = true;

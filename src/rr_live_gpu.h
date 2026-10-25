@@ -247,8 +247,6 @@ struct GpuFrame {
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R32_UINT)))
             return 0;
         auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
-        if (!add(distance)) // sky edge responsivity mask
-            return 0;
         distance.Flags = D3D12_RESOURCE_FLAG_NONE;
         if (!add(distance))
             return 0;
@@ -622,13 +620,26 @@ struct GpuFrame {
         Change(cl, rr_output.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    // Allocated on first use, before recording; RequiredPrepassBytes already
-    // reserves it, so the mask costs no GPU memory while it stays off.
-    void PrepareSkyEdge(Pipelines &p, Budget &b) {
+    // Development tests allocate on first use, before recording, and are not
+    // part of RequiredPrepassBytes. Grows the reserve when the device has room;
+    // false (never a throw) when it has none, so a test can't stop RR.
+    bool TestRoom(Pipelines &p, Budget &b, const D3D12_RESOURCE_DESC &d) {
+        const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        if (!n || n == UINT64_MAX)
+            return false;
+        if (n <= b.limit && b.bytes <= b.limit - n)
+            return true;
+        return b.bytes <= UINT64_MAX - n && b.Reserve(p.device.Get(), b.bytes + n);
+    }
+    bool PrepareSkyEdge(Pipelines &p, Budget &b) {
         if (sky_edge)
-            return;
-        sky_edge = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
+            return true;
+        const auto d = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        if (!TestRoom(p, b, d))
+            return false;
+        sky_edge = Allocate(p, b, d);
         UAV(p, sky_edge.Get(), 12);
+        return true;
     }
     // Between GateBegin and GateEnd: Status (guides[3]) is a shader resource.
     // Leaves the mask readable by RR; SkyEdgeFinish returns it to COMMON.
@@ -653,14 +664,11 @@ struct GpuFrame {
         Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_COMMON);
     }
-    // Color scale test. Not reserved in RequiredPrepassBytes: returns false
-    // instead of allocating when the frame pool's reserve has no room left.
     bool PrepareScaledColor(Pipelines &p, Budget &b) {
         if (scaled_color)
             return true;
         const auto d = TextureDesc(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
-        if (!n || n > b.limit || b.bytes > b.limit - n)
+        if (!TestRoom(p, b, d))
             return false;
         scaled_color = Allocate(p, b, d);
         UAV(p, scaled_color.Get(), 14);

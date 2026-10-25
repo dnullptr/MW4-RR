@@ -153,7 +153,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                      : !sky_edge                ? "off"
                                      : rrresponsivity::Clamp(edge_strength) == 0
                                          ? "off (strength 0)"
-                                         : "waiting (needs preset F)");
+                                         : "waiting (needs preset F and free GPU memory)");
     ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
                        "steadier over time; moving branches may ghost. While on, it replaces the "
                        "SSS responsivity mask.");

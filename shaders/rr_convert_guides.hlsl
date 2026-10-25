@@ -1,5 +1,10 @@
 #include "rr_guide_math.hlsli"
 
+// Development guide tests for thin-geometry noise (rr_guide_test.h). 0 = normal guides.
+#ifndef RR_GUIDE_TEST
+#define RR_GUIDE_TEST 0
+#endif
+
 // Inputs must be private copies from the same validated prepass/SR submission.
 // Caller must establish the current per-pixel parity addressing. This shader does
 // not prove frame association or manage resource states or RR evaluation.
@@ -97,10 +102,6 @@ void main(uint3 id : SV_DispatchThreadID)
     float length2=dot(ray,ray);
     if(!RRFinite(length2) || length2<1e-20)return;
     ray*=rsqrt(length2);
-    // Development guide tests for thin-geometry noise (rr_guide_test.h). 0 = normal guides.
-#ifndef RR_GUIDE_TEST
-#define RR_GUIDE_TEST 0
-#endif
 #if RR_GUIDE_TEST==1
     if(dot(normal,ray)>0)normal=-normal; // back faces (e.g. foliage undersides) face the camera
 #elif RR_GUIDE_TEST==3
