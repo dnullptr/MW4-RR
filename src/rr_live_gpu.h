@@ -621,15 +621,13 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     // Development tests allocate on first use, before recording, and are not
-    // part of RequiredPrepassBytes. Grows the reserve when the device has room;
-    // false (never a throw) when it has none, so a test can't stop RR.
+    // part of RequiredPrepassBytes. Each one raises the reserve by its own size,
+    // so it never takes room the pool kept for its own lazy allocations; false
+    // (never a throw) when the device has no room, so a test can't stop RR.
     bool TestRoom(Pipelines &p, Budget &b, const D3D12_RESOURCE_DESC &d) {
         const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
-        if (!n || n == UINT64_MAX)
-            return false;
-        if (n <= b.limit && b.bytes <= b.limit - n)
-            return true;
-        return b.bytes <= UINT64_MAX - n && b.Reserve(p.device.Get(), b.bytes + n);
+        return n && n != UINT64_MAX && b.limit <= UINT64_MAX - n &&
+               b.Reserve(p.device.Get(), b.limit + n);
     }
     bool PrepareSkyEdge(Pipelines &p, Budget &b) {
         if (sky_edge)

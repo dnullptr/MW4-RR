@@ -88,6 +88,10 @@ class Controller {
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
     bool responsivity_enabled{}, responsivity_active{}, sky_edge_active{}, color_scale_active{};
+    // Color scale RR's history was built with, and a mode whose scaled copy
+    // could not be allocated (kept off for every slot until the mode changes).
+    float applied_color_scale = 1.0f;
+    unsigned color_scale_blocked = rrcolorscale::Off;
     float responsivity_strength = rrresponsivity::DefaultStrength;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
@@ -1201,24 +1205,31 @@ class Controller {
                 rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
                                     preset.has_effective, preset.effective);
             // Color scale test: needs the color at the subrect origin and room in the reserve.
-            const float color_scale =
-                rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
+            const unsigned color_mode =
+                rrcolorscale::Valid(rrcolorscale::mode.load(std::memory_order_relaxed));
+            const float color_scale = rrcolorscale::Factor(color_mode);
+            if (color_mode != color_scale_blocked)
+                color_scale_blocked = rrcolorscale::Off;
             color_scale_active = false;
-            if (color_scale != 1.0f && !o.color_x && !o.color_y) {
+            if (color_scale != 1.0f && color_mode != color_scale_blocked && !o.color_x &&
+                !o.color_y) {
                 try {
                     color_scale_active = s->gpu.PrepareScaledColor(pipelines, budget);
                 } catch (const rrprivate::AllocationDeferred &) {
                 }
                 if (!color_scale_active) {
-                    static bool reported{};
-                    if (!reported) {
-                        reported = true;
-                        Log("Color scale test waiting for GPU memory; RR gets the game's color");
-                    }
+                    // Off for every slot, so frames never alternate between scales.
+                    color_scale_blocked = color_mode;
+                    Log("Color brightness test has no GPU memory for its copy; it stays off "
+                        "until another level is picked");
                 }
             }
             if (color_scale_active)
                 s->gpu.OutputScale(1.0f / color_scale);
+            // RR's history is in the previous scale: start it over when the scale changes.
+            const float applied = color_scale_active ? color_scale : 1.0f;
+            const bool color_scale_changed = applied != applied_color_scale;
+            applied_color_scale = applied;
             // The SSS guide and color before transparency are in the game's color
             // scale, so they are left out while the test scales RR's color.
             rreval::Resources resources{color_scale_active ? s->gpu.scaled_color.Get()
@@ -1252,7 +1263,7 @@ class Controller {
             }
             rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
                                        projection.data());
-            parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
+            parameters->Set(NVSDK_NGX_Parameter_Reset, reset || color_scale_changed ? 1 : 0);
             s->gpu.Depth(cl.Get(), states[1]);
             if (rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
                     rrguidetest::SkySurface &&
