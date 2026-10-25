@@ -31,6 +31,8 @@ MIXED_LIGHTING = 0xFFFFFFFF  # A frame's lighting_input when it changed within t
 # Per-frame lighting_masked: whether an SSS-masked lighting input had its SSS guide.
 MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
           None: 'not SSS-masked or not known'}
+# The same, on the lighting input line, when every frame has one value.
+MASKED_ALL = {True: 'SSS guide applied', False: 'SSS guide missing on every frame: raw lighting'}
 # Per-frame test settings and their off values; the summary shows only the ones that are on.
 FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
                'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
@@ -137,7 +139,11 @@ def summary(manifest, frames):
              f'settings {json.dumps(m["settings"], separators=(",", ":"))}']
     lobe = m['settings'].get('lighting_input')
     if type(lobe) is int:
-        lines.append(f'lighting input {lobe}: {lighting_label(lobe)}')
+        guides = {json.dumps(f.get('lighting_masked')) for f in m['frames']}  # True is not 1.
+        guide = m['frames'][0].get('lighting_masked') if len(guides) == 1 else None
+        note = '' if guide is None else (f' ({MASKED_ALL[guide]})' if type(guide) is bool else
+                                         f' (lighting_masked={json.dumps(guide)}: ?)')
+        lines.append(f'lighting input {lobe}: {lighting_label(lobe)}{note}')
     setups = {tuple(f.get(k) for k in ('lighting_input', 'lighting_masked', *FRAME_TESTS))
               for f in m['frames']}
     masked = any(f.get('lighting_masked') is not None for f in m['frames'])
@@ -306,7 +312,20 @@ def self_test():
         expect(any(line.startswith('frame 1 ') and
                    line.endswith('lighting_masked=null (not SSS-masked or not known)')
                    for line in lines), f'frame 1 not known: {lines}')
-        masked['frames'][0]['lighting_masked'] = None
+        masked['frames'][1]['lighting_masked'] = 2  # Not a value the addon writes.
+        lines = summary(masked, frames)
+        expect(any(line.startswith('frame 1 ') and line.endswith('lighting_masked=2 (?)')
+                   for line in lines), f'frame 1 unknown value: {lines}')
+        # The lighting input line says it when every frame shares one value.
+        header = 'lighting input 12: SSS pixels: both lobes fill gaps'
+        for values, note in (([True, True], ' (SSS guide applied)'),
+                             ([False, False], ' (SSS guide missing on every frame: raw lighting)'),
+                             ([2, 2], ' (lighting_masked=2: ?)'), ([True, False], ''),
+                             ([True, None], ''), ([True, 1], ''), ([None, None], '')):
+            for f, v in zip(masked['frames'], values):
+                f['lighting_masked'] = v
+            lines = summary(masked, frames)
+            expect(header + note in lines, f'lighting input line for {values}: {lines[:3]}')
         lines = summary(masked, frames)
         expect(not any('lighting_masked' in line or line.startswith('warning') for line in lines),
                f'all null: nothing printed, nothing warned: {lines}')
@@ -336,7 +355,15 @@ def self_test():
         lines = summary(stated, frames)
         expect('input states: color layouts (0x40), depth contract, motion proven' in lines,
                f'input states of frame 0, addon ones left out: {lines[:4]}')
-        expect('warning: the frames differ in input states' in lines, 'differing states warned')
+        # Frame 1 a copy of frame 0 but for one input's state_before, or its state.
+        for name, key, value in (('color', 'state_before', 0x80), ('motion', 'state', 'contract')):
+            differ = json.loads(json.dumps(stated))
+            differ['frames'][1] = json.loads(json.dumps(stated['frames'][0]))
+            differ['frames'][1]['inputs'][name][key] = value
+            lines = summary(differ, frames)
+            expect('warning: the frames differ in input states' in lines and
+                   'warning: the frames differ in lighting input or test settings' not in lines,
+                   f'frames that differ only in {name} {key} are warned: {lines[:5]}')
         same = {**stated, 'frames': [stated['frames'][0]] * 2}
         lines = summary(same, frames)
         expect('input states: color layouts (0x40), depth contract, motion proven' in lines and

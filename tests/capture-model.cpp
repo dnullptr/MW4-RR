@@ -282,6 +282,12 @@ static void LightingNotes() {
         l.Stamp(m, 7);
         assert(m.lighting_input == MixedLighting && m.lighting_masked == -1);
     }
+    Lighting three; // Nor does a third, different lobe.
+    three.Note(9, 1);
+    three.Note(4, 1);
+    three.Note(5, 1);
+    three.Stamp(m, 7);
+    assert(m.lighting_input == MixedLighting && m.lighting_masked == -1);
 }
 static void MaskedLightingBreaksRun() {
     // Same lobe, but its SSS guide goes missing at 43, so 40..42 cannot lead into it.

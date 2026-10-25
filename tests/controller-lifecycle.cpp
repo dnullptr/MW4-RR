@@ -111,7 +111,14 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{};
+static unsigned releases{}, destroys{}, log_lines{};
+static void CountLog(const char *) {
+    ++log_lines;
+}
+static std::string last_log;
+static void KeepLog(const char *s) {
+    last_log = s;
+}
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -424,6 +431,62 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.Reconfigure() && !c.slots[0].lighting.noted);
     }
+    static void ReplaceSkip() {
+        // Each refusal in TryReplaceSR names itself for this thread's evaluate
+        // (rrtrace::Probe::CurrentSkip), with or without a capture.
+        Controller c;
+        rrsparsecopy::Layouts layouts;
+        rrtrace::SlCall scope{};
+        const auto why = [&](bool safe) {
+            rrtrace::Probe::NoteSkip(rrsr::SkipCount);
+            assert(!c.TryReplaceSR(nullptr, nullptr, scope, nullptr, 0, safe, layouts));
+            return rrtrace::Probe::CurrentSkip();
+        };
+        assert(why(true) == rrsr::Off);
+        c.SetEnabled(true);
+        c.failed = true;
+        assert(why(true) == rrsr::Failed);
+        c.failed = false;
+        c.retired = true;
+        assert(why(true) == rrsr::Failed);
+        c.retired = false;
+        c.layout_pending = true;
+        assert(why(true) == rrsr::Reconfigure);
+        c.layout_pending = false;
+        assert(why(false) == rrsr::Unsafe);
+        assert(why(true) == rrsr::Scope); // No SL call.
+        scope = {true, sl::kFeatureDLSS, 5, 0};
+        assert(why(true) == rrsr::Scope); // No frame of that call.
+        auto &s = c.slots[0];
+        s.pre_live = true;
+        s.frame = 5;
+        s.viewport = 0;
+        assert(why(true) == rrsr::Scope); // Its SR call has not begun.
+        s.pending_sr = true;
+        assert(why(true) == rrsr::List); // Not on the SR call's list.
+        // The route log says why from the slot: a reason, or the failed proof.
+        c.logger = KeepLog;
+        const rrcapture::Sources sources{};
+        const std::array<unsigned, rrcapture::InputCount> from{};
+        s.skip = rrsr::ResetFixed;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log == "RR capture: native SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40; replacement not tried (reset parameter not "
+                           "writable)");
+        c.LogCaptureRoute(s, sources, from, true);
+        assert(last_log == "RR capture: RR replaces SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40");
+        s.proof_failed = true;
+        s.skip = rrsr::Ineligible;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not eligible: color missing, depth missing, "
+                                  "motion missing, output missing"));
+        s = {}; // Reset with the slot.
+        assert(s.skip == rrsr::NotCalled && !s.proof_failed);
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not tried (not called)"));
+        c.logger = nullptr;
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
@@ -432,6 +495,7 @@ struct ControllerCpuTest {
         WeaponDepth();
         HitDistanceTests();
         CaptureLighting();
+        ReplaceSkip();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);

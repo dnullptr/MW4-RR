@@ -131,8 +131,9 @@ struct Meta {
     Camera camera;
     double cpu_time_ms{};
     // The Lighting input (rr_lighting_source.h) this frame's lighting was prepared with, or
-    // MixedLighting. lighting_masked: 1 an SSS-masked input had its SSS guide, 0 it fell back to
-    // raw lighting, -1 neither (another input, not known, or mixed).
+    // MixedLighting: the requested input; a variant that failed to create prepares raw lighting
+    // under the same label. lighting_masked: 1 an SSS-masked input had its SSS guide, 0 it fell
+    // back to raw lighting, -1 neither (another input, not known, or mixed).
     unsigned lighting_input{};
     int lighting_masked = -1;
 };

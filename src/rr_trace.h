@@ -25,6 +25,7 @@
 #include <atomic>
 #include "rr_trace_model.h"
 #include "rr_sr_reset.h"
+#include "rr_sr_eligibility.h"
 #include <optional>
 
 namespace rrtrace {
@@ -359,6 +360,14 @@ class Probe {
     static CreationInfo CurrentCreation() {
         return current_creation;
     }
+    // Why this thread's current SR evaluate kept native SR (rrsr::Skip), for the capture log.
+    // EvalCommon sets it at the start of every evaluate; replace_evaluate names its own reason.
+    static unsigned CurrentSkip() {
+        return current_skip;
+    }
+    static void NoteSkip(unsigned why) {
+        current_skip = why;
+    }
     // Conservative process-wide generation: a shutdown of any observed public
     // runtime retires outstanding recorded work, including a later same-address init.
     static uint64_t RuntimeEpoch() {
@@ -507,6 +516,7 @@ class Probe {
     static inline thread_local SlCall current_call{};
     static inline thread_local HMODULE current_runtime{};
     static inline thread_local CreationInfo current_creation{};
+    static inline thread_local unsigned current_skip{};
     static inline std::atomic<uint64_t> runtime_epoch{};
     std::mutex poll_mutex;
     bool ready{};
@@ -624,6 +634,7 @@ class Probe {
                 current_creation = previous;
             }
         } runtime_scope(s.module, creation);
+        current_skip = cb ? rrsr::Callback : creation.valid ? rrsr::NotCalled : rrsr::Creation;
         if (self->before_evaluate)
             try {
                 self->before_evaluate(cl, kind, p);
@@ -635,7 +646,9 @@ class Probe {
             try {
                 rrsr::ResetParameter availability(p);
                 NVSDK_NGX_Result replacement_result = NVSDK_NGX_Result_FAIL_PlatformError;
-                if (availability.Ready() && self->replace_evaluate(cl, p, replacement_result) &&
+                const bool ready = availability.Ready();
+                current_skip = ready ? rrsr::Declined : rrsr::ResetFixed;
+                if (ready && self->replace_evaluate(cl, p, replacement_result) &&
                     NVSDK_NGX_SUCCEED(replacement_result)) {
                     std::lock_guard lock(self->mutex);
                     auto at = s.creation.find(reinterpret_cast<uintptr_t>(h));
@@ -645,6 +658,7 @@ class Probe {
                     return replacement_result;
                 }
             } catch (...) {
+                current_skip = rrsr::Threw;
                 self->Log("RR replacement unavailable; native SR retained");
             }
         }

@@ -75,6 +75,7 @@ class Controller {
         // TryReplaceSR's proof when it was not eligible while a capture was active.
         rrsr::StateProof proof;
         bool proof_failed{};
+        unsigned skip{}; // Why native SR ran (rrsr::Skip), kept by a capture of this frame.
     };
     struct Call {
         bool locked{};
@@ -678,6 +679,8 @@ class Controller {
                      unsigned(sources[k].state));
         if (!replacement && s.proof_failed)
             rrsr::Describe(s.proof, why, sizeof(why));
+        else if (!replacement)
+            snprintf(why, sizeof(why), " (%s)", rrsr::SkipText(s.skip));
         snprintf(line, sizeof(line), "RR capture: %s; input states: %s, %s, %s%s%s",
                  replacement ? "RR replaces SR" : "native SR", inputs[0], inputs[1], inputs[2],
                  replacement      ? ""
@@ -771,6 +774,8 @@ class Controller {
                     from[k] = rrcapture::Contract;
                 }
             }
+            if (!replacement) // Noted by the probe or TryReplaceSR on this thread's evaluate.
+                s.skip = rrtrace::Probe::CurrentSkip();
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
                 frame.buffer.Reset();
@@ -1892,12 +1897,27 @@ class Controller {
                       rrtrace::SlCall scope, HMODULE mod, UINT64 epoch, bool safe,
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired || NeedsReconfigure() || !safe || !scope.valid)
+        // Each refusal names itself for a capture's log (rrtrace::Probe::CurrentSkip).
+        const auto skip = [](unsigned why) {
+            rrtrace::Probe::NoteSkip(why);
             return false;
+        };
+        if (!enabled)
+            return skip(rrsr::Off);
+        if (failed || retired)
+            return skip(rrsr::Failed);
+        if (NeedsReconfigure())
+            return skip(rrsr::Reconfigure);
+        if (!safe)
+            return skip(rrsr::Unsafe);
+        if (!scope.valid)
+            return skip(rrsr::Scope);
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
         auto *s = Match(scope);
-        if (!native || !s || !s->pending_sr || s->sr.Get() != native.Get())
-            return false;
+        if (!s || !s->pending_sr)
+            return skip(rrsr::Scope);
+        if (!native || s->sr.Get() != native.Get())
+            return skip(rrsr::List);
         rrsr::StateProof proof;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
@@ -1905,6 +1925,8 @@ class Controller {
         }
         if (!rrsr::Eligible(proof)) {
             if (capture.Active()) { // CaptureLocked logs why; never fails replacement's caller.
+                s->proof = proof;   // Kept without aliasing when a lookup below throws.
+                s->proof_failed = true;
                 try {
                     for (unsigned i = 0; i < 4; ++i) {
                         D3D12_RESOURCE_STATES unaliased{};
@@ -1912,12 +1934,11 @@ class Controller {
                             proof.known[i] &&
                             !layouts.GetUnaliased(native.Get(), s->gpu.sr[i].Get(), unaliased);
                     }
-                    s->proof = proof;
-                    s->proof_failed = true;
+                    s->proof.aliased = proof.aliased;
                 } catch (...) {
                 }
             }
-            return false;
+            return skip(rrsr::Ineligible);
         }
         for (unsigned i = 0; i < 4; ++i)
             s->states[i] = {proof.states[i], true, true};
