@@ -6,14 +6,21 @@
 namespace rrdensity {
 // Layout written by shaders/rr_vrrt_probability.hlsl after the gate's 16 bytes:
 // per lobe 17 pixel counts by inverse rate (0 = not requested, 16 = 16 or more),
-// then lobe 1 and lobe 2 budget threshold/boundary, then enabled/promote/clamp.
-inline constexpr unsigned Buckets = 17, Offset = 64, Count = 2 * Buckets + 7;
+// then lobe 1 and lobe 2 budget threshold/boundary, then enabled/promote/clamp, then the extra
+// rays beyond the first at pixels granted 2 or more (lobe 1, lobe 2), then the apply shader's
+// cb1[2].x and .y as float bits (0 when not read).
+inline constexpr unsigned Buckets = 17, Offset = 64, Count = 2 * Buckets + 11;
+inline constexpr unsigned Limits = 2 * Buckets, RateSettings = Limits + 4, Extra = RateSettings + 3,
+                          Target = Extra + 2;
+static_assert(Target + 2 == Count);
 using Frame = std::array<std::uint32_t, Count>;
 // CPU-only summary of how many rays the game's VRRT schedules, logged
 // periodically to show how sparse the lighting RR receives is.
 class Tracker {
     std::array<std::uint64_t, 2 * Buckets> pixels{};
-    std::array<std::uint32_t, 7> last{};
+    std::array<std::uint64_t, 2> extra{};
+    std::array<std::uint32_t, Extra - Limits> last{};
+    static constexpr unsigned Settings = RateSettings - Limits;
     unsigned frames{};
     std::uint64_t since{};
     bool started{};
@@ -24,12 +31,15 @@ class Tracker {
         ++frames;
         for (unsigned i = 0; i < 2 * Buckets; ++i)
             pixels[i] += f[i];
+        for (unsigned lobe = 0; lobe < 2; ++lobe)
+            extra[lobe] += f[Extra + lobe];
         for (unsigned i = 0; i < last.size(); ++i)
-            last[i] = f[2 * Buckets + i];
+            last[i] = f[Limits + i];
     }
-    // Expected rays per requested pixel per frame for one lobe, 0..1.
+    // Expected rays per requested pixel per frame for one lobe, including the extra rays of
+    // pixels granted several, so it can exceed 1.
     double Density(unsigned lobe) const {
-        double rays = 0, requested = 0;
+        double rays = double(extra[lobe]), requested = 0;
         for (unsigned i = 1; i < Buckets; ++i) {
             const double n = double(pixels[lobe * Buckets + i]);
             rays += n / i;
@@ -70,7 +80,8 @@ class Tracker {
                     int(last[lobe * 2]), int(last[lobe * 2 + 1]));
             if (at > 0 && at < int(sizeof(text)))
                 std::snprintf(text + at, sizeof(text) - at, " | enabled=%d promote=%d clamp=%d",
-                              int(last[4]), int(last[5]), int(last[6]));
+                              int(last[Settings]), int(last[Settings + 1]),
+                              int(last[Settings + 2]));
             out = text;
         }
         *this = {};
