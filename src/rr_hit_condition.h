@@ -50,6 +50,9 @@ inline const char *OutcomeName(Outcome o) {
 class Diagnostics {
     std::mutex mutex;
     std::array<uint64_t, unsigned(Outcome::Count)> counts{};
+    // Conditioned frames whose PackedSurface had an aliasing barrier on its list
+    // since its last transition (see mw4_rr.cpp ConditionSpecularDistance).
+    uint64_t aliased{};
     Outcome last = Outcome::Count;
 
   public:
@@ -61,6 +64,10 @@ class Diagnostics {
         if (o != Outcome::Conditioned)
             last = o;
     }
+    void SurfaceAliased() {
+        std::lock_guard lock(mutex);
+        ++aliased;
+    }
     // Returns false when nothing happened in the window.
     bool Summary(char *text, size_t size) {
         std::lock_guard lock(mutex);
@@ -69,13 +76,15 @@ class Diagnostics {
             total += c;
         auto n = [&](Outcome o) { return static_cast<unsigned long long>(counts[unsigned(o)]); };
         snprintf(text, size,
-                 "Specular hit distance tests (10s): conditioned=%llu lastSkip=%s "
-                 "[no-slot=%llu no-copy=%llu weights=%llu surface=%llu context=%llu "
-                 "memory=%llu failed=%llu]",
-                 n(Outcome::Conditioned), OutcomeName(last), n(Outcome::NoSlot),
+                 "Specular hit distance tests (10s): conditioned=%llu surfaceAliased=%llu "
+                 "lastSkip=%s [no-slot=%llu no-copy=%llu weights=%llu surface=%llu "
+                 "context=%llu memory=%llu failed=%llu]",
+                 n(Outcome::Conditioned), static_cast<unsigned long long>(aliased),
+                 OutcomeName(last), n(Outcome::NoSlot),
                  n(Outcome::NoCopy), n(Outcome::Weights), n(Outcome::Surface),
                  n(Outcome::Context), n(Outcome::Memory), n(Outcome::Failed));
         counts = {};
+        aliased = 0;
         last = Outcome::Count;
         return total != 0;
     }
@@ -84,8 +93,9 @@ using Frame = std::array<uint32_t, StatCount>;
 // CPU-only summary of the pass's pixel counts, read back with the gate's.
 class Tracker {
     std::array<uint64_t, StatCount> pixels{};
-    uint64_t other{}; // pixels in none of the GPU's categories
-    unsigned frames{}, mode{};
+    uint64_t other{};      // pixels in none of the GPU's categories
+    uint64_t fill_holes{}; // holes in frames that ran the fill
+    unsigned frames{}, sky_frames{}, fill_frames{};
     uint64_t since{};
     bool started{};
     static double Percent(uint64_t part, uint64_t total) {
@@ -97,7 +107,11 @@ class Tracker {
     // frame_pixels: the pass's width x height.
     void Add(const Frame &f, unsigned frame_mode, uint64_t frame_pixels) {
         ++frames;
-        mode |= frame_mode;
+        sky_frames += (frame_mode & SkyMiss) ? 1 : 0;
+        if (frame_mode & FillHoles) {
+            ++fill_frames;
+            fill_holes += f[CountHole];
+        }
         for (unsigned i = 0; i < StatCount; ++i)
             pixels[i] += f[i];
         const uint64_t counted = uint64_t(f[CountSky]) + f[CountViewmodel] +
@@ -118,24 +132,25 @@ class Tracker {
         const bool active = frames != 0;
         if (active) {
             const auto &p = pixels;
-            const uint64_t traced = p[CountHit] + p[CountMiss] + p[CountHole];
-            const uint64_t all = traced + p[CountSky] + p[CountViewmodel] +
+            // Surfaces the tests may change: a hit, a miss or no ray this frame.
+            const uint64_t surfaces = p[CountHit] + p[CountMiss] + p[CountHole];
+            const uint64_t all = surfaces + p[CountSky] + p[CountViewmodel] +
                                  p[CountNoRtSpecular] + other;
-            char text[640];
+            char text[700];
             snprintf(text, sizeof(text),
-                     "Specular hit distance pixels (%llus): frames=%u skyMiss=%d fill=%d | "
-                     "sky=%.1f%% viewmodel=%.1f%% noRtSpecular=%.1f%% other=%.1f%% traced=%.1f%% "
-                     "| of traced: hit=%.1f%% miss=%.1f%% noRay=%.1f%% | of noRay: "
-                     "filledFromHits=%.1f%% filledAsMiss=%.1f%% | checks: hitWithoutLobe1Ray=%.2f%% "
+                     "Specular hit distance pixels (%llus): frames=%u skyMissFrames=%u "
+                     "fillFrames=%u | sky=%.1f%% viewmodel=%.1f%% noRtSpecular=%.1f%% "
+                     "other=%.1f%% surfaces=%.1f%% | of surfaces: hit=%.1f%% miss=%.1f%% "
+                     "noRay=%.1f%% | of noRay in fill frames: filledFromHits=%.1f%% "
+                     "filledAsMiss=%.1f%% | checks: hitWithoutLobe1Ray=%.2f%% "
                      "hitWithoutLobe2Ray=%.2f%% noRtSpecularHits=%llu",
-                     static_cast<unsigned long long>((now - since) / 1000), frames,
-                     (mode & SkyMiss) ? 1 : 0, (mode & FillHoles) ? 1 : 0,
-                     Percent(p[CountSky], all), Percent(p[CountViewmodel], all),
+                     static_cast<unsigned long long>((now - since) / 1000), frames, sky_frames,
+                     fill_frames, Percent(p[CountSky], all), Percent(p[CountViewmodel], all),
                      Percent(p[CountNoRtSpecular], all), Percent(other, all),
-                     Percent(traced, all), Percent(p[CountHit], traced),
-                     Percent(p[CountMiss], traced), Percent(p[CountHole], traced),
-                     Percent(p[CountFilledHit], p[CountHole]),
-                     Percent(p[CountFilledMiss], p[CountHole]),
+                     Percent(surfaces, all), Percent(p[CountHit], surfaces),
+                     Percent(p[CountMiss], surfaces), Percent(p[CountHole], surfaces),
+                     Percent(p[CountFilledHit], fill_holes),
+                     Percent(p[CountFilledMiss], fill_holes),
                      Percent(p[CountHitNoLobe1], p[CountHit]),
                      Percent(p[CountHitNoLobe2], p[CountHit]),
                      static_cast<unsigned long long>(p[CountNoRtSpecularHit]));

@@ -308,6 +308,7 @@ int main() {
         assert(Slope(0.5f, 0.25f, true, 1.0f, true) == 0.0f);           // edges both sides
         assert(Slope(0.5f, 0.4921875f, true, 1.0f, false) == 0.0078125f);
         assert(Slope(0.5f, 0.25f, true, 1.0f, false) == 0.0f);          // lone edge
+        assert(Slope(0.5f, 0.46875f, true, 1.0f, false) == 0.0f); // steep lone step: not trusted
         assert(Slope(0.5f, 0.25f, false, 0.5078125f, true) == 0.0078125f);
         assert(Slope(0.5f, 0.25f, false, 1.0f, false) == 0.0f);
         assert(SurfaceStatus(1) && SurfaceStatus(3) && !SurfaceStatus(0) && !SurfaceStatus(2) &&
@@ -354,12 +355,15 @@ int main() {
         outcomes.Observe(Outcome::Off);
         outcomes.Observe(Outcome::Repeat);
         assert(!outcomes.Summary(text, sizeof(text)));
-        assert(std::string_view(text).find("conditioned=0 lastSkip=none") != npos);
+        assert(std::string_view(text).find("conditioned=0 surfaceAliased=0 lastSkip=none") !=
+               npos);
         outcomes.Observe(Outcome::Surface);
         outcomes.Observe(Outcome::Conditioned);
         outcomes.Observe(Outcome::Conditioned);
+        outcomes.SurfaceAliased();
         assert(outcomes.Summary(text, sizeof(text)));
-        assert(std::string_view(text).find("conditioned=2 lastSkip=surface") != npos);
+        assert(std::string_view(text).find("conditioned=2 surfaceAliased=1 lastSkip=surface") !=
+               npos);
         assert(std::string_view(text).find("weights=0 surface=1 context=0") != npos);
         assert(!outcomes.Summary(text, sizeof(text)));
         assert(std::string_view(OutcomeName(Outcome::Count)) == "none");
@@ -378,13 +382,16 @@ int main() {
         f[CountHitNoLobe2] = 20;
         f[CountNoRtSpecularHit] = 3;
         pixels.Add(f, FillHoles, 1000);
-        pixels.Add(f, SkyMiss, 1100); // 100 more pixels in none of the categories
+        Frame g = f; // no fill
+        g[CountFilledHit] = g[CountFilledMiss] = 0;
+        pixels.Add(g, SkyMiss, 1100); // 100 more pixels in none of the categories
         assert(pixels.Pixels(CountHit) == 400 && pixels.Pixels(StatCount) == 0);
         assert(!pixels.Report(1000 + Tracker::Interval - 1, report));
         assert(pixels.Report(1000 + Tracker::Interval, report));
-        assert(report.find("(10s): frames=2 skyMiss=1 fill=1 | sky=9.5% viewmodel=4.8% "
-                           "noRtSpecular=4.8% other=4.8% traced=76.2% | of traced: hit=25.0% "
-                           "miss=12.5% noRay=62.5% | of noRay: filledFromHits=50.0% "
+        assert(report.find("(10s): frames=2 skyMissFrames=1 fillFrames=1 | sky=9.5% "
+                           "viewmodel=4.8% noRtSpecular=4.8% other=4.8% surfaces=76.2% | of "
+                           "surfaces: hit=25.0% miss=12.5% noRay=62.5% | of noRay in fill "
+                           "frames: filledFromHits=50.0% "
                            "filledAsMiss=10.0% | checks: hitWithoutLobe1Ray=1.00% "
                            "hitWithoutLobe2Ray=10.00% noRtSpecularHits=6") != npos);
         report.clear();

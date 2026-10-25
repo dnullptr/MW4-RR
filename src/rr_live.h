@@ -1026,8 +1026,8 @@ class Controller {
     // weights, holds this frame's raw lighting weights, whose lobe-1 bits mark a
     // fresh specular ray. The caller proved that binding and its state and captured
     // restore, the pass's compute state; state_of(resource, state) gives a
-    // resource's tracked state on cl (PackedSurface's, since this pass does not
-    // bind it). Nothing is recorded unless it conditions. The fill is left out
+    // resource's tracked state on cl (used for PackedSurface, which this pass does
+    // not bind). Nothing is recorded unless it conditions. The fill is left out
     // while a guide test replaces the normals it compares.
     template <class StateOf>
     rrhitcond::Outcome ConditionSpecularDistance(ID3D12GraphicsCommandList *cl,

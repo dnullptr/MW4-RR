@@ -173,7 +173,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "(about 60%% of pixels). Sky and misses: RR gets 65504 there, as "
                            "NVIDIA asks for sky. Fill: pixels with no ray take nearby hits on "
                            "the same surface. The weapon and surfaces the game never traces "
-                           "reflections for stay as they are. Judge with frame generation off; "
+                           "reflections for stay as they are. Judge while strafing or walking "
+                           "(turning alone cannot show it), with frame generation off; "
                            "ReShade.log shows the shares every 10 s.");
         ImGui::Unindent();
     }
