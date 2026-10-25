@@ -11,6 +11,7 @@
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
 #include "../src/rr_specular_distance.h"
+#include "../src/rr_hit_condition.h"
 #include "../src/rr_water.h"
 #include <cassert>
 #include <limits>
@@ -276,4 +277,124 @@ int main() {
     report.clear();
     assert(!coverage.Report(1000 + 2 * rrwater::Tracker::Interval, report, water) &&
            report.empty() && coverage.Last() == 0.0);
+
+    // Specular hit distance tests: classification, hole filling and the summaries.
+    {
+        using namespace rrhitcond;
+        static_assert(Far == 65504.0f && StatsOffset >= 20 && StatsOffset + 4 * StatCount <= 64);
+        constexpr auto npos = std::string::npos;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        assert(SpecularRay(1u << 20) && !SpecularRay(0xfffffu));
+        assert(DiffuseRay(1u << 8) && !DiffuseRay(0xffu) && !DiffuseRay(0xfff00000u));
+        assert(Classify(2, 0, 0.0f, 0.0f, false) == Sky);
+        assert(Classify(1, 0, 0.5f, 3.0f, false) == Hit);
+        assert(Classify(3, 8, 0.5f, 3.0f, true) == Hit);
+        assert(Classify(1, 0, 0.5f, 0.0f, true) == Miss);
+        assert(Classify(1, 0, 0.5f, nan, true) == Miss);
+        assert(Classify(1, 0, 0.5f, -1.0f, false) == Hole);
+        assert(Classify(1, 0, 0.5f, 0.0f, false) == Hole);
+        assert(Classify(1, Alternate, 0.5f, 3.0f, true) == Leave); // viewmodel
+        assert(Classify(1, NoRtSpecular | 4, 0.5f, 0.0f, true) == Leave);
+        for (unsigned status : {0u, 4u})
+            assert(Classify(status, 0, 0.5f, 3.0f, true) == Leave);
+        assert(Classify(1, 0, 0.0f, 3.0f, true) == Leave); // sky depth without the sky status
+        assert(Classify(1, 0, (std::numeric_limits<float>::max)(), 3.0f, true) == Leave);
+
+        // Slopes: limit 0.04 * 0.5 = 0.02 of device depth.
+        assert(Slope(0.5f, 0.25f, true, 0.75f, true) == 0.25f);        // steep plane
+        assert(Slope(0.5f, 0.25f, true, 0.5078125f, true) == 0.0078125f); // edge before
+        assert(Slope(0.5f, 0.75f, true, 0.4921875f, true) == -0.0078125f); // edge before
+        assert(Slope(0.5f, 0.25f, true, 0.25f, true) == 0.0f);          // 1-px feature
+        assert(Slope(0.5f, 0.25f, true, 1.0f, true) == 0.0f);           // edges both sides
+        assert(Slope(0.5f, 0.4921875f, true, 1.0f, false) == 0.0078125f);
+        assert(Slope(0.5f, 0.25f, true, 1.0f, false) == 0.0f);          // lone edge
+        assert(Slope(0.5f, 0.46875f, true, 1.0f, false) == 0.0f); // steep lone step: not trusted
+        assert(Slope(0.5f, 0.25f, false, 0.5078125f, true) == 0.0078125f);
+        assert(Slope(0.5f, 0.25f, false, 1.0f, false) == 0.0f);
+        assert(SurfaceStatus(1) && SurfaceStatus(3) && !SurfaceStatus(0) && !SurfaceStatus(2) &&
+               !SurfaceStatus(4));
+        assert(SameSurface(0, 0, 1, 0.5f, 0.51f, 0.5f, 1.0f));
+        assert(SameSurface(4, 4, 3, 0.5f, 0.49f, 0.5f, 0.95f));
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.53f, 0.5f, 1.0f)); // off the plane
+        assert(SameSurface(0, 0, 1, 0.5f, 0.53f, 0.52f, 1.0f));  // on a sloped one
+        assert(!SameSurface(0, 4, 1, 0.5f, 0.5f, 0.5f, 1.0f));   // another class
+        assert(!SameSurface(0, 0, 2, 0.5f, 0.5f, 0.5f, 1.0f));   // sky
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.5f, 0.5f, 0.8f));   // bent normal
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.5f, 0.5f, nan));
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.0f, 0.0f, 1.0f));
+        assert(Weight(0, 1) == 0.5f && Weight(1, 1) == 1.0f / 3.0f);
+
+        const unsigned both = SkyMiss | FillHoles;
+        assert(Resolve(Sky, 0.0f, FillHoles, 0, 0, 0) == 0.0f);
+        assert(Resolve(Sky, 0.0f, SkyMiss, 0, 0, 0) == Far);
+        assert(Resolve(Miss, 0.0f, FillHoles, 0, 0, 0) == 0.0f);
+        assert(Resolve(Miss, 0.0f, both, 0, 0, 0) == Far);
+        assert(Resolve(Hit, 12.5f, both, 0, 0, 0) == 12.5f);
+        assert(Resolve(Hit, std::numeric_limits<float>::infinity(), SkyMiss, 0, 0, 0) == Far);
+        assert(Resolve(Hole, 0.0f, SkyMiss, 1.0f, 10.0f, 0.0f) == 0.0f); // fill off
+        assert(Resolve(Hole, 0.0f, FillHoles, 1.0f, 10.0f, 0.5f) == 10.0f);
+        assert(Resolve(Hole, 0.0f, FillHoles, 0.5f, 5.0f, 0.5f) == 10.0f); // ties go to hits
+        assert(FilledAsMiss(0.5f, 1.0f) && !FilledAsMiss(0.5f, 0.5f));
+        assert(Resolve(Hole, 0.0f, FillHoles, 0.5f, 5.0f, 1.0f) == 0.0f);
+        assert(Resolve(Hole, 0.0f, both, 0.5f, 5.0f, 1.0f) == Far);
+        assert(Resolve(Hole, 0.0f, both, 0.0f, 0.0f, 0.0f) == 0.0f); // nothing to fill from
+        assert(Resolve(Leave, 3.0f, both, 1.0f, 10.0f, 0.0f) == 3.0f);
+        assert(Resolve(Leave, 0.0f, both, 0.0f, 0.0f, 1.0f) == 0.0f);
+
+        assert(Mode() == 0);
+        sky_miss = true;
+        assert(Mode() == SkyMiss);
+        fill = true;
+        assert(Mode() == both);
+        sky_miss = false;
+        assert(Mode() == FillHoles);
+        fill = false;
+
+        Diagnostics outcomes;
+        char text[320];
+        outcomes.Observe(Outcome::Off);
+        outcomes.Observe(Outcome::Repeat);
+        assert(!outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(text).find("conditioned=0 surfaceAliased=0 lastSkip=none") !=
+               npos);
+        outcomes.Observe(Outcome::Surface);
+        outcomes.Observe(Outcome::Conditioned);
+        outcomes.Observe(Outcome::Conditioned);
+        outcomes.SurfaceAliased();
+        assert(outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(text).find("conditioned=2 surfaceAliased=1 lastSkip=surface") !=
+               npos);
+        assert(std::string_view(text).find("weights=0 surface=1 context=0") != npos);
+        assert(!outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(OutcomeName(Outcome::Count)) == "none");
+
+        Tracker pixels;
+        assert(!pixels.Report(1000, report));
+        Frame f{};
+        f[CountSky] = 100;
+        f[CountViewmodel] = f[CountNoRtSpecular] = 50;
+        f[CountHit] = 200;
+        f[CountMiss] = 100;
+        f[CountHole] = 500;
+        f[CountFilledHit] = 250;
+        f[CountFilledMiss] = 50;
+        f[CountHitNoLobe1] = 2;
+        f[CountHitNoLobe2] = 20;
+        f[CountNoRtSpecularHit] = 3;
+        pixels.Add(f, FillHoles, 1000);
+        Frame g = f; // no fill
+        g[CountFilledHit] = g[CountFilledMiss] = 0;
+        pixels.Add(g, SkyMiss, 1100); // 100 more pixels in none of the categories
+        assert(pixels.Pixels(CountHit) == 400 && pixels.Pixels(StatCount) == 0);
+        assert(!pixels.Report(1000 + Tracker::Interval - 1, report));
+        assert(pixels.Report(1000 + Tracker::Interval, report));
+        assert(report.find("(10s): frames=2 skyMissFrames=1 fillFrames=1 | sky=9.5% "
+                           "viewmodel=4.8% noRtSpecular=4.8% other=4.8% surfaces=76.2% | of "
+                           "surfaces: hit=25.0% miss=12.5% noRay=62.5% | of noRay in fill "
+                           "frames: filledFromHits=50.0% "
+                           "filledAsMiss=10.0% | checks: hitWithoutLobe1Ray=1.00% "
+                           "hitWithoutLobe2Ray=10.00% noRtSpecularHits=6") != npos);
+        report.clear();
+        assert(!pixels.Report(1000 + 2 * Tracker::Interval, report) && report.empty());
+    }
 }

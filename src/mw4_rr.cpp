@@ -612,6 +612,9 @@ static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t
     GlassDraw(l, true, c, i);
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
 }
+static void ConditionSpecularDistance(reshade::api::command_list *list,
+                                      ID3D12GraphicsCommandList *native, uint64_t effective,
+                                      const rrsparsecopy::Pair &input);
 #include "rr_sparse_render.h"
 #include "rr_vrrt_render.h"
 static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
@@ -805,6 +808,49 @@ static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t 
                ? S::Copied
                : S::Slot);
 }
+static rrhitcond::Diagnostics &ConditionStats() {
+    static auto *p = new rrhitcond::Diagnostics;
+    return *p;
+}
+// Specular hit distance tests (rrhitcond): called at the native temporal pass,
+// whose proven t4/t5 input holds this frame's raw lighting and weights. Its
+// compute state is captured and restored around the private pass, as for the
+// VRRT reader. PackedSurface is not bound here: it was proven at the earlier hit
+// distance blur and the game reads it again after this pass, so its tracked
+// state is used as for the bound inputs. An aliasing barrier on the list since
+// its last transition (one naming no resource marks every tracked resource) is
+// only counted in the log, so the tests cannot go quiet on an unproven concern.
+// Dispatches with nothing to condition skip the capture.
+static void ConditionSpecularDistance(reshade::api::command_list *list,
+                                      ID3D12GraphicsCommandList *native, uint64_t effective,
+                                      const rrsparsecopy::Pair &input) {
+    if (!rrhitcond::Mode())
+        return;
+    auto &stats = ConditionStats();
+    rrhitcond::Outcome why{};
+    if (!LiveRR().HitDistancePending(native, why))
+        return stats.Observe(why);
+    auto *state = rrbindings::State(list->get_device());
+    if (!state || !state->tracker.Healthy())
+        return stats.Observe(rrhitcond::Outcome::Context);
+    const auto restore = ComputeState().Capture(native, (ID3D12PipelineState *)effective);
+    if (!restore.valid || !restore.complete || !restore.heap_restore_valid ||
+        UINT64(restore.root.Get()) != state->tracker.CurrentLayout(list->get_native()))
+        return stats.Observe(rrhitcond::Outcome::Context);
+    bool aliased{};
+    const auto outcome = LiveRR().ConditionSpecularDistance(
+        native, input.r[1].Get(), input.state[1], restore,
+        [&](ID3D12Resource *r, D3D12_RESOURCE_STATES &s) {
+            if (!SparseLayouts().Get(native, r, s))
+                return false;
+            D3D12_RESOURCE_STATES unaliased{};
+            aliased = !SparseLayouts().GetUnaliased(native, r, unaliased);
+            return true;
+        });
+    stats.Observe(outcome);
+    if (outcome == rrhitcond::Outcome::Conditioned && aliased)
+        stats.SurfaceAliased();
+}
 static void RestoreLightingPipeline(reshade::api::command_list *list) {
     const auto b = ShaderDispatches().Get(list->get_native());
     if (!rrbypass::Target(b.shader) || !b.pipeline)
@@ -836,9 +882,20 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         if (!native || !LiveRR().CanRaw(native.Get()) || rrbypass::Health(device).failed)
             return false;
         if (b.shader == rrbypass::Vrrt) {
-            if (!PreserveNativeSampling(list, x, y, z))
+            if (!PreserveNativeSampling(list, x, y, z)) {
+                rrapply::Dispatched(0, false);
                 return false;
+            }
             rrbypass::Used(device, b.pipeline, b.shader);
+            // Ray selection test: the patched copy runs this dispatch only, on the same root
+            // arguments; RestoreLightingPipeline rebinds the game's PSO at the next dispatch.
+            const auto variant = rrapply::Selected();
+            Microsoft::WRL::ComPtr<ID3D12PipelineState> patched;
+            if (variant)
+                patched = rrbypass::Apply(device, b.pipeline, variant);
+            if (patched)
+                native->SetPipelineState(patched.Get());
+            rrapply::Dispatched(variant, patched != nullptr);
             return false;
         }
         if (!LiveRR().SamplingReady(native.Get()))

@@ -100,6 +100,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                            "RR current/native-history bindings or layouts unproven; RR blocked");
             return false;
         }
+        ConditionSpecularDistance(list, native.Get(), effective, input);
 #ifdef RR_FILTER_DIAGNOSTIC
         if (LiveRR().NativeFiltering()) {
             LiveRR().NativeTemporalObserved(native.Get(), output);
