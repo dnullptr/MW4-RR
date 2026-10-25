@@ -298,7 +298,7 @@ int main() {
         for (unsigned status : {0u, 4u})
             assert(Classify(status, 0, 0.5f, 3.0f, true) == Leave);
         assert(Classify(1, 0, 0.0f, 3.0f, true) == Leave); // sky depth without the sky status
-        assert(Classify(1, 0, std::numeric_limits<float>::max(), 3.0f, true) == Leave);
+        assert(Classify(1, 0, (std::numeric_limits<float>::max)(), 3.0f, true) == Leave);
 
         // Slopes: limit 0.04 * 0.5 = 0.02 of device depth.
         assert(Slope(0.5f, 0.25f, true, 0.75f, true) == 0.25f);        // steep plane
