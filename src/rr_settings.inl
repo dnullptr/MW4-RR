@@ -8,12 +8,14 @@ static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
 static bool &requested_glass = preferences.glass;
 static bool &requested_hit = preferences.hit;
+static bool &requested_blend = preferences.blend;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::set_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::set_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
 }
 static void ApplyEnabled() {
     config_allowed = VrsConfigAllowsRR();
@@ -21,6 +23,7 @@ static void ApplyEnabled() {
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
     LiveRR().SetSpecularHitEnabled(requested_hit);
+    LiveRR().SetTransparencyBlendEnabled(requested_blend);
     AlbedoInspector().observe_transitions = requested_glass;
 }
 static void LoadSettings() {
@@ -33,6 +36,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::get_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -98,6 +102,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
+    changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
     if (changed) {
         ApplyEnabled();
         SaveToggles();
@@ -141,6 +146,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     StatusRow("Transparency", status.glass);
     StatusRow("Subsurface Scattering", status.sss);
     StatusRow("Specular hit distance", status.hit);
+    StatusRow("Transparency albedo blend",
+              LiveRR().TransparencyBlendState(rrsig::Attached() && CoveragePipelines().SignatureHooked(),
+                                              CoveragePipelines().OitUnavailable()));
     ImGui::Text("Reconstruction path: %s", rrstatus::RouteLabel(status.route));
     ImGui::TextWrapped("Waiting means enabled but not delivered in recent completed frames. A "
                        "guide may be unavailable in some scenes.");

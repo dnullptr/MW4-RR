@@ -6,6 +6,7 @@ struct Preferences {
     bool sss = true;
     bool glass = true;
     bool hit = true;
+    bool blend = true;
     unsigned preset = 6;
 };
 inline constexpr const char *QualityLabel(int quality) {

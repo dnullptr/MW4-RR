@@ -9,6 +9,7 @@
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
               defaults.preset == 6);
+static_assert(defaults.blend);
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");

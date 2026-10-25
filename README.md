@@ -23,6 +23,16 @@ Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering Guide 
 
 DLSS quality is configured through `DLSSPerfModeMP` in the game's configuration and requires a restart. Preset changes are handled separately and can apply during gameplay.
 
+Transparency albedo blend (on by default, with a checkbox in the panel and no hotkey) moves RR's albedo guides toward neutral values where the game's transparency layers (OIT glass and particles, and screen-space refraction) cover a pixel, so texture seen through glass is kept while moving. It is controlled by the `TransparencyBlend` key in `ReShade.ini`. Running water is not affected. Optional tuning keys, not shown in the panel:
+
+- `TransparencyBlendDiffuse` (0.5): the diffuse albedo value the guide moves toward.
+- `TransparencyBlendSpecular` (0): the specular albedo value the guide moves toward.
+- `TransparencyBlendRoughness` (-1): the roughness the guide moves toward; -1 leaves roughness unchanged.
+- `TransparencyBlendStrength` (1): overall blend amount, from 0 (no change) to 1.
+- `TransparencyBlendSky` (1): 1 also blends where transparency layers cover the sky; 0 leaves sky pixels alone.
+- `TransparencyBlendFilter` (1): 1 smooths the blend mask over neighboring pixels; 0 uses it unfiltered.
+- `TransparencyBlendDebug` (0): 1 shows the blend mask in the albedo guide for inspection.
+
 ## Architecture
 
 This is a game-specific rendering integration, not a screen-space ReShade effect. It depends on recognized shader variants, resource bindings, and the game's existing NVIDIA NGX initialization.
