@@ -114,17 +114,21 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
     }
     SparsePool().Poll();
     LiveRR().Poll();
-    // Only idle windows are reported, a few times, so a missing blur dispatch is visible.
+    // Idle windows are reported a few times, so a missing blur dispatch is visible, and a window
+    // whose set of rejection stages differs from the last one's, so new rejections show.
     static ULONGLONG distance_report{};
-    static unsigned idle_reports{};
+    static unsigned idle_reports{}, last_rejects{};
     const auto now = GetTickCount64();
     if (now - distance_report >= 10000) {
         distance_report = now;
         char line[320];
-        const bool active = DistanceStats().Summary(line, sizeof(line));
-        if (!active && LiveRR().Enabled() && LiveRR().SpecularHitEnabled() && idle_reports < 3) {
-            ++idle_reports;
-            WriteLog(line);
+        unsigned rejects{};
+        const bool active = DistanceStats().Summary(line, sizeof(line), &rejects);
+        if (LiveRR().Enabled() && LiveRR().SpecularHitEnabled()) {
+            if (!active ? idle_reports++ < 3 : rejects != last_rejects)
+                WriteLog(line);
+            if (active)
+                last_rejects = rejects;
         }
     }
 }

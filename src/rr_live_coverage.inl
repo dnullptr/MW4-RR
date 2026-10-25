@@ -12,6 +12,7 @@ rrblend::Counters blend_counters;
 rrblend::Tuning blend_tuning;
 rrblend::Pipeline blend_pipeline;
 ULONGLONG blend_report = 0;
+bool blend_off_logged{}; // "off" is logged once per switch-off, not every window
 ULONGLONG blend_last_ran = 0;
 unsigned blend_logged = 0; // one-time log lines: 1 Oit, 2 Refraction, 4 typed, 8 memory
 
@@ -112,10 +113,13 @@ void CoverageReportLocked(ULONGLONG now) {
     if (now - blend_report < 10000)
         return;
     blend_report = now;
-    // Every window while RR runs, all-zero ones included, so "no transparency
-    // seen" reads differently from "refused" and from "failed" or
-    // "unavailable", which show in every window, not only the first.
-    if (enabled && !failed && !retired) {
+    // Every window while RR runs with the blend on, all-zero ones included, so
+    // "no transparency seen" reads differently from "refused" and from "failed"
+    // or "unavailable", which show in every window, not only the first. A blend
+    // that is off says so once.
+    if (blend_enabled)
+        blend_off_logged = false;
+    if (enabled && !failed && !retired && !(blend_off_logged && !blend_enabled)) {
         auto &k = blend_counters;
         const char *state = "on";
         if (!blend_enabled)
@@ -129,7 +133,10 @@ void CoverageReportLocked(ULONGLONG now) {
         }
         char line[400];
         if (!blend_enabled)
-            snprintf(line, sizeof(line), "Transparency albedo blend (10s): off");
+        {
+            snprintf(line, sizeof(line), "Transparency albedo blend: off");
+            blend_off_logged = true;
+        }
         else {
             const int n = rrblend::Report(k, line, sizeof(line));
             if (n > 0 && size_t(n) < sizeof(line))

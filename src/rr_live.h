@@ -32,11 +32,11 @@ class Controller {
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
-        bool responsivity_used{}; // RR was given a responsivity mask (water or SSS)
+        bool responsivity_used{}; // RR was given the water responsivity mask
         GpuFrame gpu;
         bool busy{};
-        // This frame's coverage captures. The window-noise pass reads its counts and
-        // cleared after CoverageBlend in AfterSR, so it is reset only with the slot.
+        // This frame's coverage captures, read by CoverageBlend in AfterSR and reset
+        // only with the slot.
         rrblend::Ticket coverage;
         bool blend_used{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
@@ -1391,7 +1391,7 @@ class Controller {
                 water, s->water_used, preset.has_effective, preset.effective);
             if (s->water_used)
                 s->gpu.WaterHeader(rrwater::Clamp(water.strength),
-                                   rrwater::Flags(water_responsivity, false));
+                                   rrwater::Flags(water_responsivity));
             water_status = {};
             water_status.ready = s->water_used;
             water_status.responsivity = water_responsivity;
@@ -1444,7 +1444,7 @@ class Controller {
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
             if (s->water_used)
-                s->gpu.WaterPass(cl.Get(), pipelines, nullptr);
+                s->gpu.WaterPass(cl.Get(), pipelines);
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

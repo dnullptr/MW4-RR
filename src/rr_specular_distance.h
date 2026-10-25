@@ -65,8 +65,9 @@ class Diagnostics {
         std::lock_guard lock(mutex);
         return candidates.size() < 16 && candidates.insert(hash).second;
     }
-    // Summarizes and clears the window; returns false when nothing happened.
-    bool Summary(char *text, size_t size) {
+    // Summarizes and clears the window; returns false when nothing happened. rejects gets one
+    // bit per rejection stage seen in the window.
+    bool Summary(char *text, size_t size, unsigned *rejects = nullptr) {
         std::lock_guard lock(mutex);
         uint64_t total = dispatches;
         for (auto c : counts)
@@ -80,6 +81,12 @@ class Diagnostics {
             static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
             static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]),
             static_cast<unsigned long long>(counts[4]), static_cast<unsigned long long>(counts[5]));
+        if (rejects) {
+            *rejects = 0;
+            for (unsigned i = 0; i < counts.size(); ++i)
+                if (i != unsigned(Stage::Copied) && counts[i])
+                    *rejects |= 1u << i;
+        }
         dispatches = 0;
         counts = {};
         last = Stage::Count;

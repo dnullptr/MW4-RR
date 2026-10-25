@@ -32,7 +32,7 @@ static_assert(defaults.tolerate_isolated && defaults.water);
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
 static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&
               !rrwater::Wanted(rrwater::Settings{}, false));
-static_assert(rrwater::Flags(true, false) == 1 && rrwater::Flags(false, true) == 4);
+static_assert(rrwater::Flags(true) == 1 && rrwater::Flags(false) == 0);
 // Only the SSS source reads the SSS guide.
 static_assert(rrlighting::Raw == 0 && rrlighting::SssHistory2 == 1 && rrlighting::Count == 2);
 static_assert(!rrlighting::SssMasked(rrlighting::Raw) &&
@@ -412,7 +412,7 @@ int main() {
     policy.Reject();
     assert(policy.Next(7, 1, false) && policy.LastReason() == rrlive::HistoryPolicy::Rejected);
 
-    // Health reports once per interval, only with activity, then starts over.
+    // Health checks once per interval and logs a state change, with activity, then starts over.
     // Presentation counters arrive lock-free; each interval takes its own window.
     auto &shown = rrhealth::presentation;
     shown.presents = 50; // before the first interval: discarded
@@ -462,6 +462,21 @@ int main() {
                        "nonFiniteColorFrames=0 maxNonFiniteColorPixels=0 "
                        "nonFiniteOutputFrames=0 maxNonFiniteOutputPixels=0 presents=2 "
                        "unfocusedPresents=2 focused=0 fgEvaluations=0") != std::string::npos);
+    // The same state again is held back until the slow summary, which counts every frame since
+    // the last line; a state change (a rejected frame) logs at its interval.
+    const std::uint64_t logged_at = 1000 + 3 * rrhealth::Tracker::Interval;
+    report.clear();
+    for (unsigned i = 1; i < rrhealth::Tracker::Summary / rrhealth::Tracker::Interval; ++i) {
+        health.Frame({0, 1, 0, 0});
+        assert(!health.Report(logged_at + i * rrhealth::Tracker::Interval, report));
+    }
+    health.Frame({0, 1, 0, 0});
+    assert(health.Report(logged_at + rrhealth::Tracker::Summary, report));
+    assert(report.rfind("RR health (300s): frames=30 rejected=0 ", 0) == 0);
+    health.Frame({1, 0, 0, 0});
+    assert(health.Report(logged_at + rrhealth::Tracker::Summary + rrhealth::Tracker::Interval,
+                         report));
+    assert(report.find("frames=1 rejected=1 ") != std::string::npos);
     // The widest line is never truncated.
     rrhealth::Tracker wide;
     assert(!wide.Report(0, report));

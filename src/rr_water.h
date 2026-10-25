@@ -29,9 +29,9 @@ inline bool UseResponsivity(const Settings &s, bool water_used, bool preset_know
     return s.responsivity && Clamp(s.strength) != 0 && water_used && preset_known && preset == 6;
 }
 // Flags read by shaders/rr_water_masks.hlsl (header word 15).
-inline constexpr unsigned FlagResponsivity = 1, FlagSssMask = 4;
-inline constexpr unsigned Flags(bool responsivity, bool sss_mask) {
-    return (responsivity ? FlagResponsivity : 0u) | (sss_mask ? FlagSssMask : 0u);
+inline constexpr unsigned FlagResponsivity = 1;
+inline constexpr unsigned Flags(bool responsivity) {
+    return responsivity ? FlagResponsivity : 0u;
 }
 // What the latest evaluation sent, for the panel.
 struct Status {

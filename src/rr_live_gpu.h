@@ -187,16 +187,13 @@ struct Pipelines {
     void WaterPipeline() {
         if (water)
             return;
-        // t1 SSS mask; u0 responsivity, u1 the water classification.
-        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 0},
-                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
-        D3D12_ROOT_PARAMETER p[3]{};
+        // u0 responsivity, u1 the water classification.
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0};
+        D3D12_ROOT_PARAMETER p[2]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        for (unsigned i = 0; i < 2; ++i) {
-            p[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            p[i + 1].DescriptorTable = {1, &ranges[i]};
-        }
-        D3D12_ROOT_SIGNATURE_DESC desc{3, p};
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable = {1, &range};
+        D3D12_ROOT_SIGNATURE_DESC desc{2, p};
         Root(desc, water_root);
         Pipeline(water_root.Get(), RRWaterMasks, sizeof(RRWaterMasks), water);
     }
@@ -442,7 +439,7 @@ struct GpuFrame {
         take(water.mask, mask);
         take(water.responsivity, value);
         if (!water.heap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
             rrprivate::CheckAllocation(
                 p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&water.heap)),
@@ -722,28 +719,19 @@ struct GpuFrame {
         cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, StatsBytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
-    // SR time, after the SSS resolve. Writes the responsivity mask from this frame's
-    // classification, merging the SSS responsivity mask when given (left
-    // NON_PIXEL_SHADER_RESOURCE by that resolve). Leaves the mask readable for RR until
-    // WaterFinish.
-    void WaterPass(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *sss_mask) {
+    // SR time. Writes the responsivity mask from this frame's classification and leaves it
+    // readable for RR until WaterFinish.
+    void WaterPass(ID3D12GraphicsCommandList *cl, Pipelines &p) {
         Require(water.ready && water_written && p.water, "water masks unavailable");
         auto cpu = water.heap->GetCPUDescriptorHandleForHeapStart();
         const auto gpu = water.heap->GetGPUDescriptorHandleForHeapStart();
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R16_FLOAT;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        p.device->CreateShaderResourceView(sss_mask, &srv, cpu);
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
         uav.Format = DXGI_FORMAT_R16_FLOAT;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        p.device->CreateUnorderedAccessView(water.responsivity.Get(), nullptr, &uav,
-                                            {cpu.ptr + p.stride});
+        p.device->CreateUnorderedAccessView(water.responsivity.Get(), nullptr, &uav, cpu);
         uav.Format = DXGI_FORMAT_R8_UNORM;
         p.device->CreateUnorderedAccessView(water.mask.Get(), nullptr, &uav,
-                                            {cpu.ptr + 2 * p.stride});
+                                            {cpu.ptr + p.stride});
         for (auto *r : {water.mask.Get(), water.responsivity.Get()})
             Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {water.heap.Get()};
@@ -752,7 +740,6 @@ struct GpuFrame {
         cl->SetPipelineState(p.water.Get());
         cl->SetComputeRootConstantBufferView(0, header->GetGPUVirtualAddress());
         cl->SetComputeRootDescriptorTable(1, gpu);
-        cl->SetComputeRootDescriptorTable(2, {gpu.ptr + p.stride});
         cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         Order(cl);
         for (auto *r : {water.mask.Get(), water.responsivity.Get()})

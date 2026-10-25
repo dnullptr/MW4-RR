@@ -19,8 +19,10 @@ struct Presentation {
     std::atomic<bool> focused{}; // at the latest present
 };
 inline Presentation presentation;
-// CPU-only counters for completed RR frames and history resets. Reported
-// periodically so frame rejection and reset frequency show up in ReShade.log.
+// CPU-only counters for completed RR frames and history resets. Each interval is checked, and
+// a line is logged when its state (running, rejecting, non-finite pixels, which guides were
+// bound) differs from the last line's, or as a slow summary. A line counts everything since
+// the previous line.
 class Tracker {
     unsigned frames{}, rejected{}, isolated_frames{}, sanitized_frames{}, resets{};
     std::array<unsigned, 4> reasons{};
@@ -28,11 +30,30 @@ class Tracker {
     unsigned sss_frames{}, glass_frames{}, hit_frames{}, responsivity_frames{};
     unsigned non_finite_color_frames{}, non_finite_output_frames{};
     std::uint32_t non_finite_color_max{}, non_finite_output_max{};
-    std::uint64_t since{};
+    std::array<unsigned, 3> shown{}; // presents, unfocused presents, FG evaluations
+    std::uint64_t since{}, checked{};
+    unsigned logged_state{}, mark{};    // the last line's state; frames... at the last check
+    std::array<unsigned, 6> marks{};    // rejected, non-finite, sss, glass, hit, responsivity
     bool started{};
 
+    // The state of the frames since the last check.
+    unsigned State() const {
+        const std::array<unsigned, 6> now{rejected, non_finite_color_frames + non_finite_output_frames,
+                                          sss_frames, glass_frames, hit_frames,
+                                          responsivity_frames};
+        unsigned state = frames != mark;
+        for (unsigned i = 0; i < now.size(); ++i)
+            state |= unsigned(now[i] != marks[i]) << (i + 1);
+        return state;
+    }
+    void Mark() {
+        mark = frames;
+        marks = {rejected, non_finite_color_frames + non_finite_output_frames, sss_frames,
+                 glass_frames, hit_frames, responsivity_frames};
+    }
+
   public:
-    static constexpr std::uint64_t Interval = 10000;
+    static constexpr std::uint64_t Interval = 10000, Summary = 300000;
     // stats: bad frame, copied frame, isolated guide pixels, sanitized SSS samples.
     void Frame(const std::array<std::uint32_t, 4> &stats, const Evaluation &e = {}) {
         ++frames;
@@ -60,45 +81,62 @@ class Tracker {
         for (unsigned i = 0; i < reasons.size(); ++i)
             reasons[i] += (reason >> i) & 1;
     }
-    // Returns a summary once per interval with activity, then starts a new interval.
+    // Checks once per interval; returns a line on a state change or a due summary, with
+    // activity since the previous line.
     bool Report(std::uint64_t now, std::string &out) {
         if (!started) {
             started = true;
-            since = now;
+            since = checked = now;
             Take();
             return false;
         }
-        if (now < since || now - since < Interval)
+        if (now < checked || now - checked < Interval)
             return false;
-        const bool active = frames || resets;
+        checked = now;
         const auto taken = Take();
-        if (active) {
-            char text[640];
-            std::snprintf(text, sizeof(text),
-                          "RR health (%llus): frames=%u rejected=%u resets=%u "
-                          "[rejected=%u cut=%u generation=%u gap=%u] "
-                          "isolatedGuideFrames=%u maxIsolatedPixels=%u "
-                          "sanitizedSssFrames=%u maxSanitizedSamples=%u "
-                          "guides[sss=%u glass=%u hit=%u responsivity=%u] "
-                          "nonFiniteColorFrames=%u maxNonFiniteColorPixels=%u "
-                          "nonFiniteOutputFrames=%u maxNonFiniteOutputPixels=%u "
-                          "presents=%u unfocusedPresents=%u focused=%d fgEvaluations=%u",
-                          static_cast<unsigned long long>((now - since) / 1000), frames, rejected,
-                          resets, reasons[0], reasons[1], reasons[2], reasons[3], isolated_frames,
-                          isolated_max, sanitized_frames, sanitized_max, sss_frames, glass_frames,
-                          hit_frames, responsivity_frames, non_finite_color_frames,
-                          non_finite_color_max, non_finite_output_frames, non_finite_output_max,
-                          taken[0], taken[1],
-                          presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, taken[2]);
-            out = text;
+        for (unsigned i = 0; i < shown.size(); ++i)
+            shown[i] += taken[i];
+        const unsigned state = State();
+        Mark();
+        const bool active = frames || resets;
+        if (!active) { // nothing to report: drop the presentation counts
+            logged_state = state;
+            Restart(now);
+            return false;
         }
-        *this = {};
-        started = true;
-        since = now;
-        return active;
+        if (state == logged_state && now - since < Summary)
+            return false;
+        char text[640];
+        std::snprintf(text, sizeof(text),
+                      "RR health (%llus): frames=%u rejected=%u resets=%u "
+                      "[rejected=%u cut=%u generation=%u gap=%u] "
+                      "isolatedGuideFrames=%u maxIsolatedPixels=%u "
+                      "sanitizedSssFrames=%u maxSanitizedSamples=%u "
+                      "guides[sss=%u glass=%u hit=%u responsivity=%u] "
+                      "nonFiniteColorFrames=%u maxNonFiniteColorPixels=%u "
+                      "nonFiniteOutputFrames=%u maxNonFiniteOutputPixels=%u "
+                      "presents=%u unfocusedPresents=%u focused=%d fgEvaluations=%u",
+                      static_cast<unsigned long long>((now - since) / 1000), frames, rejected,
+                      resets, reasons[0], reasons[1], reasons[2], reasons[3], isolated_frames,
+                      isolated_max, sanitized_frames, sanitized_max, sss_frames, glass_frames,
+                      hit_frames, responsivity_frames, non_finite_color_frames,
+                      non_finite_color_max, non_finite_output_frames, non_finite_output_max,
+                      shown[0], shown[1],
+                      presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, shown[2]);
+        out = text;
+        logged_state = state;
+        Restart(now);
+        return true;
     }
 
   private:
+    void Restart(std::uint64_t now) {
+        const auto state = logged_state;
+        *this = {};
+        started = true;
+        since = checked = now;
+        logged_state = state;
+    }
     // presents, unfocused presents, frame generation evaluations since the last call.
     static std::array<unsigned, 3> Take() {
         auto &p = presentation;

@@ -1457,13 +1457,16 @@ struct ControllerCpuTest {
             assert(line.find("lastReject=typed-load changed=0 state=unavailable") !=
                    std::string::npos);
         c.blend_unavailable = rrblend::Reason::None;
-        // Blend off: one short line per window, counters reset.
+        // Blend off: one short line, not repeated while it stays off; counters reset.
         logs.clear();
         c.blend_counters.frames = 1;
         c.SetTransparencyBlendEnabled(false);
         c.CoverageReportLocked(180000);
-        assert(logs.size() == 1 && logs[0] == "Transparency albedo blend (10s): off");
+        assert(logs.size() == 1 && logs[0] == "Transparency albedo blend: off");
         assert(c.blend_counters.frames == 0);
+        c.CoverageReportLocked(185000);
+        c.CoverageReportLocked(195000);
+        assert(logs.size() == 1);
         // RR off, failed or retired: no line.
         c.SetTransparencyBlendEnabled(true);
         c.SetEnabled(false);
