@@ -1,6 +1,7 @@
 #include "../src/rr_trace.h"
 #include "ngx-recording-params.h"
 #include "../src/rr_evaluation_params.h"
+#include "../src/rr_ngx_log.h"
 #include <cassert>
 #include <stdexcept>
 static unsigned originals{}, replacements{}, afters{};
@@ -192,10 +193,157 @@ static void CreationParameters() {
     assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
     assert(flags == 0x1bf);
 }
+static RecordingParams *capability_map{};
+static NVSDK_NGX_Result capability_result = NVSDK_NGX_Result_Success;
+static unsigned capability_destroys{};
+static NVSDK_NGX_Result NVSDK_CONV Capabilities(NVSDK_NGX_Parameter **out) {
+    *out = NVSDK_NGX_SUCCEED(capability_result) ? capability_map : nullptr;
+    return capability_result;
+}
+static NVSDK_NGX_Result NVSDK_CONV DestroyCapabilities(NVSDK_NGX_Parameter *p) {
+    assert(p == capability_map);
+    ++capability_destroys;
+    return NVSDK_NGX_Result_Success;
+}
+// Result codes by numeric value (older SDKs lack some names), versions, and the lines RR logs.
+static void NgxLog() {
+    using rrngxlog::Code;
+    assert(!strcmp(Code(0x1u).text, "0x00000001 Success"));
+    assert(!strcmp(Code(0xBAD00000u).text, "0xBAD00000 Fail"));
+    assert(!strcmp(Code(0xBAD00001u).text, "0xBAD00001 FAIL_FeatureNotSupported"));
+    assert(!strcmp(Code(0xBAD00005u).text, "0xBAD00005 FAIL_InvalidParameter"));
+    assert(!strcmp(Code(0xBAD0000Du).text, "0xBAD0000D FAIL_OutOfGPUMemory"));
+    assert(!strcmp(Code(0xBAD00012u).text, "0xBAD00012 FAIL_NotImplemented"));
+    assert(!strcmp(Code(0xBAD00013u).text, "0xBAD00013 unknown"));
+    assert(!strcmp(Code(0u).text, "0x00000000 unknown"));
+    assert(!strcmp(rrngxlog::ResultName(0xBAD0000Fu), "FAIL_UnableToWriteToAppDataPath"));
+    rrngxlog::Require(true, "unused", 0xBAD00000u);
+    bool thrown = false;
+    try {
+        rrngxlog::Require(false, "live RR feature creation failed", 0xBAD0000Du);
+    } catch (const std::runtime_error &e) {
+        thrown =
+            !strcmp(e.what(), "live RR feature creation failed: 0xBAD0000D FAIL_OutOfGPUMemory");
+    }
+    assert(thrown);
+
+    // VS_FIXEDFILEINFO at DWORD 3: signature, struct version, file version MS/LS (310.9.1.0).
+    uint32_t info[20]{};
+    info[3] = 0xFEEF04BDu;
+    info[4] = 0x00010000u;
+    info[5] = (310u << 16) | 9u;
+    info[6] = 1u << 16;
+    unsigned v[4]{};
+    assert(rrngxlog::FixedFileVersion(info, sizeof(info), v));
+    assert(v[0] == 310 && v[1] == 9 && v[2] == 1 && v[3] == 0);
+    assert(!strcmp(rrngxlog::Version(v).text, "310.9.1.0"));
+    assert(rrngxlog::FixedFileVersion(info, 12 + 52, v));
+    assert(!rrngxlog::FixedFileVersion(info, 12 + 51, v)); // truncated struct
+    unsigned char shifted[sizeof(info) + 2]{};
+    memcpy(shifted + 2, info, sizeof(info));
+    assert(!rrngxlog::FixedFileVersion(shifted, sizeof(shifted), v)); // misaligned signature
+    info[3] = 0;
+    assert(!rrngxlog::FixedFileVersion(info, sizeof(info), v)); // absent
+    assert(!rrngxlog::FixedFileVersion(nullptr, 64, v));
+    unsigned system[4]{};
+    assert(rrngxlog::ModuleVersion(GetModuleHandleW(L"kernel32.dll"), system) && system[0]);
+    assert(!rrngxlog::ModuleVersion(nullptr, system));
+
+    // The probe's model rule, case-insensitively.
+    assert(rrngxlog::ModelPath(L"D:\\Games\\Call of Duty\\NVNGX_DLSSD.DLL"));
+    assert(rrngxlog::ModelPath(L"nvngx_dlssd.dll"));
+    assert(rrngxlog::ModelPath(
+        L"C:\\ProgramData\\NVIDIA\\NGX\\models\\dlssd\\versions\\20316928\\files\\a.bin"));
+    assert(!rrngxlog::ModelPath(L"D:\\Games\\Call of Duty\\nvngx_dlss.dll"));
+    assert(!rrngxlog::ModelPath(L"D:\\Games\\Call of Duty\\nvngx_dlssd.dll.bak"));
+    assert(!rrngxlog::ModelPath(L"C:\\ProgramData\\NVIDIA\\NGX\\models\\dlss\\versions\\1\\a.bin"));
+
+    char text[256];
+    const unsigned drivers[][4] = {{32, 0, 15, 6094}, {32, 0, 15, 6603}, {27, 21, 14, 5671}};
+    const char *numbers[] = {"560.94", "566.03", "456.71"};
+    for (unsigned i = 0; i < 3; ++i) {
+        rrngxlog::NvidiaVersion(drivers[i], text, sizeof(text));
+        assert(!strcmp(text, numbers[i]));
+    }
+    rrngxlog::Adapter adapter;
+    rrngxlog::DescribeDriver(adapter, text, sizeof(text));
+    assert(!strcmp(text, "?"));
+    adapter.found = true;
+    adapter.vendor = 0x10DE;
+    snprintf(adapter.name, sizeof(adapter.name), "NVIDIA GeForce RTX 4090");
+    rrngxlog::DescribeDriver(adapter, text, sizeof(text));
+    assert(!strcmp(text, "? NVIDIA GeForce RTX 4090"));
+    adapter.versioned = true;
+    memcpy(adapter.version, drivers[0], sizeof(adapter.version));
+    rrngxlog::DescribeDriver(adapter, text, sizeof(text));
+    assert(!strcmp(text, "32.0.15.6094 (NVIDIA 560.94) NVIDIA GeForce RTX 4090"));
+    adapter.vendor = 0x1002;
+    snprintf(adapter.name, sizeof(adapter.name), "AMD Radeon RX 7900 XTX");
+    rrngxlog::DescribeDriver(adapter, text, sizeof(text));
+    assert(!strcmp(text, "32.0.15.6094 AMD Radeon RX 7900 XTX"));
+    // No core module, device or model in this process.
+    assert(rrngxlog::RuntimeLine(nullptr, nullptr) ==
+           "RR runtime: NGX core ? ?; model not loaded; driver ?");
+
+    RecordingParams caps;
+    caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, 1);
+    caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, 0);
+    caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, 535u);
+    caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, 98u);
+    caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, 1);
+    const auto c = rrngxlog::ReadCapability(caps);
+    assert(c.available == 1 && c.needs_driver == 0 && c.major == 535u && c.minor == 98u &&
+           c.init == 1);
+    const char *full = "RR capability: available=1 needsUpdatedDriver=0 minDriver=535.98 "
+                       "featureInit=0x00000001 Success";
+    rrngxlog::DescribeCapability(c, text, sizeof(text));
+    assert(!strcmp(text, full));
+    RecordingParams partial;
+    partial.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, 0);
+    partial.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, 535u);
+    partial.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, int(0xBAD0000Bu));
+    rrngxlog::DescribeCapability(rrngxlog::ReadCapability(partial), text, sizeof(text));
+    assert(!strcmp(text, "RR capability: available=0 needsUpdatedDriver=? minDriver=535.? "
+                         "featureInit=0xBAD0000B FAIL_UnableToInitializeFeature"));
+    rrngxlog::DescribeCapability({}, text, sizeof(text));
+    assert(!strcmp(text, "RR capability: available=? needsUpdatedDriver=? minDriver=?.? "
+                         "featureInit=?"));
+    // The query: optional export, the map destroyed after reading, a failed query's code.
+    rreval::Api api;
+    assert(!rrngxlog::CapabilityLine(api, text, sizeof(text)));
+    api.capabilities = &Capabilities;
+    api.destroy = &DestroyCapabilities;
+    capability_map = &caps;
+    assert(rrngxlog::CapabilityLine(api, text, sizeof(text)) && !strcmp(text, full));
+    assert(capability_destroys == 1);
+    capability_result = NVSDK_NGX_Result(0xBAD0000Cu);
+    assert(rrngxlog::CapabilityLine(api, text, sizeof(text)) && capability_destroys == 1);
+    assert(!strcmp(text, "RR capability query failed: 0xBAD0000C FAIL_OutOfDate"));
+
+    rreval::Options o;
+    o.width = 2224;
+    o.height = 1248;
+    o.out_width = 3840;
+    o.out_height = 2160;
+    o.quality = 1;
+    o.flags = 75;
+    rrngxlog::DescribeCreation(o, 6, text, sizeof(text));
+    assert(!strcmp(text, "RR created: preset F, quality 1, flags 75 -> 11, render 2224x1248, "
+                         "output 3840x2160"));
+    o.flags = 0;
+    rrngxlog::DescribeCreation(o, 0, text, sizeof(text));
+    assert(!strcmp(text, "RR created: preset Default, quality 1, flags 0 -> 0, render 2224x1248, "
+                         "output 3840x2160"));
+    rrngxlog::DescribeCreation(o, 1, text, sizeof(text));
+    assert(!strncmp(text, "RR created: preset unknown,", strlen("RR created: preset unknown,")));
+}
 int main() {
     rrtrace::ProbeTestAccess::Run();
     CreationParameters();
+    NgxLog();
     puts("PASS: replacement skips native SR; declines forward once; native history resets and "
          "caller parameters restore.");
     puts("PASS: RR creation drops AutoExposure, frees released features and keeps the game's key.");
+    puts("PASS: NGX result codes, module and driver versions, capability, creation and runtime "
+         "lines.");
 }

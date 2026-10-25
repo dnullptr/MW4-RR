@@ -110,6 +110,17 @@ static NVSDK_NGX_Result NVSDK_CONV DestroyParameters(NVSDK_NGX_Parameter *) {
     ++destroys;
     return NVSDK_NGX_Result_Success;
 }
+static std::string logged;
+static void Logged(const char *s) {
+    logged += s;
+    logged += '\n';
+}
+static NVSDK_NGX_Result NVSDK_CONV FeatureNotFound(NVSDK_NGX_Handle *) {
+    return NVSDK_NGX_Result(0xBAD00004u);
+}
+static NVSDK_NGX_Result NVSDK_CONV PlatformError(NVSDK_NGX_Parameter *) {
+    return NVSDK_NGX_Result(0xBAD00002u);
+}
 
 namespace rrlive {
 struct ControllerCpuTest {
@@ -144,8 +155,38 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
     }
+    // A failed retirement keeps its allocations and logs the NGX result, or the missing export.
+    static void RetirementFailure() {
+        Controller f;
+        f.logger = &Logged;
+        f.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        f.parameters = reinterpret_cast<NVSDK_NGX_Parameter *>(2);
+        f.api.release = FeatureNotFound;
+        f.QueueReconfigure();
+        assert(!f.Reconfigure() && f.failed && f.feature && f.parameters);
+        assert(logged == "RR feature retirement failed (0xBAD00004 FAIL_FeatureNotFound); "
+                         "allocations retained\n");
+        logged.clear();
+        Controller p;
+        p.logger = &Logged;
+        p.parameters = reinterpret_cast<NVSDK_NGX_Parameter *>(2);
+        p.api.destroy = PlatformError;
+        p.QueueReconfigure();
+        assert(!p.Reconfigure() && p.failed && p.parameters);
+        assert(logged == "RR parameter retirement failed (0xBAD00002 FAIL_PlatformError); "
+                         "allocations retained\n");
+        logged.clear();
+        Controller m;
+        m.logger = &Logged;
+        m.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        m.QueueReconfigure();
+        assert(!m.Reconfigure() && m.failed && m.feature);
+        assert(logged == "RR feature retirement failed (export missing); allocations retained\n");
+        logged.clear();
+    }
     static void Run() {
         DevTests();
+        RetirementFailure();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);

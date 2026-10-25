@@ -15,6 +15,7 @@
 #include "rr_inputs.h"
 #include "rr_internal.h"
 #include "rr_ngx_api.h"
+#include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
 #include "rr_capture.h"
@@ -126,6 +127,12 @@ class Controller {
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
+    // A successful creation's runtime, logged by Poll after it releases the mutex: module and DXGI
+    // queries never run under it. The probe pins the NGX core module.
+    struct RuntimeReport {
+        HMODULE core{};
+        ComPtr<ID3D12Device> device;
+    } runtime_report;
     rreval::Api api;
     NVSDK_NGX_Parameter *parameters{};
     NVSDK_NGX_Handle *feature{};
@@ -217,6 +224,17 @@ class Controller {
         Log(why);
         CaptureFailed("RR failed");
     }
+    // A failed retirement call logs its NGX result; a missing export has none.
+    bool RetirementFailed(const char *what, bool exported, NVSDK_NGX_Result result) {
+        char line[160];
+        if (exported)
+            snprintf(line, sizeof(line), "%s (%s); allocations retained", what,
+                     rrngxlog::Code(result).text);
+        else
+            snprintf(line, sizeof(line), "%s (export missing); allocations retained", what);
+        Failure(line);
+        return false;
+    }
     void Initialize(ID3D12Device *d) {
         if (initialized) {
             Require(fg::SameNativeObject(pipelines.device.Get(), d),
@@ -283,18 +301,18 @@ class Controller {
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
         if (feature) {
-            if (!api.release || NVSDK_NGX_FAILED(api.release(feature))) {
-                Failure("RR feature retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.release != nullptr;
+            const auto r = exported ? api.release(feature) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR feature retirement failed", exported, r);
             feature = nullptr;
             preset.Retired();
         }
         if (parameters) {
-            if (!api.destroy || NVSDK_NGX_FAILED(api.destroy(parameters))) {
-                Failure("RR parameter retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.destroy != nullptr;
+            const auto r = exported ? api.destroy(parameters) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR parameter retirement failed", exported, r);
             parameters = nullptr;
         }
         for (auto &s : slots) {
@@ -1163,12 +1181,21 @@ class Controller {
     }
 
     void Poll() {
-        std::lock_guard lock(mutex);
-        try {
-            PollLocked();
-        } catch (const std::exception &e) {
-            Failure(e.what());
+        RuntimeReport report;
+        {
+            std::lock_guard lock(mutex);
+            try {
+                PollLocked();
+            } catch (const std::exception &e) {
+                Failure(e.what());
+            }
+            report = std::exchange(runtime_report, {});
         }
+        if (report.core)
+            try {
+                Log(rrngxlog::RuntimeLine(report.core, report.device.Get()).c_str());
+            } catch (...) {
+            }
     }
     // All native identity/binding/view/constant/context proofs are required at
     // the call site. Prepare completes before dispatch; once native dispatch is
@@ -1593,15 +1620,23 @@ class Controller {
                 key = o;
                 api = resolve(mod);
                 Require(api.Valid(), "live NGX exports missing");
-                Require(NVSDK_NGX_SUCCEED(api.allocate(&parameters)) && parameters,
-                        "live NGX parameter allocation failed");
+                const auto allocated = api.allocate(&parameters);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
+                                  "live NGX parameter allocation failed", allocated);
                 rreval::CreateParameters(*parameters, o, preset.desired);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
                 auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
                                           parameters, &feature);
-                Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
+                char line[200];
+                if (rrngxlog::CapabilityLine(api, line, sizeof(line)))
+                    Log(line);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
+                                  "live RR feature creation failed", created);
                 preset.Created();
+                rrngxlog::DescribeCreation(o, preset.desired, line, sizeof(line));
+                Log(line);
+                runtime_report = {mod, pub};
             }
             // Development tests (shared textures, see UseTest). RR takes one mask:
             // while in use, the sky edge mask replaces the SSS one.
@@ -1756,8 +1791,12 @@ class Controller {
                     Change(cl.Get(), s->gpu.sr[i].Get(),
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
-            if (!s->inference_ok)
-                Failure("RR inference failed; native SR retained");
+            if (!s->inference_ok) {
+                char line[128];
+                snprintf(line, sizeof(line), "RR inference failed (%s); native SR retained",
+                         rrngxlog::Code(evaluated_result).text);
+                Failure(line);
+            }
             return s->inference_ok;
         } catch (const std::exception &e) {
             Failure(e.what());
