@@ -6,15 +6,15 @@ static bool settings_loaded{}, config_allowed{};
 static rrsettings::Preferences preferences;
 static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
-static bool &requested_glass = preferences.glass;
 static bool &requested_blend = preferences.blend;
+static bool &requested_glass = preferences.glass;
 static bool &requested_hit = preferences.hit;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::set_config_value(nullptr, SettingsSection, "SSS", requested_sss);
-    reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::set_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
+    reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
 }
 static void ApplyEnabled() {
@@ -34,8 +34,8 @@ static void LoadSettings() {
     unsigned preset = preferences.preset;
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
-    reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::get_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
+    reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
