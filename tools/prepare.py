@@ -64,6 +64,8 @@ def main():
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
+    header(out / 'rr_transparency_blend.generated.h', [
+        ('RRTransparencyBlend', compile_hlsl('rr_transparency_blend.hlsl', 'rr_transparency_blend'), False)])
     for source, entry, symbol, leaf in [
         ('rr_convert_guides.hlsl', 'main', 'RRGuideShader', 'rr_convert_guides'),
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
