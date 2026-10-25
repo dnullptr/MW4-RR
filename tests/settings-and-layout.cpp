@@ -236,7 +236,7 @@ int main() {
     // Specular hit distance tests: classification, hole filling and the summaries.
     {
         using namespace rrhitcond;
-        static_assert(Far == 65504.0f && StatsOffset >= 16 && StatsOffset + 4 * StatCount <= 64);
+        static_assert(Far == 65504.0f && StatsOffset >= 20 && StatsOffset + 4 * StatCount <= 64);
         constexpr auto npos = std::string::npos;
         const float nan = std::numeric_limits<float>::quiet_NaN();
         assert(SpecularRay(1u << 20) && !SpecularRay(0xfffffu));
@@ -332,13 +332,13 @@ int main() {
         f[CountHitNoLobe1] = 2;
         f[CountHitNoLobe2] = 20;
         f[CountNoRtSpecularHit] = 3;
-        pixels.Add(f, FillHoles);
-        pixels.Add(f, SkyMiss);
+        pixels.Add(f, FillHoles, 1000);
+        pixels.Add(f, SkyMiss, 1100); // 100 more pixels in none of the categories
         assert(pixels.Pixels(CountHit) == 400 && pixels.Pixels(StatCount) == 0);
         assert(!pixels.Report(1000 + Tracker::Interval - 1, report));
         assert(pixels.Report(1000 + Tracker::Interval, report));
-        assert(report.find("(10s): frames=2 skyMiss=1 fill=1 | sky=10.0% viewmodel=5.0% "
-                           "noRtSpecular=5.0% other=0.0% traced=80.0% | of traced: hit=25.0% "
+        assert(report.find("(10s): frames=2 skyMiss=1 fill=1 | sky=9.5% viewmodel=4.8% "
+                           "noRtSpecular=4.8% other=4.8% traced=76.2% | of traced: hit=25.0% "
                            "miss=12.5% noRay=62.5% | of noRay: filledFromHits=50.0% "
                            "filledAsMiss=10.0% | checks: hitWithoutLobe1Ray=1.00% "
                            "hitWithoutLobe2Ray=10.00% noRtSpecularHits=6") != npos);

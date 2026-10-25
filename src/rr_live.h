@@ -381,7 +381,7 @@ class Controller {
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 if (s.gate_recorded && s.hit_conditioned)
-                    hit_pixels.Add(s.gpu.ReadHitStats(), s.hit_mode);
+                    hit_pixels.Add(s.gpu.ReadHitStats(), s.hit_mode, UINT64(s.gpu.w) * s.gpu.h);
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  s.sss_used && !s.guides_withheld && s.sss.admission.accepted,
                                  s.transparency_used && !s.guides_withheld &&

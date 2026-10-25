@@ -84,6 +84,7 @@ using Frame = std::array<uint32_t, StatCount>;
 // CPU-only summary of the pass's pixel counts, read back with the gate's.
 class Tracker {
     std::array<uint64_t, StatCount> pixels{};
+    uint64_t other{}; // pixels in none of the GPU's categories
     unsigned frames{}, mode{};
     uint64_t since{};
     bool started{};
@@ -93,11 +94,15 @@ class Tracker {
 
   public:
     static constexpr uint64_t Interval = 10000;
-    void Add(const Frame &f, unsigned frame_mode) {
+    // frame_pixels: the pass's width x height.
+    void Add(const Frame &f, unsigned frame_mode, uint64_t frame_pixels) {
         ++frames;
         mode |= frame_mode;
         for (unsigned i = 0; i < StatCount; ++i)
             pixels[i] += f[i];
+        const uint64_t counted = uint64_t(f[CountSky]) + f[CountViewmodel] +
+                                 f[CountNoRtSpecular] + f[CountHit] + f[CountMiss] + f[CountHole];
+        other += frame_pixels > counted ? frame_pixels - counted : 0;
     }
     uint64_t Pixels(unsigned i) const {
         return i < StatCount ? pixels[i] : 0;
@@ -115,7 +120,7 @@ class Tracker {
             const auto &p = pixels;
             const uint64_t traced = p[CountHit] + p[CountMiss] + p[CountHole];
             const uint64_t all = traced + p[CountSky] + p[CountViewmodel] +
-                                 p[CountNoRtSpecular] + p[CountOther];
+                                 p[CountNoRtSpecular] + other;
             char text[640];
             snprintf(text, sizeof(text),
                      "Specular hit distance pixels (%llus): frames=%u skyMiss=%d fill=%d | "
@@ -126,7 +131,7 @@ class Tracker {
                      static_cast<unsigned long long>((now - since) / 1000), frames,
                      (mode & SkyMiss) ? 1 : 0, (mode & FillHoles) ? 1 : 0,
                      Percent(p[CountSky], all), Percent(p[CountViewmodel], all),
-                     Percent(p[CountNoRtSpecular], all), Percent(p[CountOther], all),
+                     Percent(p[CountNoRtSpecular], all), Percent(other, all),
                      Percent(traced, all), Percent(p[CountHit], traced),
                      Percent(p[CountMiss], traced), Percent(p[CountHole], traced),
                      Percent(p[CountFilledHit], p[CountHole]),

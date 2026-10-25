@@ -80,7 +80,7 @@ void Condition(int2 p){
   Count(rrhitcond::CountNoRtSpecular);
   if(raw>0)Count(rrhitcond::CountNoRtSpecularHit);
  }
- else Count(rrhitcond::CountOther);
+ // Anything else is the rest of the frame, worked out on the CPU.
 }
 [numthreads(16,16,1)]
 void main(uint3 id:SV_DispatchThreadID,uint index:SV_GroupIndex){

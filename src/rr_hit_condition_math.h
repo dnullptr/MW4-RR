@@ -26,13 +26,14 @@ RR_HIT_CONST int Radius = 3;
 // A neighbour stands in for the centre within this share of its device depth
 // (about the same share of view depth) and within about 25 degrees of its normal.
 RR_HIT_CONST float DepthTolerance = 0.04f, MinCosine = 0.9f;
-// Statistics after the gate's 16 bytes in the slot's stats buffer, which only
-// this pass writes; it zeroes them first.
-RR_HIT_CONST UInt StatsOffset = 16u, StatCount = 12u;
+// Statistics in the slot's stats buffer after the gate's 16 bytes and byte 16
+// (the water tests' pixel count); only this pass writes them, and it zeroes them
+// first. Each pixel is sky, viewmodel, no RT specular, a hit, a miss or a hole,
+// or else the rest, which the CPU works out from the frame size.
+RR_HIT_CONST UInt StatsOffset = 20u, StatCount = 11u;
 RR_HIT_CONST UInt CountSky = 0u, CountViewmodel = 1u, CountNoRtSpecular = 2u, CountHit = 3u,
                   CountMiss = 4u, CountHole = 5u, CountFilledHit = 6u, CountFilledMiss = 7u,
-                  CountHitNoLobe1 = 8u, CountHitNoLobe2 = 9u, CountNoRtSpecularHit = 10u,
-                  CountOther = 11u;
+                  CountHitNoLobe1 = 8u, CountHitNoLobe2 = 9u, CountNoRtSpecularHit = 10u;
 
 // Raw lighting weights: bits 20-31 count lobe-1 samples, 8-19 lobe-2 samples
 // (shaders/rr_sparse_scale_vrrt.hlsl). Lobe 1 behaves as specular in game.
