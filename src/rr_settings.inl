@@ -68,7 +68,7 @@ static const char *PresetLabel(unsigned value) {
             return rrpreset::names[i];
     return "Unknown";
 }
-static void OnRuntime(reshade::api::effect_runtime *) {
+static void OnRuntime(reshade::api::effect_runtime *runtime) {
     Observer().Poll();
     {
         std::lock_guard lock(settings_mutex);
@@ -92,12 +92,12 @@ static void OnRuntime(reshade::api::effect_runtime *) {
             down[i] = pressed;
         }
         // Pause/Break, as every F key is taken; not with Ctrl (Ctrl+Pause is Break) or Alt held.
-        static bool pause_down{};
-        const bool pause = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
-        if (pause && !pause_down && foreground == GetCurrentProcessId() &&
-            !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_MENU) & 0x8000))
+        // Its down and up arrive together, too briefly to poll, so ReShade's key messages are
+        // read; both in one frame show as released. A second request is ignored while active.
+        if (runtime && (runtime->is_key_pressed(VK_PAUSE) || runtime->is_key_released(VK_PAUSE)) &&
+            foreground == GetCurrentProcessId() && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetAsyncKeyState(VK_MENU) & 0x8000))
             LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
-        pause_down = pause;
         if (changed) {
             ApplyEnabled();
             SaveToggles();

@@ -144,6 +144,7 @@ class Controller {
         failed = true;
         policy.Reject();
         Log(why);
+        CaptureFailed("RR failed");
     }
     void Initialize(ID3D12Device *d) {
         if (initialized) {
@@ -204,6 +205,9 @@ class Controller {
             if (done == UINT64_MAX || done < signaled)
                 return false;
         }
+        // Pooled and collected readback buffers may belong to the device being retired.
+        if (capture.Active())
+            CaptureFailed("RR was reconfigured");
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
         if (feature) {
@@ -371,6 +375,15 @@ class Controller {
                        const rreval::Options &o, bool reset,
                        const std::array<float, 16> &projection) {
         try {
+            const bool armed = capture.state == rrcapture::State::Armed;
+            if (!armed) {
+                unsigned in_flight = 0;
+                for (const auto &v : slots)
+                    if (v.captured.buffer && v.captured.session == capture.session)
+                        ++in_flight;
+                if (!capture.Wants(in_flight))
+                    return;
+            }
             rrcapture::Sources sources{};
             sources[rrcapture::Color] = {r.color, o.color_x, o.color_y};
             sources[rrcapture::Depth] = {r.depth, o.depth_x, o.depth_y};
@@ -389,28 +402,35 @@ class Controller {
                 CaptureFailed("unsupported input layout");
                 return;
             }
+            char line[160];
             const auto mb = [](UINT64 bytes) {
                 return static_cast<unsigned long long>((bytes >> 20) + ((bytes & 0xFFFFF) != 0));
             };
-            char line[160];
-            if (capture.state == rrcapture::State::Armed) {
+            const auto admit = [&](UINT64 bytes) { // Fails the capture when refused.
+                if (rrcapture::Admit(device, bytes))
+                    return true;
+                snprintf(line, sizeof(line), "not enough memory for %llu MB", mb(bytes));
+                CaptureFailed(line);
+                return false;
+            };
+            const auto allocate = [&] { // One frame's buffer; fails the capture when null.
+                auto b = rrcapture::Allocate(device, frame.bytes);
+                if (!b)
+                    CaptureFailed("cannot allocate readback memory");
+                return b;
+            };
+            if (armed) {
                 if (frame.bytes > UINT64_MAX / rrcapture::Frames) {
                     CaptureFailed("capture too large");
                     return;
                 }
-                const UINT64 total = frame.bytes * rrcapture::Frames;
-                if (!rrcapture::Admit(device, total)) {
-                    snprintf(line, sizeof(line), "not enough memory for %llu MB", mb(total));
-                    CaptureFailed(line);
+                if (!admit(frame.bytes * rrcapture::Frames))
                     return;
-                }
                 std::vector<ComPtr<ID3D12Resource>> buffers;
                 for (unsigned i = 0; i < rrcapture::Frames; ++i) {
-                    buffers.push_back(rrcapture::Allocate(device, frame.bytes));
-                    if (!buffers.back()) {
-                        CaptureFailed("cannot allocate readback memory");
+                    buffers.push_back(allocate());
+                    if (!buffers.back())
                         return;
-                    }
                 }
                 capture.Begin(std::move(buffers));
                 snprintf(line, sizeof(line), "RR capture: collecting %u frames, %llu MB each",
@@ -418,26 +438,15 @@ class Controller {
                 Log(line);
                 return; // The allocation hitch stays out of the run.
             }
-            unsigned in_flight = 0;
-            for (const auto &v : slots)
-                if (v.captured.buffer && v.captured.session == capture.session)
-                    ++in_flight;
-            if (!capture.Wants(in_flight))
-                return;
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
                 frame.buffer.Reset();
             if (!frame.buffer) {
-                if (!rrcapture::Admit(device, frame.bytes)) {
-                    snprintf(line, sizeof(line), "not enough memory for %llu MB", mb(frame.bytes));
-                    CaptureFailed(line);
+                if (!admit(frame.bytes))
                     return;
-                }
-                frame.buffer = rrcapture::Allocate(device, frame.bytes);
-                if (!frame.buffer) {
-                    CaptureFailed("cannot allocate readback memory");
+                frame.buffer = allocate();
+                if (!frame.buffer)
                     return;
-                }
             }
             if (!capture.Count()) {
                 LogCaptureFailure();
@@ -1670,6 +1679,7 @@ class Controller {
             retired = true;
             enabled = false;
             Log("RR NGX shutdown invalidated private handles; live mode retired");
+            CaptureFailed("RR shut down");
         }
     }
 };
