@@ -15,6 +15,7 @@
 #include "rr_sss_pipeline.h"
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
+#include "rr_game_config.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -208,13 +209,20 @@ static void AfterNgxShutdown(HMODULE m, ID3D12Device *d, bool ok) {
 }
 static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
                         const NVSDK_NGX_Parameter *p, NVSDK_NGX_Result r) {
+    // Frame generation is counted for the health line only, lock-free: never the controller.
+    if (k == rrtrace::Kind::FG) {
+        rrhealth::presentation.fg_evaluations.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (k != rrtrace::Kind::SR)
         return;
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
+    // A capture on this route copies an input from the tracker's state when nothing proved it.
     LiveRR().AfterSR(cl, p, rrtrace::Probe::CurrentCall(), r, rrtrace::Probe::CurrentRuntime(),
                      rrtrace::Probe::RuntimeEpoch(),
                      n && AlbedoInspector().SafeCopies(n.Get()) &&
-                         AlbedoInspector().StateCoverage(n.Get()));
+                         AlbedoInspector().StateCoverage(n.Get()),
+                     false, &SparseLayouts());
     ComputeState().Invalidate(n.Get());
 }
 static rrtrace::Probe &Observer() {
@@ -612,7 +620,11 @@ static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t
     GlassDraw(l, true, c, i);
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
 }
+static void ConditionSpecularDistance(reshade::api::command_list *list,
+                                      ID3D12GraphicsCommandList *native, uint64_t effective,
+                                      const rrsparsecopy::Pair &input);
 #include "rr_sparse_render.h"
+#include "rr_vrrt_budget_render.h"
 #include "rr_vrrt_render.h"
 static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
     const auto binding = ShaderDispatches().Get(list->get_native());
@@ -805,6 +817,47 @@ static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t 
                ? S::Copied
                : S::Slot);
 }
+static rrhitcond::Diagnostics &ConditionStats() {
+    static auto *p = new rrhitcond::Diagnostics;
+    return *p;
+}
+// Specular hit distance tests (rrhitcond): called at the native temporal pass,
+// whose proven t4/t5 input holds this frame's raw lighting and weights. Its
+// compute state is captured and restored around the private pass, as for the
+// VRRT reader. PackedSurface is not bound here: it was proven at the earlier hit
+// distance blur and the game reads it again after this pass, so its tracked
+// state is used as for the bound inputs. An aliasing barrier on the list since
+// its last transition (one with a null side marks every tracked resource) is
+// only counted in the log, split by whether it named PackedSurface, so the
+// tests cannot go quiet on an unproven concern.
+// Dispatches with nothing to condition skip the capture.
+static void ConditionSpecularDistance(reshade::api::command_list *list,
+                                      ID3D12GraphicsCommandList *native, uint64_t effective,
+                                      const rrsparsecopy::Pair &input) {
+    if (!rrhitcond::Mode())
+        return;
+    auto &stats = ConditionStats();
+    rrhitcond::Outcome why{};
+    if (!LiveRR().HitDistancePending(native, why))
+        return stats.Observe(why);
+    auto *state = rrbindings::State(list->get_device());
+    if (!state || !state->tracker.Healthy())
+        return stats.Observe(rrhitcond::Outcome::Context);
+    const auto restore = ComputeState().Capture(native, (ID3D12PipelineState *)effective);
+    if (!restore.valid || !restore.complete || !restore.heap_restore_valid ||
+        UINT64(restore.root.Get()) != state->tracker.CurrentLayout(list->get_native()))
+        return stats.Observe(rrhitcond::Outcome::Context);
+    using Alias = rrsparsecopy::Layouts::Alias;
+    auto alias = Alias::None;
+    const auto outcome = LiveRR().ConditionSpecularDistance(
+        native, input.r[1].Get(), input.state[1], restore,
+        [&](ID3D12Resource *r, D3D12_RESOURCE_STATES &s) {
+            return SparseLayouts().Get(native, r, s, alias);
+        });
+    stats.Observe(outcome);
+    if (outcome == rrhitcond::Outcome::Conditioned && alias != Alias::None)
+        stats.SurfaceAliased(alias == Alias::Named);
+}
 static void RestoreLightingPipeline(reshade::api::command_list *list) {
     const auto b = ShaderDispatches().Get(list->get_native());
     if (!rrbypass::Target(b.shader) || !b.pipeline)
@@ -829,16 +882,37 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         const bool live_prepass = PreservePrepass(list, x, y, z);
         if (live_prepass)
             return true;
+        if (PreserveRayBudget(list, x, y, z))
+            return true;
         const auto b = ShaderDispatches().Get(list->get_native());
         auto *device = list->get_device();
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             (ID3D12GraphicsCommandList *)list->get_native());
-        if (!native || !LiveRR().CanRaw(native.Get()) || rrbypass::Health(device).failed)
+        if (!native || !LiveRR().CanRaw(native.Get()))
             return false;
+        if (rrbypass::Health(device).failed) {
+            // A3: the ray budget gate still sees this apply, unproven, so a raised Budget it
+            // consumes is counted (controller-lifecycle: RayBudget, "An apply that OnDispatch
+            // reports while rrbypass Health has failed").
+            if (b.shader == rrbypass::Vrrt)
+                LiveRR().RayBudgetApply(native.Get(), rrraybudget::Lists{}, rrvrrt::RayApply{});
+            return false;
+        }
         if (b.shader == rrbypass::Vrrt) {
-            if (!PreserveNativeSampling(list, x, y, z))
+            if (!PreserveNativeSampling(list, x, y, z)) {
+                rrapply::Dispatched(0, false);
                 return false;
+            }
             rrbypass::Used(device, b.pipeline, b.shader);
+            // Ray selection test: the patched copy runs this dispatch only, on the same root
+            // arguments; RestoreLightingPipeline rebinds the game's PSO at the next dispatch.
+            const auto variant = rrapply::Selected();
+            Microsoft::WRL::ComPtr<ID3D12PipelineState> patched;
+            if (variant)
+                patched = rrbypass::Apply(device, b.pipeline, variant);
+            if (patched)
+                native->SetPipelineState(patched.Get());
+            rrapply::Dispatched(variant, patched != nullptr);
             return false;
         }
         if (!LiveRR().SamplingReady(native.Get()))
@@ -864,7 +938,9 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
     return false;
 }
 static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_command t,
-                       reshade::api::resource, uint64_t, uint32_t, uint32_t) {
+                       reshade::api::resource buffer, uint64_t offset, uint32_t draw_count,
+                       uint32_t stride) {
+    ObserveRayListConsumer(l, t, buffer, offset, draw_count, stride);
     RestoreLightingPipeline(l);
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)
@@ -873,22 +949,47 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     return false;
 }
-static bool VrsConfigAllowsRR() {
+// The campaign settings file: read-only flag and text, for the RR gate and the config report.
+static rrgameconfig::File ReadGameConfig() {
+    rrgameconfig::File file;
     wchar_t local[32768]{};
     auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
     if (!size || size >= 32768)
-        return false;
+        return file;
     const auto path =
         std::filesystem::path(local) / L"Activision/Call of Duty/players/s.1.0.cod26.txt";
     const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_READONLY))
-        return false;
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return file;
+    file.readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    file.state = rrgameconfig::FileState::Unreadable;
     std::ifstream input(path);
     if (!input)
-        return false;
+        return file;
     std::ostringstream text;
     text << input.rdbuf();
-    return rrvrsconfig::Allowed(text.str(), true, true);
+    file.text = text.str();
+    file.state = rrgameconfig::FileState::Read;
+    return file;
+}
+static bool VrsGateAllows(const rrgameconfig::File &file) {
+    return file.state == rrgameconfig::FileState::Read &&
+           rrvrsconfig::Allowed(file.text, file.readonly, true);
+}
+static bool VrsConfigAllowsRR() { return VrsGateAllows(ReadGameConfig()); }
+// Once per session, from LoadSettings, with the file the RR gate read and its answer. Logs and
+// counts only: RR is never blocked by it.
+static unsigned ReportGameConfig(const rrgameconfig::File &file, bool gate_allows) {
+    try {
+        std::vector<std::string> lines;
+        const auto warnings = rrgameconfig::Report(file, gate_allows, lines);
+        for (const auto &line : lines)
+            WriteLog(line.c_str());
+        return warnings;
+    } catch (...) {
+        WriteLog("Game config check failed; RR is not affected");
+        return 0;
+    }
 }
 #include "rr_settings.inl"
 static bool RegisterRuntimeCallbacks(HMODULE module) {
@@ -921,7 +1022,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::draw>(&AuditDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
-    reshade::register_event<reshade::addon_event::reshade_present>(&OnRuntime);
+    reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
     return true;
 }
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

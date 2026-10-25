@@ -6,6 +6,7 @@ struct Preferences {
     bool sss = true;
     bool glass = true;
     bool hit = true;
+    bool weapon_depth = true; // linear depth for RR, the weapon kept in front (rr_weapon_depth.h)
     unsigned preset = 6;
     // SSS noise experiments.
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame

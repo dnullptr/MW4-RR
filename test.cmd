@@ -21,7 +21,7 @@ for %%T in (refraction-dropout) do (
  build\tests\%%T.exe || exit /b 1
 )
 cl %FLAGS% %INC% /c tests\preset-policy.cpp /Fobuild\tests\ || exit /b 1
-for %%T in (runtime-shader sr-replacement sr-presentation sr-layouts settings-and-layout controller-lifecycle capture-model weapon-depth release-buffer-cpu release-hooks-cpu release-private-transition-cpu) do (
+for %%T in (runtime-shader sr-replacement sr-presentation sr-layouts settings-and-layout ray-copies ray-budget controller-lifecycle capture-model weapon-depth vrrt-apply-shader release-buffer-cpu release-hooks-cpu release-private-transition-cpu) do (
  cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
  build\tests\%%T.exe || exit /b 1
 )

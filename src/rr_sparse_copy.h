@@ -31,7 +31,7 @@ class Layouts {
     struct State {
         D3D12_RESOURCE_STATES layout{};
         UINT64 identity{};
-        bool aliased{};
+        bool aliased{}, named{}; // named: by a barrier naming this resource
     };
     struct Recording {
         std::unordered_map<ID3D12Resource *, State> states;
@@ -82,15 +82,13 @@ class Layouts {
             // https://microsoft.github.io/DirectX-Specs/d3d/ResourceHeaps.html
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
                 const auto &a = b[i].Aliasing;
-                if (!a.pResourceBefore || !a.pResourceAfter) {
+                if (!a.pResourceBefore || !a.pResourceAfter)
                     for (auto &[resource, state] : l.states)
                         state.aliased = true;
-                } else {
-                    for (auto *resource : {a.pResourceBefore, a.pResourceAfter}) {
-                        auto at = l.states.find(resource);
-                        if (at != l.states.end())
-                            at->second.aliased = true;
-                    }
+                for (auto *resource : {a.pResourceBefore, a.pResourceAfter}) {
+                    auto at = l.states.find(resource);
+                    if (at != l.states.end())
+                        at->second.aliased = at->second.named = true;
                 }
             }
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
@@ -116,17 +114,22 @@ class Layouts {
         }
     }
   private:
+    const State *Find(ID3D12GraphicsCommandList *cl, ID3D12Resource *r) { // mutex held
+        auto l = lists.find(cl);
+        if (!r || l == lists.end() || l->second.capped)
+            return nullptr;
+        auto at = l->second.states.find(r);
+        if (at == l->second.states.end() || Identity(r, false) != at->second.identity)
+            return nullptr;
+        return &at->second;
+    }
     bool Lookup(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
                 D3D12_RESOURCE_STATES &value, bool require_unaliased) {
         std::lock_guard lock(mutex);
-        auto l = lists.find(cl);
-        if (!r || l == lists.end() || l->second.capped)
+        const auto *at = Find(cl, r);
+        if (!at || (require_unaliased && at->aliased))
             return false;
-        auto at = l->second.states.find(r);
-        if (at == l->second.states.end() || Identity(r, false) != at->second.identity ||
-            (require_unaliased && at->second.aliased))
-            return false;
-        value = at->second.layout;
+        value = at->layout;
         return true;
     }
   public:
@@ -138,6 +141,20 @@ class Layouts {
     bool GetUnaliased(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
                       D3D12_RESOURCE_STATES &value) {
         return Lookup(cl, r, value, true);
+    }
+    // Get, also saying which aliasing barrier on cl, if any, came after r's last
+    // transition: Any for one with a null side (it covers every resource), Named
+    // for one naming r.
+    enum class Alias { None, Any, Named };
+    bool Get(ID3D12GraphicsCommandList *cl, ID3D12Resource *r, D3D12_RESOURCE_STATES &value,
+             Alias &alias) {
+        std::lock_guard lock(mutex);
+        const auto *at = Find(cl, r);
+        if (!at)
+            return false;
+        value = at->layout;
+        alias = at->named ? Alias::Named : at->aliased ? Alias::Any : Alias::None;
+        return true;
     }
     // Fixture simulates allocation lifetime rollover at the same opaque address.
     static void RetireIdentityForTest(ID3D12Resource *r) {
@@ -297,6 +314,26 @@ class Pool {
                                                         sizeof(RRVrrtScaleSssFill3Float)}
                                 : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill3,
                                                         sizeof(RRVrrtScaleSssFill3)};
+        case Source::SssFill2Spatial:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SpatialFloat,
+                                                        sizeof(RRVrrtScaleSssFill2SpatialFloat)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Spatial,
+                                                        sizeof(RRVrrtScaleSssFill2Spatial)};
+        case Source::SssSpatial2:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2Float,
+                                                        sizeof(RRVrrtScaleSssSpatial2Float)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2,
+                                                        sizeof(RRVrrtScaleSssSpatial2)};
+        case Source::SssFill2Settled:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SettledFloat,
+                                                        sizeof(RRVrrtScaleSssFill2SettledFloat)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Settled,
+                                                        sizeof(RRVrrtScaleSssFill2Settled)};
+        case Source::SssFillDebug:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFillDebugFloat,
+                                                        sizeof(RRVrrtScaleSssFillDebugFloat)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFillDebug,
+                                                        sizeof(RRVrrtScaleSssFillDebug)};
         default:
             return packed_float
                        ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}

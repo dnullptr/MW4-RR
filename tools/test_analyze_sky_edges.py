@@ -6,7 +6,8 @@ so sky/non-sky flips at thin edges arise from the jitter alone: a bright texture
 thin dark diagonal wire, a thin branch and a canopy that move +2 px per frame (with matching
 motion vectors), and a hill whose far and near parts make a depth edge well away from the sky.
 Faults are injected per case: (b) depth shifted 1 px or colour blended at edges, (c) filtered
-depth, (d) NaN colour, (e) sky motion on tree edges, (f) a foliage patch dithered per frame.
+depth, (d) NaN colour, (e) sky motion on tree edges, (f) a foliage patch dithered per frame,
+(g) 2x2 coarse shading (VRS) on the alpha-tested branch and canopy.
 H0 cases add rr_output, the scene sampled at the unjittered output pixel centres (a converged RR):
 (a) with per-frame gain noise at sky edges only, (b) stable (plus a reset frame that must be
 skipped), (c) absent (older captures), (d) at a non-integer scale of the render size.
@@ -60,8 +61,9 @@ def segment_distance(px, py, a, b):
     return np.hypot(px - (ax + t * (bx - ax)), py - (ay + t * (by - ay)))
 
 
-def surface_ids(px, py, frame, dither):
-    """Front-most surface at each sample point (largest reverse-Z depth wins)."""
+def surface_ids(px, py, frame, dither, skip=()):
+    """Front-most surface at each sample point (largest reverse-Z depth wins), surfaces in skip
+    left out."""
     shift = TREE_SPEED * frame
     ids = np.full(px.shape, SKY)
     best = np.zeros(px.shape)
@@ -76,6 +78,8 @@ def surface_ids(px, py, frame, dither):
         inside = ((px - 22) / 13) ** 2 + ((py - 40) / 8) ** 2 <= 1
         shapes.append((DITHER, inside & (rng.random(px.shape) < DITHER_COVERAGE)))
     for surface, mask in shapes:
+        if surface in skip:
+            continue
         take = mask & (DEPTH[surface] > best)
         ids[take], best[take] = surface, DEPTH[surface]
     return ids
@@ -102,11 +106,11 @@ def surface_color(ids, px, py):
     return color
 
 
-def render_frame(frame, dither=False):
+def render_frame(frame, dither=False, skip=()):
     gy, gx = np.mgrid[0:H, 0:W].astype(np.float64)
     jx, jy = JITTER[frame]
     px, py = gx + 0.5 + jx, gy + 0.5 + jy
-    ids = surface_ids(px, py, frame, dither)
+    ids = surface_ids(px, py, frame, dither, skip)
     lut = lambda table: np.array([table[s] for s in range(7)], np.float32)[ids]  # noqa: E731
     motion = np.zeros((H, W, 2), np.float32)
     motion[(ids == BRANCH) | (ids == CANOPY)] = (-TREE_SPEED, 0)   # points to the previous position
@@ -191,6 +195,30 @@ def nan_color(frame, i):
 
 def sky_motion(frame, i):
     frame['motion'][edge_mask(frame['depth'])] = 0
+
+
+def coarse_foliage(frame, i):
+    """2x2 coarse shading (VRS) on the alpha-tested branch and canopy: each aligned 2x2 block takes
+    the coverage (discard runs once per coarse pixel) and the shading of its top-left sample, then
+    is depth-tested against what lies behind. The wire and the hills are rasterised as before."""
+    behind = render_frame(i, skip=(BRANCH, CANOPY))
+    foliage = (frame['depth'] == DEPTH[BRANCH]) | (frame['depth'] == DEPTH[CANOPY])
+    tl = lambda a: np.repeat(np.repeat(a[0::2, 0::2], 2, axis=0), 2, axis=1)  # noqa: E731
+    take = tl(foliage) & (tl(frame['depth']) > behind['depth'])
+    for name, value in frame.items():
+        mask = take if value.ndim == 2 else take[..., None]
+        frame[name] = np.where(mask, tl(value), behind[name]).astype(value.dtype)
+
+
+def coarse_foliage_with_roofs(frame, i):
+    """coarse_foliage, plus two full-width horizontal bars (rooflines) in the sky whose edges
+    sit on pixel boundaries 1.0, 3.0, 5.0 and 7.0. They are rasterised, but every one of their
+    mixed y-blocks lands in the leaves' grid phase 0 in every frame, which the snapped leaves
+    leave nearly empty, so the frame-wide count picks phase 1."""
+    coarse_foliage(frame, i)
+    for name, value in frame.items():
+        value[1:3] = value[70, 0]   # a far-hill pixel: static, finite depth
+        value[5:7] = value[70, 0]
 
 
 def make_capture(fault=None, dither=False):
@@ -284,6 +312,26 @@ def run(fault=None, dither=False):
         return ase.analyze(manifest, frames, tmp)
 
 
+def linear_depth(depth, mapping):
+    """src/rr_weapon_depth.h Linear in float32: the linear view depth RR gets with weapon depth on."""
+    f = np.float32
+    d = np.asarray(depth, np.float32)
+    scale, offset, sky = f(mapping['scale']), f(mapping['offset']), f(mapping['sky'])
+    cut, knee = f(mapping['slice']), f(mapping['knee'])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = np.minimum((d - cut) * f(64), f(1))
+        weapon = scale / (f(1) + offset) / (f(1) + t / knee)
+        world = np.minimum(scale / (d + offset), sky)
+        return np.where(d > 0, np.where(d > cut, weapon, world), sky).astype(np.float32)
+
+
+def weapon_mapping(scale=NEAR, offset=0.0, floor=0.0):
+    """A frame's linear_depth, as src/rr_weapon_depth.h Map makes it."""
+    sky = scale / (floor + offset) if floor or offset else scale * 1e6
+    return {'scale': scale, 'offset': offset, 'sky': float(np.float32(sky)), 'slice': 63 / 64,
+            'knee': 2 ** -11}
+
+
 def verdict(metrics, key):
     return metrics['verdicts'][key]['verdict']
 
@@ -340,10 +388,75 @@ class SyntheticCaptureTests(unittest.TestCase):
         cls.clean = run()
 
     def test_weapon_depth_capture_refused(self):
+        # An older build's capture with weapon depth on has linear depth but no mapping per frame.
         manifest, frames = make_capture(None, False)
         manifest['settings']['weapon_depth'] = True
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             ase.analyze(manifest, frames, tmp)
+        with self.assertRaises(ValueError):
+            ase.undo_tests(manifest, frames)
+        for meta in manifest['frames'][1:]:
+            meta['linear_depth'] = None
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            ase.analyze(manifest, frames, tmp)
+
+    def test_weapon_depth_undone(self):
+        # Weapon depth: RR got linear view depth, with its mapping in each frame. The analysis reads
+        # it as hardware depth again, so every verdict matches the clean capture; also with the sky
+        # guide test's floor, which linear depth's sky then stands for.
+        for floor in (0.0, 1e-7):
+            with self.subTest(floor=floor):
+                manifest, frames = make_capture_with_output()
+                manifest['settings']['weapon_depth'] = True
+                mapping = weapon_mapping(floor=floor)
+                for meta, frame in zip(manifest['frames'], frames):
+                    meta.update(linear_depth=mapping, depth_floor=floor)
+                    frame['depth'] = linear_depth(frame['depth'], mapping)
+                reference, original = make_capture_with_output()
+                with tempfile.TemporaryDirectory() as tmp:
+                    expected = ase.analyze(reference, original, tmp)
+                    m = ase.analyze(manifest, frames, tmp)
+                    report = (Path(tmp) / 'report.md').read_text()
+                self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                                 {k: verdict(expected, k) for k in expected['verdicts']})
+                self.assertIn('weapon depth on in frames [0, 1, 2, 3, 4, 5, 6, 7]', report)
+                undone = ase.undo_tests(manifest, frames)[0]
+                for frame, game in zip(undone, original):
+                    np.testing.assert_allclose(frame['depth'], game['depth'], rtol=1e-6, atol=0)
+                    self.assertTrue((frame['depth'][game['depth'] == 0] == 0).all())
+                self.assertTrue((frames[0]['depth'] > 1).all())   # The caller's arrays are left alone.
+
+    def test_hardware_depth_exact(self):
+        # hardware_depth undoes linear_depth as src/rr_weapon_depth.h Hardware undoes Linear.
+        cut = np.float32(63 / 64)
+        weapon = cut + (1 - cut) * np.array([1e-5, 1e-4, 0.004, 0.03, 0.5, 1], np.float32)
+        world = np.array([cut, 0.75, 0.5, 1e-3, 1e-5, 2e-6], np.float32)
+        sky = np.array([0, -0.0, np.nan], np.float32)
+        for m in (weapon_mapping(), weapon_mapping(scale=4.0), weapon_mapping(offset=1e-6)):
+            with self.subTest(mapping=m):
+                back = ase.hardware_depth(linear_depth(weapon, m), m)
+                self.assertTrue((back > cut).all())
+                np.testing.assert_allclose(back, weapon, rtol=0, atol=3e-7)
+                np.testing.assert_allclose(ase.hardware_depth(linear_depth(world, m), m), world,
+                                           rtol=1e-5, atol=0)
+                np.testing.assert_array_equal(ase.hardware_depth(linear_depth(sky, m), m), np.zeros(3))
+                # World depth farther than an infinite projection's sky came back as sky.
+                tiny = ase.hardware_depth(linear_depth(np.float32(1e-7), m), m)
+                np.testing.assert_allclose(tiny, 0 if m['offset'] == 0 else 1e-7, rtol=1e-5, atol=0)
+                floor = np.float32(1e-7)
+                np.testing.assert_array_equal(ase.hardware_depth(np.float32([m['sky'], 2e30]), m, floor),
+                                              [floor] * 2)
+                # Depth linear depth never holds stays as it is, so it still counts as bad.
+                bad = np.float32([np.inf, -np.inf, np.nan, 0, -1])
+                np.testing.assert_array_equal(ase.hardware_depth(bad, m), bad)
+                # World depth never comes back as the weapon.
+                self.assertLessEqual(ase.hardware_depth(linear_depth(cut, m), m), cut)
+                # Weapon depth on the near plane, or between it and the nearest world depth, is the
+                # slice's back; nearer than the weapon's front is its front.
+                near = np.float32(m['scale']) / (np.float32(1) + np.float32(m['offset']))
+                gap = np.nextafter(linear_depth(cut, m), np.float32(0))
+                np.testing.assert_array_equal(
+                    ase.hardware_depth(np.float32([near, gap, near / 4096]), m), [cut, cut, 1])
 
     def test_tree_tests_undone(self):
         # Color brightness test (on all frames or every other one) and the sky depth floor on all,
@@ -380,6 +493,38 @@ class SyntheticCaptureTests(unittest.TestCase):
                 self.assertTrue((frames[0]['depth'] > 0).all())
                 self.assertEqual(frames[1]['color'].shape[-1], 4)
 
+    def test_contrast_test_undone(self):
+        # The contrast test compresses the brightest channel to knee * ln(1 + m / knee), hue kept,
+        # after the brightness test's factor (shaders/rr_color_scale.hlsl). The analysis expands
+        # color and rr_output back, so the values and every verdict match the clean capture.
+        def compress(rgb, knee):
+            m = rgb.max(axis=-1, keepdims=True)
+            x = m / np.float32(knee)
+            f = np.where(x < 0.01, 1 + x * (x / 3 - 0.5), np.log1p(x) / np.maximum(x, 1e-30))
+            return (rgb * np.where(m > 0, f, 1)).astype(np.float32)
+        for knee, s in ((1.0, 1.0), (0.25, 0.25), (0.05, 1.0)):
+            with self.subTest(knee=knee, scale=s):
+                manifest, frames = make_capture_with_output()
+                for meta, frame in zip(manifest['frames'], frames):
+                    meta['color_scale'], meta['contrast_knee'] = s, knee
+                    rgb = compress(frame['color'] * np.float32(s), knee)
+                    frame['color'] = np.concatenate([rgb, np.ones(rgb.shape[:2] + (1,), np.float32)], -1)
+                    out = frame['rr_output'].copy()
+                    out[..., :3] = compress(out[..., :3] * np.float32(s), knee)
+                    frame['rr_output'] = out
+                reference, original = make_capture_with_output()
+                undone, notes = ase.undo_tests(manifest, frames)
+                for name in ('color', 'rr_output'):
+                    np.testing.assert_allclose(undone[0][name][..., :3], original[0][name][..., :3],
+                                               rtol=2e-5, atol=1e-7)
+                self.assertTrue(any('contrast test on in frames' in n for n in notes))
+                if knee == 0.05:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        expected = ase.analyze(reference, original, tmp)
+                        m = ase.analyze(manifest, frames, tmp)
+                    self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                                     {k: verdict(expected, k) for k in expected['verdicts']})
+
     def test_tree_tests_undo_exact(self):
         # The floor replaced only depth == 0, so a game's negative or tiny depth stays as RR got
         # it; the scaled color copy loses its constant alpha and rr_output keeps its own.
@@ -408,6 +553,27 @@ class SyntheticCaptureTests(unittest.TestCase):
         manifest['frames'][3]['responsivity_source'] = 'water'
         self.assertEqual(ase.undo_tests(manifest, frames)[1], ['responsivity mask from: sss, water'])
 
+    def test_guide_test_noted(self):
+        # A guide test can't be undone, so the report says which frames had one, and warns when
+        # the mode changed within the capture.
+        manifest, frames = make_capture_with_output()
+        for i, meta in enumerate(manifest['frames']):
+            meta.update(color_scale=1.0, depth_floor=0.0, responsivity_source='none',
+                        guide_test=9 if i >= 6 else 7)
+        notes = ase.undo_tests(manifest, frames)[1]
+        self.assertEqual(notes, [
+            "guide test 7 (sky normals face the camera) on in frames [0, 1, 2, 3, 4, 5]: the guides "
+            "are the test's, not the game's",
+            "guide test 9 (sky roughness 0) on in frames [6, 7]: the guides are the test's, not the "
+            "game's",
+            'the guide test changed within the capture, so its frames mix guide values'])
+        for meta in manifest['frames']:
+            meta['guide_test'] = 7
+        self.assertEqual(len(ase.undo_tests(manifest, frames)[1]), 1)
+        manifest['frames'][0]['guide_test'] = 0   # Off then on: mixed too.
+        self.assertIn('the guide test changed within the capture, so its frames mix guide values',
+                      ase.undo_tests(manifest, frames)[1])
+
     def test_a_consistent_inputs(self):
         m = self.clean
         self.assertEqual(verdict(m, 'H1'), 'supports')
@@ -425,6 +591,9 @@ class SyntheticCaptureTests(unittest.TestCase):
         self.assertNotEqual(verdict(m, 'H8'), 'supports')
         self.assertEqual(verdict(m, 'H9'), 'supports')   # bright synthetic sky: numbers must print
         self.assertIsNotNone(m['H9']['sky_over_edge_non_sky'])
+        self.assertEqual(verdict(m, 'H10'), 'against')
+        h = m['H10']
+        self.assertLess(h['snapped_tile_share'] - h['control_tile_share'], ase.H10_AGAINST_TILE_SHARE)
 
     def test_b1_depth_shifted_one_pixel(self):
         m = run(shift_depth)
@@ -455,6 +624,32 @@ class SyntheticCaptureTests(unittest.TestCase):
         for key in ('H2', 'H3', 'H4', 'H6', 'H7'):
             self.assertNotEqual(verdict(m, key), 'supports', key)
         self.assertGreater(m['H8']['jitter_fit']['sky']['share'], self.clean['H8']['jitter_fit']['sky']['share'])
+        self.assertNotEqual(verdict(m, 'H10'), 'supports')   # per-frame dither is not a fixed grid
+
+    def test_g_coarse_shading_on_foliage(self):
+        # Coverage and shading of the leaves snap to the 2x2 grid at phase 0; the wire and the
+        # skyline do not, so the global ratio is diluted but the leaf tiles and colour pairs show it.
+        m = run(coarse_foliage)
+        self.assertEqual(verdict(m, 'H10'), 'supports')
+        x, y = m['H10']['axes']['x']['2'], m['H10']['axes']['y']['2']
+        self.assertEqual((x['best_phase'], y['best_phase']), (0, 0))
+        self.assertLess(x['ratio'], ase.H10_SUPPORT_RATIO)
+        self.assertGreater(m['H10']['tiles_snapped'], 0)
+        self.assertEqual(m['H10']['tile_phase'], [0, 0])
+        self.assertGreater(m['H10']['snapped_tile_share'],
+                           ase.H10_TILE_CONTROL * m['H10']['control_tile_share'])
+        self.assertIn('color (sky edge band)', m['verdicts']['H10']['text'])
+        for key in ('H2', 'H3', 'H4', 'H6'):
+            self.assertNotEqual(verdict(m, key), 'supports', key)
+
+    def test_g2_long_straight_edges_do_not_hide_the_grid(self):
+        # The rooflines tip the frame-wide y count to phase 1. Tested only at that phase, the
+        # leaf tiles would not snap; chosen from the tiles, the grid shows in x phase 0.
+        m = run(coarse_foliage_with_roofs)
+        self.assertEqual(m['H10']['axes']['y']['2']['best_phase'], 1)
+        self.assertEqual(m['H10']['tile_phase'][0], 0)
+        self.assertGreater(m['H10']['tiles_snapped'], 0)
+        self.assertEqual(verdict(m, 'H10'), 'supports')
 
     def test_h0_a_output_flickers_at_sky_edges(self):
         manifest, frames = make_capture_with_output(flicker=0.4)

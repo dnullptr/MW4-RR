@@ -18,6 +18,10 @@ enum Source : unsigned {
     SssFill2,    // lobe 2 fill gaps on SSS pixels
     SssNative3,  // both lobes from native temporal on SSS pixels
     SssFill3,    // both lobes fill gaps on SSS pixels
+    SssFill2Spatial, // lobe 2 fill gaps on SSS pixels; no native lobe-2 history -> this frame's 5x5 mean
+    SssSpatial2,     // lobe 2 on SSS pixels: fresh unboosted, else this frame's 5x5 mean; never native
+    SssFill2Settled, // as SssFill2Spatial, native only with lobe-2 history field >= 4
+    SssFillDebug,    // test view: SssFill2Spatial's lobe-2 source per SSS pixel, as a colour
     Count
 };
 inline constexpr const char *labels[Count] = {
@@ -25,10 +29,19 @@ inline constexpr const char *labels[Count] = {
     "Lobe 2 fill gaps", "Both lobes fill gaps", "Raw, cap bright samples (8x)",
     "Raw, cap bright samples (4x)", "Raw, AO fix A (fill gaps)", "Raw, AO fix B (native)",
     "SSS pixels: lobe 2 native temporal", "SSS pixels: lobe 2 fill gaps",
-    "SSS pixels: both lobes native temporal", "SSS pixels: both lobes fill gaps"};
+    "SSS pixels: both lobes native temporal", "SSS pixels: both lobes fill gaps",
+    "SSS pixels: lobe 2 fill gaps, history + spatial (test)",
+    "SSS pixels: lobe 2 spatial fill only (test)",
+    "SSS pixels: lobe 2 fill gaps, settled + spatial (test)",
+    "SSS pixels: history + spatial source view (debug)"};
 inline constexpr unsigned Valid(unsigned source) {
     return source < Count ? source : Raw;
 }
+// The panel lists these first and the older ones under "Older tests". Sources in neither list
+// were tested and ruled out: hidden, but kept and never renumbered (saved NativeLobe, captures).
+inline constexpr unsigned panel[] = {Raw, SssFill2, SssFill2Spatial, SssSpatial2, SssFill2Settled,
+                                     SssFillDebug};
+inline constexpr unsigned older[] = {NativeLobe1, FillBoth, SssNative2, SssNative3, SssFill3};
 // SSS-masked sources read the guide at t2, which only the private root binds.
 inline constexpr bool SssMasked(unsigned source) {
     return source >= SssNative2 && source < Count;

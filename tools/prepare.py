@@ -56,6 +56,7 @@ def main():
         ('RRSpatialPassthrough', compile_hlsl('rr_spatial_passthrough.hlsl', 'rr_spatial_passthrough'), True)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
+        ('RRVrrtGovernor', compile_hlsl('rr_vrrt_governor.hlsl', 'rr_vrrt_governor', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
         # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio,
@@ -71,8 +72,25 @@ def main():
                                                 ('WFill', 0, 0, 0, 1, 0), ('WNative', 0, 0, 0, 2, 0),
                                                 ('SssNative2', 2, 0, 0, 0, 1), ('SssFill2', 2, 1, 0, 0, 1),
                                                 ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
+          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
+        # Lobe 2 fill gaps on SSS pixels with history gate and this frame's spatial fallback.
+        *[(f'RRVrrtScale{name}{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
+                        flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
+                               '-D', 'RR_CAP_RATIO=0', '-D', 'RR_W_SOURCE=0', '-D', 'RR_SSS_MASK=1',
+                               '-D', f'RR_FILL_HISTORY={history}', '-D', 'RR_FILL_SPATIAL=1', *debug,
+                               *extra)), False)
+          for name, history, debug in (('SssFill2Spatial', 1, ()), ('SssSpatial2', 4096, ()),
+                                       ('SssFill2Settled', 4, ()),
+                                       ('SssFillDebug', 1, ('-D', 'RR_FILL_DEBUG=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
+    # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and
+    # R32_FLOAT lighting weights.
+    header(out / 'rr_hit_condition.generated.h', [
+        ('RRHitCondition', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition'), False),
+        ('RRHitConditionFloat', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition_float',
+                                             flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
     # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.

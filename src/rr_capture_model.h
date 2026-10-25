@@ -10,6 +10,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include "rr_weapon_depth.h"
 namespace rrcapture {
 // Device-free model of an RR input capture: what is saved, the files, the manifest and the
 // sequence that finds 8 consecutive delivered frames. The D3D12 side lives elsewhere.
@@ -76,11 +77,21 @@ inline std::string FormatName(unsigned dxgi) {
     return f ? f->name : "DXGI_" + std::to_string(dxgi);
 }
 
+// Where the state an input's copy moved it from (and back to) came from: the addon's own resource,
+// a state proven for that frame, the state tracker's, or the DLSS input contract's (NPSR).
+enum StateSource : unsigned { Addon, Proven, Tracked, Contract, StateSourceCount };
+inline constexpr const char *state_sources[StateSourceCount] = {"addon", "proven", "layouts",
+                                                                "contract"};
+inline const char *StateSourceName(unsigned source) {
+    return source < StateSourceCount ? state_sources[source] : "unknown";
+}
 struct Region { // One image inside a readback buffer.
     bool present{};
     unsigned format{}, width{}, height{}, bytes_per_pixel{};
     std::uint64_t offset{}, pitch{}; // Placement inside the buffer.
     unsigned source_x{}, source_y{}, source_width{}, source_height{};
+    // The StateSource of the state the copy moved it from, and that D3D12_RESOURCE_STATES.
+    unsigned state_source{}, state_before{};
 };
 struct Camera {
     float position[3]{}, right[3]{}, up[3]{}, forward[3]{}, jitter[2]{}, motion_scale[2]{},
@@ -96,20 +107,30 @@ inline constexpr const char *responsivity_sources[SourceCount] = {"none", "sss",
 inline const char *ResponsivitySourceName(unsigned source) {
     return source < SourceCount ? responsivity_sources[source] : "unknown";
 }
-// A reset_reasons bit beyond HistoryPolicy's: the color brightness test changed its scale.
+// A reset_reasons bit beyond HistoryPolicy's: the color brightness test changed its scale,
+// or the contrast test its knee (both transform the color copy RR's history was built on).
 inline constexpr unsigned ColorScaleReset = 16;
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
+    // Specular hit distance tests applied to the sent distance (rrhitcond mode bits:
+    // 1 sky and misses far, 2 fill); 0 when it is the game's raw value.
+    unsigned hit_distance_test{};
     bool delivered{}, reset{}, replaced_sr{};
     // Water tests (rr_water.h): whether this frame computed the water masks (the settings say
     // which ones RR took), and the water guide mode its guides were converted with.
     bool water_masks{};
     unsigned water_guide{};
-    bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
+    // Depth is linear view depth (weapon depth, rr_weapon_depth.h), not hardware depth, with
+    // this mapping: world depth = scale / (hardware depth + offset), sky = sky.
+    bool linear_depth{};
+    std::array<float, 3> linear_map{}; // scale, offset, sky
     // Tree-noise tests: the color brightness test's factor on RR's color (RR's output is in the
-    // same scaled domain; 1 = off), the guide test mode this frame's guides were converted with,
-    // the depth sky was lifted to (0 = not lifted), and the responsivity mask RR took.
-    float color_scale = 1.0f, depth_floor{};
+    // same scaled domain; 1 = off), the contrast test's knee (rr_contrast_test.h: the scaled
+    // color, and RR's output, are compressed by it; 0 = off), the guide test mode this frame's
+    // guides were converted with, the depth sky was lifted to (0 = not lifted; with
+    // linear_depth, the hardware depth its sky stands for, which no raw texel equals), and the
+    // responsivity mask RR took.
+    float color_scale = 1.0f, contrast_knee{}, depth_floor{};
     unsigned guide_test{}, responsivity_source{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
@@ -117,18 +138,48 @@ struct Meta {
     float world_to_view[16]{}, view_to_clip[16]{};
     Camera camera;
     double cpu_time_ms{};
+    // The Lighting input (rr_lighting_source.h) this frame's lighting was prepared with, or
+    // MixedLighting: the requested input; a variant that failed to create prepares raw lighting
+    // under the same label. lighting_masked: 1 an SSS-masked input had its SSS guide, 0 it fell
+    // back to raw lighting, -1 neither (another input, not known, or mixed).
+    unsigned lighting_input{};
+    int lighting_masked = -1;
+};
+inline constexpr unsigned MixedLighting = 0xFFFFFFFFu; // The lighting changed within the frame.
+// What a frame's first spatial passes noted they prepared, until the frame is captured.
+struct Lighting {
+    bool noted{}, mixed{};
+    unsigned input{};
+    int masked = -1;
+    void Note(unsigned lobe, int guide) {
+        if (!noted) {
+            noted = true;
+            input = lobe;
+            masked = guide;
+        } else if (lobe != input || guide != masked) {
+            mixed = true;
+        }
+    }
+    // setting: the Lighting input the settings apply, for a frame that noted nothing.
+    void Stamp(Meta &m, unsigned setting) const {
+        m.lighting_input = mixed ? MixedLighting : noted ? input : setting;
+        m.lighting_masked = noted && !mixed ? masked : -1;
+    }
 };
 struct Header {
     std::string created;
+    // create_flags: the flags RR was created with (rreval::CreateFlags drops the game's
+    // AutoExposure, and DepthInverted with weapon depth's linear depth).
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
-        guide_test{}, lighting_input{};
+        guide_test{}, lighting_input{}, create_flags{};
+    unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
         responsivity_enabled{}, sky_depth_test{}, weapon_depth{};
     float responsivity_strength{};
     // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
     bool water_responsivity{}, water_discard{}, water_animated{};
-    float water_strength{};
+    float water_strength{}, water_discard_strength{};
     unsigned water_guide{};
     // Sky edge responsivity mask test (rr_sky_edge.h).
     bool sky_edge_enabled{};
@@ -267,6 +318,8 @@ inline void JsonRegion(std::string &o, unsigned index, unsigned input, const Reg
     JsonUint(f.Key("bytes_per_pixel"), r.bytes_per_pixel);
     JsonUints(f.Key("source_offset"), offset, 2);
     JsonUints(f.Key("source_size"), size, 2);
+    JsonString(f.Key("state"), StateSourceName(r.state_source));
+    JsonUint(f.Key("state_before"), r.state_before);
     o += '}';
 }
 inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
@@ -281,11 +334,27 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("reset"), m.reset);
     JsonUint(f.Key("reset_reasons"), m.reset_reasons);
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
+    JsonUint(f.Key("hit_distance_test"), m.hit_distance_test);
     JsonBool(f.Key("water_masks"), m.water_masks);
     JsonUint(f.Key("water_guide"), m.water_guide);
     JsonNumber(f.Key("color_scale"), m.color_scale);
+    JsonNumber(f.Key("contrast_knee"), m.contrast_knee);
     JsonUint(f.Key("guide_test"), m.guide_test);
     JsonNumber(f.Key("depth_floor"), m.depth_floor);
+    // Weapon depth's mapping (rr_weapon_depth.h; tools/analyze_sky_edges.py undo_tests inverts
+    // it), or null for hardware depth.
+    f.Key("linear_depth");
+    if (m.linear_depth) {
+        o += '{';
+        JsonFields ld(o, ", ");
+        JsonNumber(ld.Key("scale"), m.linear_map[0]);
+        JsonNumber(ld.Key("offset"), m.linear_map[1]);
+        JsonNumber(ld.Key("sky"), m.linear_map[2]);
+        JsonNumber(ld.Key("slice"), rrweapondepth::Slice);
+        JsonNumber(ld.Key("knee"), rrweapondepth::Knee);
+        o += '}';
+    } else
+        o += "null";
     JsonString(f.Key("responsivity_source"), ResponsivitySourceName(m.responsivity_source));
     f.Key("stats");
     o += '{';
@@ -329,6 +398,11 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonUint(cf.Key("motion_vectors_jittered"), c.motion_jittered);
     o += "\n      }";
     JsonFixed(f.Key("cpu_time_ms"), m.cpu_time_ms);
+    JsonUint(f.Key("lighting_input"), m.lighting_input);
+    if (m.lighting_masked < 0)
+        f.Key("lighting_masked") += "null";
+    else
+        JsonBool(f.Key("lighting_masked"), m.lighting_masked != 0);
     f.Key("inputs");
     o += "{\n        ";
     JsonFields in(o, ",\n        ");
@@ -350,6 +424,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonUint(top.Key("output_height"), h.output_height);
     top.Key("quality") += std::to_string(h.quality);
     JsonUint(top.Key("preset"), h.preset);
+    JsonUint(top.Key("create_flags"), h.create_flags);
     top.Key("settings");
     o += "{\n    ";
     JsonFields s(o, ",\n    ");
@@ -365,12 +440,14 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("water_responsivity"), h.water_responsivity);
     JsonNumber(s.Key("water_strength"), h.water_strength);
     JsonBool(s.Key("water_discard"), h.water_discard);
+    JsonNumber(s.Key("water_discard_strength"), h.water_discard_strength);
     JsonBool(s.Key("water_animated"), h.water_animated);
     JsonUint(s.Key("water_guide"), h.water_guide);
     JsonBool(s.Key("weapon_depth"), h.weapon_depth);
     JsonBool(s.Key("sky_edge_enabled"), h.sky_edge_enabled);
     JsonNumber(s.Key("sky_edge_strength"), h.sky_edge_strength);
     JsonUint(s.Key("sky_edge_radius"), h.sky_edge_radius);
+    JsonUint(s.Key("ray_selection"), h.ray_selection);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";
@@ -447,10 +524,11 @@ template <class F> class Sequence {
         if (state == State::Collecting && b)
             pool.push_back(std::move(b));
     }
-    bool Count() {
+    // Counts one attempt; the one past the cap fails the capture with why, if given.
+    bool Count(const char *why = nullptr) {
         if (++attempts <= MaxAttempts)
             return true;
-        Fail("RR did not deliver 8 consecutive frames");
+        Fail(why ? why : "RR did not deliver 8 consecutive frames");
         return false;
     }
     void Complete(F f) {
@@ -471,15 +549,20 @@ template <class F> class Sequence {
                 Recycle(std::move(f.buffer));
                 continue;
             }
-            // A reset frame begins a new RR history, so it can only start a run.
+            // A reset frame begins a new RR history, so it can only start a run. A run also keeps
+            // one lighting input, with or without its SSS guide; a mixed frame joins no run.
             if (!run.empty() && (f.meta.reset || f.meta.serial != run.back().meta.serial + 1 ||
-                                 f.width != run.back().width || f.height != run.back().height))
+                                 f.width != run.back().width || f.height != run.back().height ||
+                                 f.meta.lighting_input == MixedLighting ||
+                                 f.meta.lighting_input != run.back().meta.lighting_input ||
+                                 f.meta.lighting_masked != run.back().meta.lighting_masked))
                 Restart();
             run.push_back(std::move(f));
             if (run.size() == Frames) {
                 state = State::Writing;
                 done = std::move(run);
                 run.clear();
+                pool.clear(); // Only the run's buffers stay alive.
             }
         }
         return done;
