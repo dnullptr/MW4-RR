@@ -124,6 +124,18 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
             WriteLog(line);
     }
 }
+// Every present, before OnRuntime takes any lock: lock-free counts for the RR health line.
+static void OnPresent(reshade::api::effect_runtime *runtime) {
+    DWORD foreground{};
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    const bool focused = foreground == GetCurrentProcessId();
+    auto &shown = rrhealth::presentation;
+    shown.presents.fetch_add(1, std::memory_order_relaxed);
+    if (!focused)
+        shown.unfocused_presents.fetch_add(1, std::memory_order_relaxed);
+    shown.focused.store(focused, std::memory_order_relaxed);
+    OnRuntime(runtime);
+}
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));
 }

@@ -40,6 +40,7 @@ class Controller {
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
         bool guides_withheld{};
+        bool responsivity_used{}; // RR was given a responsivity mask (sky edge test or SSS)
         GpuFrame gpu;
         bool busy{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
@@ -386,16 +387,17 @@ class Controller {
         for (auto &s : slots) {
             if (s.recorded && s.sealed && !s.reported && Complete(s)) {
                 auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
+                const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
                 s.reported = true;
-                health.Frame(v);
+                const bool sss = s.sss_used && !s.guides_withheld && s.sss.admission.accepted;
+                const bool glass =
+                    s.transparency_used && !s.guides_withheld && s.transparency_accepted;
+                health.Frame(v,
+                             {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
-                                 s.sss_used && !s.guides_withheld && s.sss.admission.accepted,
-                                 s.transparency_used && !s.guides_withheld &&
-                                     s.transparency_accepted,
-                                 s.replaced_sr,
-                                 s.hit_used);
+                                 sss, glass, s.replaced_sr, s.hit_used);
                 if (s.captured.buffer) {
                     auto &m = s.captured.meta;
                     m.stats = v;
@@ -1705,6 +1707,7 @@ class Controller {
                                         : responsivity_active ? s->gpu.sss.mask.Get()
                                                               : nullptr,
                                         s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+            s->responsivity_used = resources.responsivity != nullptr;
             // The test copies are read at their own origin.
             auto evaluated = o;
             if (color_on)

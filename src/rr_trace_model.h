@@ -3,9 +3,13 @@
 #include <cstddef>
 #include <map>
 namespace rrtrace {
-enum class Kind { Unknown, SR, RR, Other };
+enum class Kind { Unknown, SR, RR, Other, FG };
+// NVSDK_NGX_Feature: SuperSampling 1, FrameGeneration 11, RayReconstruction 13.
 inline Kind FeatureKind(unsigned feature) {
-    return feature == 1 ? Kind::SR : feature == 13 ? Kind::RR : Kind::Other;
+    return feature == 1    ? Kind::SR
+           : feature == 13 ? Kind::RR
+           : feature == 11 ? Kind::FG
+                           : Kind::Other;
 }
 inline const char *Name(Kind kind) {
     switch (kind) {
@@ -15,6 +19,8 @@ inline const char *Name(Kind kind) {
         return "RR";
     case Kind::Other:
         return "other";
+    case Kind::FG:
+        return "FG";
     default:
         return "unknown";
     }

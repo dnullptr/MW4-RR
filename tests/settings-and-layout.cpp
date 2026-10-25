@@ -11,6 +11,7 @@
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
 #include "../src/rr_specular_distance.h"
+#include "../src/rr_trace_model.h"
 #include <cassert>
 #include <limits>
 #include <string_view>
@@ -195,21 +196,67 @@ int main() {
     assert(rrresponsivity::Clamp(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
 
     // Health reports once per interval, only with activity, then starts over.
+    // Presentation counters arrive lock-free; each interval takes its own window.
+    auto &shown = rrhealth::presentation;
+    shown.presents = 50; // before the first interval: discarded
+    shown.fg_evaluations = 9;
     rrhealth::Tracker health;
     std::string report;
     assert(!health.Report(1000, report));
+    assert(shown.presents == 0 && shown.fg_evaluations == 0);
     health.Frame({0, 1, 0, 0});
-    health.Frame({0, 1, 12, 0});
-    health.Frame({1, 0, 0, 30});
+    health.Frame({0, 1, 12, 0}, {3, 0, true, false, true, false});
+    health.Frame({1, 0, 0, 30}, {1, 7, true, true, false, true});
     health.Reset(rrlive::HistoryPolicy::Rejected | rrlive::HistoryPolicy::Gap);
+    shown.presents += 16;
+    shown.unfocused_presents += 5;
+    shown.focused = true;
+    shown.fg_evaluations += 12;
     assert(!health.Report(1000 + rrhealth::Tracker::Interval - 1, report));
+    assert(shown.presents == 16);
     assert(health.Report(1000 + rrhealth::Tracker::Interval, report));
     assert(report.find("frames=3 rejected=1 resets=1") != std::string::npos);
     assert(report.find("[rejected=1 cut=0 generation=0 gap=1]") != std::string::npos);
     assert(report.find("isolatedGuideFrames=1 maxIsolatedPixels=12") != std::string::npos);
     assert(report.find("sanitizedSssFrames=1 maxSanitizedSamples=30") != std::string::npos);
+    assert(report.find("maxSanitizedSamples=30 guides[sss=2 glass=1 hit=1 responsivity=1] "
+                       "nonFiniteColorFrames=2 maxNonFiniteColorPixels=3 "
+                       "nonFiniteOutputFrames=1 maxNonFiniteOutputPixels=7 presents=16 "
+                       "unfocusedPresents=5 focused=1 fgEvaluations=12") != std::string::npos);
+    assert(shown.presents == 0 && shown.unfocused_presents == 0 && shown.fg_evaluations == 0);
+    // An inactive interval logs nothing and still drops its presentation counts.
+    shown.presents = 7;
+    shown.unfocused_presents = 7;
+    shown.fg_evaluations = 7;
     report.clear();
     assert(!health.Report(1000 + 2 * rrhealth::Tracker::Interval, report) && report.empty());
+    assert(shown.presents == 0 && shown.unfocused_presents == 0 && shown.fg_evaluations == 0);
+    // The next line holds only its own interval; focus is the latest present's.
+    health.Frame({0, 1, 0, 0});
+    shown.presents = 2;
+    shown.unfocused_presents = 2;
+    shown.focused = false;
+    assert(health.Report(1000 + 3 * rrhealth::Tracker::Interval, report));
+    assert(report.find("frames=1 rejected=0 resets=0 [rejected=0 cut=0 generation=0 gap=0] "
+                       "isolatedGuideFrames=0 maxIsolatedPixels=0 sanitizedSssFrames=0 "
+                       "maxSanitizedSamples=0 guides[sss=0 glass=0 hit=0 responsivity=0] "
+                       "nonFiniteColorFrames=0 maxNonFiniteColorPixels=0 "
+                       "nonFiniteOutputFrames=0 maxNonFiniteOutputPixels=0 presents=2 "
+                       "unfocusedPresents=2 focused=0 fgEvaluations=0") != std::string::npos);
+    // The widest line is never truncated.
+    rrhealth::Tracker wide;
+    assert(!wide.Report(0, report));
+    wide.Frame({~0u, 0, ~0u, ~0u}, {~0u, ~0u, true, true, true, true});
+    shown.presents = shown.unfocused_presents = shown.fg_evaluations = ~0u;
+    assert(wide.Report(~0ull, report));
+    assert(report.size() > 400 && report.ends_with(" fgEvaluations=4294967295"));
+    shown.presents = shown.unfocused_presents = shown.fg_evaluations = 0;
+    // NGX feature kinds the probe tells apart (NVSDK_NGX_Feature values).
+    assert(rrtrace::FeatureKind(1) == rrtrace::Kind::SR);
+    assert(rrtrace::FeatureKind(13) == rrtrace::Kind::RR);
+    assert(rrtrace::FeatureKind(11) == rrtrace::Kind::FG);
+    assert(rrtrace::FeatureKind(12) == rrtrace::Kind::Other);
+    assert(std::string_view(rrtrace::Name(rrtrace::Kind::FG)) == "FG");
 
     // Ray density: lobe 1 fully sampled, lobe 2 at 1/4 with some unrequested pixels.
     rrdensity::Tracker density;

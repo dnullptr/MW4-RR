@@ -208,6 +208,11 @@ static void AfterNgxShutdown(HMODULE m, ID3D12Device *d, bool ok) {
 }
 static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
                         const NVSDK_NGX_Parameter *p, NVSDK_NGX_Result r) {
+    // Frame generation is counted for the health line only, lock-free: never the controller.
+    if (k == rrtrace::Kind::FG) {
+        rrhealth::presentation.fg_evaluations.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (k != rrtrace::Kind::SR)
         return;
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
@@ -921,7 +926,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::draw>(&AuditDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
-    reshade::register_event<reshade::addon_event::reshade_present>(&OnRuntime);
+    reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
     return true;
 }
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

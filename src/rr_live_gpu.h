@@ -383,6 +383,7 @@ struct GpuFrame {
         Check(header->Map(0, &empty, &m), "live association upload map failed");
         header_map = (UINT *)m;
         memset(m, 0, 256);
+        // stats (gate, rr_live_gate.hlsl): bytes 0-15 ReadStats, 16-23 ReadFinite, 64+ ReadRates.
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
@@ -705,6 +706,17 @@ struct GpuFrame {
         D3D12_RANGE r{0, 16};
         Check(readback->Map(0, &r, &m), "live stats map failed");
         memcpy(v.data(), m, 16);
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
+    // Pixels with a non-finite channel: in the color RR receives, in RR's output.
+    std::array<UINT, 2> ReadFinite() {
+        std::array<UINT, 2> v{};
+        void *m{};
+        D3D12_RANGE r{16, 16 + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live finite statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + 16, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;
