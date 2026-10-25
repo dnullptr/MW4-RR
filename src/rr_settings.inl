@@ -3,6 +3,7 @@
 #include "rr_lighting_source.h"
 #include "rr_responsivity.h"
 #include "rr_guide_test.h"
+#include "rr_sky_depth_test.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -131,6 +132,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     if (ImGui::Combo("Guide test (thin geometry)", &guide_test, rrguidetest::labels,
                      rrguidetest::Count))
         rrguidetest::mode = static_cast<unsigned>(guide_test);
+    bool sky_depth = rrskydepth::enabled;
+    if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
+        rrskydepth::enabled = sky_depth;
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);

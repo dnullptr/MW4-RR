@@ -4,6 +4,7 @@
 #include "rr_guide_health.h"
 #include "rr_ray_density.h"
 #include "rr_responsivity.h"
+#include "rr_sky_depth_test.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -1171,8 +1172,19 @@ class Controller {
                                                              : nullptr,
                                         responsivity_active ? s->gpu.sss.mask.Get() : nullptr,
                                         s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+            auto projection = s->projection;
+            if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
+                static bool described{};
+                if (!described) {
+                    described = true;
+                    char line[200];
+                    rrskydepth::Describe(projection, line, sizeof(line));
+                    Log(line);
+                }
+                rrskydepth::Apply(projection);
+            }
             rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
-                                       s->projection.data());
+                                       projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
             s->gpu.Depth(cl.Get(), states[1]);
             for (unsigned i = 0; i < 3; ++i)
