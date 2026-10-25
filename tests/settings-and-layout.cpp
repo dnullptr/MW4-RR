@@ -71,6 +71,9 @@ int main() {
     }
     h.Format = DXGI_FORMAT_R32_FLOAT;
     assert(!rrspecular::ValidSource(h, UINT(h.Width), h.Height, read));
+    assert(rrspecular::DistanceBlur(0xc9ca6daa80593f3aull));
+    assert(rrspecular::DistanceBlur(0x4894e5e7e717b468ull));
+    assert(!rrspecular::DistanceBlur(0xd63e707761558424ull));
     rrspecular::Diagnostics stats;
     char line[320];
     assert(!stats.Summary(line, sizeof(line)));
