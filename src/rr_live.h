@@ -6,6 +6,7 @@
 #include "rr_responsivity.h"
 #include "rr_water.h"
 #include "rr_sky_depth_test.h"
+#include "rr_vrrt_apply_patch.h"
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
@@ -777,6 +778,7 @@ class Controller {
                 rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
             h.sky_edge_radius =
                 rrskyedge::ClampRadius(rrskyedge::radius.load(std::memory_order_relaxed));
+            h.ray_selection = rrapply::last_variant.load(std::memory_order_relaxed);
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {

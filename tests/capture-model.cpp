@@ -670,7 +670,8 @@ static void ManifestShape() {
                               "\"water_strength\": 0.75",        "\"water_discard\": true",
                               "\"water_animated\": false",       "\"water_guide\": 2",
                               "\"weapon_depth\": false",       "\"sky_edge_enabled\": true",
-                              "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3"};
+                              "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3",
+                              "\"ray_selection\": 0"};
     for (const char *s : settings)
         assert(Contains(m, s));
     h.weapon_depth = true; // The weapon depth test: depth is linear view depth.
