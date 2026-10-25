@@ -1025,6 +1025,11 @@ static void TestRequiredBytes() {
            events[0] == Format("allocation-info dim=%u fmt=%u", D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                                DXGI_FORMAT_R10G10B10A2_UNORM));
     assert(!Gpu::RequiredBytes(nullptr, scene));
+    // One source of truth: on a fresh Gpu it is what Prepare sizes (Missing).
+    assert(Gpu::RequiredBytes(&device, scene) == Gpu{}.Missing(&device, scene));
+    device.texture_size = 3 << 20;
+    assert(Gpu::RequiredBytes(&device, scene) == Gpu{}.Missing(&device, scene) &&
+           Gpu{}.Missing(&device, scene) == (3u << 20) + 3 * device.buffer_size);
 }
 
 static void TestPrepare() {
@@ -1565,10 +1570,9 @@ static void TestRelease() {
     events.clear();
     s.gpu.Release();
     assert(control.unmaps == 1 && readback.unmaps == 1);
-    // The CPU wrote the whole control buffer and, in Record, the readback stats words.
-    const std::vector<std::string> unmapped = {
-        "unmap control sub=0 written=all",
-        Format("unmap readback sub=0 written=0-%zu", sizeof(PassStats))};
+    // The control buffer as written; the readback with the empty range the debug layer wants.
+    const std::vector<std::string> unmapped = {"unmap control sub=0 written=all",
+                                               "unmap readback sub=0 written=0-0"};
     assert(events == unmapped);
     assert(!s.gpu.Ready() && !s.gpu.target && !s.gpu.control && !s.gpu.stats && !s.gpu.readback);
     assert(!s.gpu.rtv && !s.gpu.heap && !s.gpu.bytes && !s.gpu.ControlAddress());

@@ -183,18 +183,21 @@ struct Gpu {
     // Resumable: each resource is created only while it is null. Every
     // resource goes through owner.Allocate (rrlive::GpuFrame::Allocate), so it
     // is budget-checked and added to the frame's and the budget's bytes; bytes
-    // keeps this slot's share for reporting. Coverage is not in the pool
-    // projection, and Budget::Reserve sets the ledger ceiling to exactly what
-    // the pool needs above its minimum, so the ledger can already be at its
-    // ceiling, which Allocate treats as a hard failure. Prepare therefore sizes
-    // the still-null resources first and, when the ledger cannot hold them,
-    // asks budget.Reserve to grow the ceiling by that much. Reserve grows it
-    // only for this actual allocation and only when DXGI has room. Once
-    // allocated, coverage is in GpuFrame::bytes, so the later pool reservations
-    // count it in this slot's base bytes. When Reserve refuses (nothing is
-    // allocated) or Allocate defers on its DXGI check, this returns false, and
-    // the caller reports Reason::Memory and retries after 1 s. Other failures
-    // throw.
+    // keeps this slot's share for reporting.
+    // Precondition (binding on the caller): the caller must already have
+    // reserved the pool with coverage on every slot, e.g. ReservePool with
+    // extra_persistent = slot count * (RequiredBytes(device, scene) - the
+    // largest coverage bytes a slot already holds). Once allocated, coverage
+    // is in GpuFrame::bytes, and the pool projections take the largest slot
+    // base times the slot count, so coverage taken from existing headroom
+    // instead would make later mandatory pool reservations exceed the
+    // ceiling, fail, and disable RR.
+    // Prepare itself only rechecks each allocation: it sizes the still-null
+    // resources and, when the ledger cannot hold them, asks budget.Reserve to
+    // grow the ceiling by that much (only when DXGI has room). When Reserve
+    // refuses (nothing is allocated) or Allocate defers on its DXGI check,
+    // this returns false, and the caller reports Reason::Memory and retries
+    // after 1 s. Other failures throw.
     template <class Owner, class Pipelines, class Budget>
     bool Prepare(Owner &owner, Pipelines &p, Budget &budget, const D3D12_RESOURCE_DESC &scene) {
         using rrprivate::Check;
@@ -403,8 +406,10 @@ struct Gpu {
         if (control_map)
             control->Unmap(0, nullptr);
         if (readback_map) {
-            const D3D12_RANGE cleared{0, sizeof(PassStats)}; // Record's CPU writes
-            readback->Unmap(0, &cleared);
+            // Empty written range: it is tooling-only, and a non-empty one on a
+            // READBACK heap trips the debug layer's UNMAP_RANGE_NOT_EMPTY.
+            const D3D12_RANGE none{};
+            readback->Unmap(0, &none);
         }
         *this = {};
     }
