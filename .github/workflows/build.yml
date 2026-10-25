@@ -18,31 +18,46 @@ jobs:
           ref: claude/sss-noise-fixes
           submodules: recursive
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Setup MSVC Developer Command Prompt (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      - name: Build Project (CMake or MSBuild)
+      - name: Inspect and Build Project
         shell: pwsh
         run: |
-          if (Test-Path "CMakeLists.txt") {
-            Write-Host "Building with CMake..."
-            cmake -B build -A x64
+          Write-Host "=== Files in repository ==="
+          Get-ChildItem -Path . -Recurse -File | Where-Object { $_.FullName -notmatch "\\\.git\\" } | Select-Object -ExpandProperty FullName
+
+          $cmake = Get-ChildItem -Path . -Filter CMakeLists.txt -Recurse | Where-Object { $_.FullName -notmatch "\\\.git\\" } | Select-Object -First 1
+          $sln = Get-ChildItem -Path . -Filter *.sln -Recurse | Select-Object -First 1
+          $vcxproj = Get-ChildItem -Path . -Filter *.vcxproj -Recurse | Select-Object -First 1
+          $bat = Get-ChildItem -Path . -Include *build*.bat, *compile*.bat, *make*.bat -Recurse | Select-Object -First 1
+          $ps1 = Get-ChildItem -Path . -Include *build*.ps1, *compile*.ps1 -Recurse | Select-Object -First 1
+
+          if ($cmake) {
+            Write-Host "Found CMakeLists.txt at: $($cmake.DirectoryName)"
+            cmake -S $cmake.DirectoryName -B build -A x64
             cmake --build build --config Release
+          } elseif ($sln) {
+            Write-Host "Found Solution: $($sln.FullName)"
+            msbuild $sln.FullName /m /p:Configuration=Release /p:Platform=x64
+          } elseif ($vcxproj) {
+            Write-Host "Found vcxproj: $($vcxproj.FullName)"
+            msbuild $vcxproj.FullName /m /p:Configuration=Release /p:Platform=x64
+          } elseif ($bat) {
+            Write-Host "Found batch build script: $($bat.FullName)"
+            Push-Location $bat.DirectoryName
+            cmd /c $bat.Name
+            Pop-Location
+          } elseif ($ps1) {
+            Write-Host "Found PowerShell build script: $($ps1.FullName)"
+            Push-Location $ps1.DirectoryName
+            & $ps1.FullName
+            Pop-Location
           } else {
-            $sln = Get-ChildItem -Path . -Filter *.sln -Recurse | Select-Object -First 1
-            if ($sln) {
-              Write-Host "Building Solution: $($sln.FullName)"
-              msbuild $sln.FullName /m /p:Configuration=Release /p:Platform=x64
-            } else {
-              $vcxproj = Get-ChildItem -Path . -Filter *.vcxproj -Recurse | Select-Object -First 1
-              if ($vcxproj) {
-                Write-Host "Building Project: $($vcxproj.FullName)"
-                msbuild $vcxproj.FullName /m /p:Configuration=Release /p:Platform=x64
-              } else {
-                Write-Error "No CMakeLists.txt, .sln, or .vcxproj found!"
-                exit 1
-              }
-            }
+            Write-Error "Custom structure detected — check the file list printed above!"
+            exit 1
           }
 
       - name: Collect Compiled Files
