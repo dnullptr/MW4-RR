@@ -196,8 +196,8 @@ struct ControllerCpuTest {
         logged.clear();
     }
     // Each stats reader maps only its own bytes, one after another: the gate (0..15), the
-    // water count (16), the hit distance statistics (20..63), the ray density (64..227)
-    // and the non-finite counts (228, 232).
+    // hit distance statistics (20..63), the ray density (64..227), the non-finite counts
+    // (228, 232) and the water counts (16, then the prepass flags at 236..255).
     static void StatsReaders() {
         UINT words[64]; // the whole 256-byte readback
         for (UINT i = 0; i < 64; ++i)
@@ -208,8 +208,6 @@ struct ControllerCpuTest {
         g.readback.Attach(readback);
         assert((g.ReadStats() == std::array<UINT, 4>{100, 101, 102, 103}));
         assert(readback->read.Begin == 0 && readback->read.End == 16);
-        assert(g.ReadWaterPixels() == 104);
-        assert(readback->read.Begin == 16 && readback->read.End == 20);
         const auto hit = g.ReadHitStats();
         assert(hit.front() == 105 && hit.back() == 115);
         assert(readback->read.Begin == 20 && readback->read.End == 64);
@@ -218,6 +216,11 @@ struct ControllerCpuTest {
         assert(readback->read.Begin == 64 && readback->read.End == 228);
         assert((g.ReadFinite() == std::array<UINT, 2>{157, 158}));
         assert(readback->read.Begin == 228 && readback->read.End == 236);
+        const auto water = g.ReadWaterCounts();
+        assert(water.water == 104);
+        assert((water.prepass == std::array<std::uint32_t, rrwater::PrepassCount>{159, 160, 161,
+                                                                                  162, 163}));
+        assert(readback->read.Begin == 236 && readback->read.End == 256);
     }
     // A creation attempt's runtime is logged once, by the next Poll, with the controller mutex
     // released: its module and DXGI queries never run under it.
@@ -663,7 +666,7 @@ struct ControllerCpuTest {
         assert(wet_status.ready && wet_status.responsivity && !wet_status.discard);
         // The panel's game flags follow the latest delivered frame's counts.
         assert(wet_status.prepass[rrwater::Special] < 0);
-        water.water_stats.Add({2, {8, 4, 2, 1, 3, 0}}, 16);
+        water.water_stats.Add({2, {4, 2, 1, 3, 0}}, 16);
         wet_status = water.WaterStatus();
         assert(wet_status.coverage == 0.125f && wet_status.prepass[rrwater::Special] == 0.25f &&
                wet_status.prepass[rrwater::Override] == 0.0625f);

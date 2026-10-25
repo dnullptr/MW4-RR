@@ -458,10 +458,10 @@ struct GpuFrame {
         header_map = (UINT *)m;
         memset(m, 0, 256);
         // stats bytes (rr_live_gate.hlsl): 0 bad, 4 copied, 8 isolated, 12 sanitized SSS
-        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20..63 hit
+        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterCounts); 20..63 hit
         // distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..227 ray density
         // (ReadRates); 228 non-finite color, 232 non-finite displayed output (rr_gate_stats.h,
-        // ReadFinite).
+        // ReadFinite); 236..255 water prepass flags (rrwater::PrepassOffset, ReadWaterCounts).
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
@@ -928,7 +928,7 @@ struct GpuFrame {
             Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Zero the water pixel count (stats byte 16) and the prepass flag counts
         // (rrwater::PrepassOffset) from the header's never-written tail.
-        static_assert(rrwater::PrepassOffset == rrdensity::Offset + 4 * rrdensity::Count &&
+        static_assert(rrwater::PrepassOffset == RR_STATS_NON_FINITE_OUTPUT + 4 &&
                       rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= 256);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_DEST);
@@ -961,17 +961,20 @@ struct GpuFrame {
         memcpy(&header_map[14], &strength, sizeof(strength));
         header_map[15] = flags;
     }
-    // Water pixels counted by the latest WaterPass on this frame.
+    // Water pixels counted by the latest WaterPass on this frame. Two maps, so each
+    // reads only the water bytes (16, and 236..255), not the statistics between them.
     rrwater::Counts ReadWaterCounts() {
         rrwater::Counts v{};
-        void *m{};
-        D3D12_RANGE r{16, rrwater::PrepassOffset + sizeof(v.prepass)};
-        Check(readback->Map(0, &r, &m), "live water statistics map failed");
-        memcpy(&v.water, static_cast<const char *>(m) + 16, sizeof(v.water));
-        memcpy(v.prepass.data(), static_cast<const char *>(m) + rrwater::PrepassOffset,
-               sizeof(v.prepass));
-        r = {0, 0};
-        readback->Unmap(0, &r);
+        const auto read = [&](UINT offset, void *out, UINT size) {
+            void *m{};
+            D3D12_RANGE r{offset, offset + size};
+            Check(readback->Map(0, &r, &m), "live water statistics map failed");
+            memcpy(out, static_cast<const char *>(m) + offset, size);
+            r = {0, 0};
+            readback->Unmap(0, &r);
+        };
+        read(16, &v.water, sizeof(v.water));
+        read(rrwater::PrepassOffset, v.prepass.data(), sizeof(v.prepass));
         return v;
     }
     // tolerate: count isolated unusable guide pixels instead of rejecting the frame.

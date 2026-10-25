@@ -6,9 +6,10 @@
 #include <string>
 namespace rrwater {
 // Development tests for running water, which RR blurs. Water pixels are the
-// game prepass's water marker: PackedSurface.w bit 2 (value 4) without the
-// depth-override bit 3 (value 8). The guide shader classifies them, and
-// shaders/rr_water_masks.hlsl turns that into RR's optional masks.
+// game prepass's special surfaces, PackedSurface.w bit 1 (value 2): its water
+// flag (value 4) or its class override (value 8). Andi's river captures carry
+// the override; only distant water has the flag. The guide shader classifies
+// them, and shaders/rr_water_masks.hlsl turns that into RR's optional masks.
 enum Guide : unsigned { Mirror, MirrorSmooth, Material, Physical, GuideCount };
 // Order matches the WaterGuide values in shaders/rr_convert_guides.hlsl.
 inline constexpr const char *guide_labels[GuideCount] = {
@@ -50,22 +51,14 @@ inline constexpr unsigned Flags(bool responsivity, bool discard, bool sss_mask) 
     return (responsivity ? FlagResponsivity : 0u) | (discard ? FlagDiscard : 0u) |
            (sss_mask ? FlagSssMask : 0u);
 }
-// Pixel counts per cs_prepass flag, so the log and panel show why water is or is
-// not detected. The guide shader codes each surface pixel (RRWaterCode) and
-// shaders/rr_water_masks.hlsl counts them into the stats buffer at PrepassOffset,
-// the free tail after the ray density counters, in this order:
-// converted (status 1 or 3), special (w&2), water flag (w&4), override (w&8),
-// NormalGloss bit 31, and water flag on a pixel the guide shader rejected.
-enum Prepass : unsigned {
-    Converted,
-    Special,
-    Marked,
-    Override,
-    Bit31,
-    MarkedRejected,
-    PrepassCount
-};
-inline constexpr unsigned PrepassOffset = 228;
+// Pixel counts per cs_prepass flag, so the log and panel show which kind of
+// special surface the water is. The guide shader codes each surface pixel
+// (RRWaterCode) and shaders/rr_water_masks.hlsl counts them into the stats
+// buffer at PrepassOffset, the free tail after the gate's non-finite counts, in
+// this order: special (w&2), water flag (w&4), override (w&8), NormalGloss
+// bit 31, and special pixels the guide shader rejected.
+enum Prepass : unsigned { Special, Marked, Override, Bit31, SpecialRejected, PrepassCount };
+inline constexpr unsigned PrepassOffset = 236;
 struct Counts {
     std::uint32_t water{}; // stats byte 16
     std::array<std::uint32_t, PrepassCount> prepass{};
@@ -75,7 +68,7 @@ struct Status {
     bool wanted{}, ready{}, unavailable{}, waiting_memory{}, responsivity{}, discard{}, animated{};
     float coverage = -1; // share of the latest frame's pixels classified as water, 0..1
     // Share of the latest frame's pixels per Prepass flag, 0..1; -1 when unknown.
-    std::array<float, PrepassCount> prepass{-1, -1, -1, -1, -1, -1};
+    std::array<float, PrepassCount> prepass{-1, -1, -1, -1, -1};
 };
 // CPU-only coverage summary, logged periodically so water detection can be
 // checked in ReShade.log without a capture.
@@ -134,7 +127,7 @@ class Tracker {
                                   s.discard ? "on" : "off", s.animated ? "on" : "off",
                                   ValidGuide(s.guide));
             static constexpr const char *names[PrepassCount] = {
-                "converted", "special", "waterFlag", "override", "bit31", "waterFlagRejected"};
+                "special", "waterFlag", "override", "bit31", "specialRejected"};
             for (unsigned i = 0; i < PrepassCount && n > 0 && unsigned(n) < sizeof(text); ++i)
                 n += std::snprintf(text + n, sizeof(text) - n, " %s=%.2f/%.2f%%", names[i],
                                    100.0 * prepass_sum[i] / frames, 100.0 * prepass_max[i]);

@@ -610,10 +610,10 @@ int main() {
     rrwater::Tracker coverage;
     assert(!coverage.Report(1000, report, water) && coverage.Last() < 0);
     assert(coverage.LastPrepass(rrwater::Special) < 0);
-    // converted, special, water flag, override, bit 31, water flag rejected
-    coverage.Add({25, {90, 30, 25, 5, 26, 1}}, 100);
-    coverage.Add({0, {80, 10, 0, 10, 0, 0}}, 100);
-    coverage.Add({5, {5, 5, 5, 5, 5, 5}}, 0); // no pixels: ignored
+    // special, water flag, override, bit 31, special rejected
+    coverage.Add({25, {30, 25, 5, 26, 1}}, 100);
+    coverage.Add({0, {10, 0, 10, 0, 0}}, 100);
+    coverage.Add({5, {5, 5, 5, 5, 5}}, 0); // no pixels: ignored
     assert(coverage.Last() == 0.0 && coverage.LastPrepass(rrwater::Override) == 0.1);
     assert(coverage.LastPrepass(rrwater::PrepassCount) < 0);
     water.discard = true;
@@ -623,15 +623,15 @@ int main() {
            std::string::npos);
     assert(report.find("responsivity=off(1.00) discard=on animatedMask=off guides=0") !=
            std::string::npos);
-    assert(report.find("prepass avg/max: converted=85.00/90.00% special=20.00/30.00% "
-                       "waterFlag=12.50/25.00% override=7.50/10.00% bit31=13.00/26.00% "
-                       "waterFlagRejected=0.50/1.00%") != std::string::npos);
+    assert(report.find("prepass avg/max: special=20.00/30.00% waterFlag=12.50/25.00% "
+                       "override=7.50/10.00% bit31=13.00/26.00% specialRejected=0.50/1.00%") !=
+           std::string::npos);
     report.clear();
     assert(!coverage.Report(1000 + 2 * rrwater::Tracker::Interval, report, water) &&
            report.empty() && coverage.Last() == 0.0);
     // The latest frame stays on the panel across reports.
     assert(coverage.LastPrepass(rrwater::Special) == 0.1);
-    static_assert(rrwater::PrepassCount == 6 && rrwater::PrepassOffset == 228);
+    static_assert(rrwater::PrepassCount == 5 && rrwater::PrepassOffset == 236);
 
     // Specular hit distance tests: classification, hole filling and the summaries.
     {

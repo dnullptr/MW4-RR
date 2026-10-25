@@ -12,10 +12,11 @@ RWTexture2D<float> Disocclusion:register(u1);
 // In: the guide shader's water code/255 (RRWaterCode in rr_convert_guides.hlsl).
 // Out: 1 on water, 0 elsewhere, which is also RR's animated texture mask.
 RWTexture2D<float> Water:register(u2);
-// Byte 16: water pixels this frame. Bytes 228-251 (rrwater::FlagOffset): pixels
-// per code bit, in rrwater::Flag order. GpuFrame::WaterPass zeroes both first.
+// Byte 16: water pixels this frame. Bytes 236-255 (rrwater::PrepassOffset):
+// pixels per code bit, in rrwater::Prepass order. GpuFrame::WaterPass zeroes both
+// first.
 RWByteAddressBuffer Stats:register(u3);
-static const uint FlagResponsivity=1,FlagDiscard=2,FlagSssMask=4,FlagOffset=228;
+static const uint FlagResponsivity=1,FlagDiscard=2,FlagSssMask=4,FlagOffset=236;
 void Count(bool value,uint offset){
  uint count=WaveActiveCountBits(value);
  if(count!=0&&WaveIsFirstLane()){uint old;Stats.InterlockedAdd(offset,count,old);}
@@ -36,12 +37,11 @@ void Count(bool value,uint offset){
   Water[id.xy]=water?1.0f:0.0f;
  }
  Count(water,16);
- // rrwater::Flag: converted, special, water flag, override, NormalGloss bit 31,
- // water flag on a pixel the guide shader rejected.
- Count((code&32u)!=0,FlagOffset);
- Count((code&2u)!=0,FlagOffset+4);
- Count((code&4u)!=0,FlagOffset+8);
- Count((code&8u)!=0,FlagOffset+12);
- Count((code&16u)!=0,FlagOffset+16);
- Count((code&4u)!=0&&(code&32u)==0,FlagOffset+20);
+ // rrwater::Prepass: special, water flag, override, NormalGloss bit 31, and a
+ // special pixel the guide shader rejected (no converted bit 32).
+ Count((code&2u)!=0,FlagOffset);
+ Count((code&4u)!=0,FlagOffset+4);
+ Count((code&8u)!=0,FlagOffset+8);
+ Count((code&16u)!=0,FlagOffset+12);
+ Count((code&2u)!=0&&(code&32u)==0,FlagOffset+16);
 }

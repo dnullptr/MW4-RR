@@ -390,12 +390,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
             ImGui::TextUnformatted("Water in the latest frame: measuring");
         // What the game's prepass marks, to tell whether a surface is flagged at all.
         const auto &flags = water_status.prepass;
-        if (flags[rrwater::Converted] >= 0)
-            ImGui::Text("Game flags: special %.1f%%, water %.1f%%, override %.1f%%, "
-                        "marker %.1f%%, rejected water %.1f%%",
+        if (flags[rrwater::Special] >= 0)
+            ImGui::Text("Game flags: special %.1f%% (water flag %.1f%%, override %.1f%%), "
+                        "marker %.1f%%, rejected %.1f%%",
                         100.0f * flags[rrwater::Special], 100.0f * flags[rrwater::Marked],
                         100.0f * flags[rrwater::Override], 100.0f * flags[rrwater::Bit31],
-                        100.0f * flags[rrwater::MarkedRejected]);
+                        100.0f * flags[rrwater::SpecialRejected]);
         if (water.responsivity)
             ImGui::Text("Water responsivity mask: %s",
                         water_status.responsivity               ? "active"
@@ -409,19 +409,22 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                         water_status.animated ? "active" : "waiting");
     }
     ImGui::TextWrapped(
-        "Water pixels are the ones the game's prepass marks as water. Responsivity tells RR to "
-        "lean on the current frame there (preset F only); with the SSS responsivity mask also "
-        "on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, as "
-        "RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
+        "Water pixels are the game's special surfaces: mirror-like water that its prepass marks "
+        "with its water flag (lakes, distant water) or its override (rivers). Responsivity tells "
+        "RR to lean on the current frame there (preset F only); with the SSS responsivity mask "
+        "also on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, "
+        "as RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
         "noisier water. The animated texture mask is an RR input NVIDIA does not document; it "
         "is here to see whether it changes anything. Water guides changes the normal and albedo "
         "guides on water only: the game mirror is what RR gets today, smoothed normal averages "
         "the wave normal over 7x7 pixels, water material uses the game's own reflectance and "
-        "diffuse arrays, and physical uses water's 0.02 reflectance with a smoothed normal. "
+        "diffuse arrays (not yet checked on rivers), and physical uses water's 0.02 reflectance "
+        "with a smoothed normal. "
         "Water coverage and these settings are logged to ReShade.log every 10 seconds. Game "
-        "flags shows how much of the frame the game's prepass marks as special surfaces, as "
-        "water, as overridden surfaces and with the water lighting marker: if water stays near "
-        "0%% while you look at water, the game does not mark it.");
+        "flags shows how much of the frame the game's prepass marks special, split into its "
+        "water flag and its override, plus the water lighting marker and special pixels the "
+        "add-on could not convert: if special stays near 0%% while you look at water, the "
+        "game does not mark that water.");
     ImGui::Separator();
     // Session-only: not saved, so a test mode never sticks across restarts.
     ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");

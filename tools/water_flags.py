@@ -1,9 +1,12 @@
 """Where an RR capture's special and water pixels are, to see whether the game marks a river.
 
-The Status guide is 3 on the game's special surfaces (PackedSurface w&2): water carries the
-prepass water flag (w&4) on top, the class override (w&8) does not. With a water test on, the
-disocclusion or animated texture mask is the add-on's water classification, so special pixels
-outside it are override pixels. Untinted pixels in the image are ordinary surfaces.
+The Status guide is 3 on the game's special surfaces (PackedSurface w&2), which carry either the
+prepass water flag (w&4: lakes, distant water) or the class override (w&8: the river in Andi's
+captures). With a water test on, the disocclusion or animated texture mask is the add-on's water
+classification. Builds before 2026-10-25 took only w&4 as water, so there red (special, not water)
+is override pixels. Later builds take every special pixel, so red only shows on a frame the add-on
+rejected whole; a special pixel rejected on its own is status 4, magenta like every invalid pixel.
+Without a water mask every special pixel is red. Untinted pixels are ordinary surfaces.
 
 CLI: python tools/water_flags.py FOLDER [--frame N]   |   python tools/water_flags.py --self-test
 Prints per-frame shares and a coarse screen grid, and writes FOLDER/images/water_flags_frameN.png:
@@ -159,7 +162,7 @@ def self_test():
         assert 'status 0=0.00% 1=73.96% 2=0.00% 3=25.00% 4=1.04%' in text, text
         assert ('water 12.50%, special and water 12.50%, special not water 12.50%, '
                 'water not special 0.00%') in text, text
-        # Top-left cells hold the override pixels; the bottom-right cells hold the water.
+        # Top-left cells hold the special pixels outside the mask; the bottom-right ones the water.
         assert '    100.0 100.0 100.0   0.0   0.0   0.0' in text, text
         assert '      0.0   0.0   0.0 100.0 100.0 100.0' in text, text
         png = (folder / 'images' / 'water_flags_frame0.png').read_bytes()

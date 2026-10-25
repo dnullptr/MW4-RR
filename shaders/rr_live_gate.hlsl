@@ -11,7 +11,7 @@ RWTexture2D<float4> GameOutput:register(u0);
 // 16 water pixels (rr_water_masks.hlsl), 20..63 hit distance statistics (rr_hit_condition.hlsl),
 // 64..227 ray density (rr_vrrt_probability.hlsl), then rr_gate_stats.h: 228 non-finite color
 // pixels RR receives, 232 non-finite pixels of the RR output Display shows (none on a frame
-// it rejects or blocks).
+// it rejects or blocks), 236..255 water prepass flags (rr_water_masks.hlsl).
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
 // Flags bit0: tolerate isolated unusable guide pixels. Each such pixel keeps
