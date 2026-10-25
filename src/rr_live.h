@@ -5,6 +5,7 @@
 #include "rr_ray_density.h"
 #include "rr_responsivity.h"
 #include "rr_sky_depth_test.h"
+#include "rr_sky_edge.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -85,7 +86,7 @@ class Controller {
     rrhealth::Tracker health;
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
-    bool responsivity_enabled{}, responsivity_active{};
+    bool responsivity_enabled{}, responsivity_active{}, sky_edge_active{};
     float responsivity_strength = rrresponsivity::DefaultStrength;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
@@ -331,6 +332,14 @@ class Controller {
                !sss_failed &&
                rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
                                    preset.has_effective, preset.effective);
+    }
+    // Whether the latest evaluation sent the sky edge mask and it would still be sent now.
+    bool SkyEdgeActive() {
+        std::lock_guard lock(mutex);
+        return sky_edge_active && enabled && !failed && !retired &&
+               rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
+                              rrskyedge::strength.load(std::memory_order_relaxed),
+                              preset.has_effective, preset.effective);
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -1160,6 +1169,14 @@ class Controller {
             responsivity_active =
                 rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
                                     preset.has_effective, preset.effective);
+            const float sky_edge_strength =
+                rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
+            const UINT sky_edge_radius =
+                rrskyedge::ClampRadius(rrskyedge::radius.load(std::memory_order_relaxed));
+            // RR takes one mask: while in use, the sky edge mask replaces the SSS one.
+            sky_edge_active =
+                rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
+                               sky_edge_strength, preset.has_effective, preset.effective);
             rreval::Resources resources{s->gpu.sr[0].Get(),
                                         s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
@@ -1170,7 +1187,9 @@ class Controller {
                                         s->sss_used ? s->gpu.sss.guide.Get() : nullptr,
                                         s->transparency_used ? s->gpu.transparency.guide.Get()
                                                              : nullptr,
-                                        responsivity_active ? s->gpu.sss.mask.Get() : nullptr,
+                                        sky_edge_active       ? s->gpu.sky_edge.Get()
+                                        : responsivity_active ? s->gpu.sss.mask.Get()
+                                                              : nullptr,
                                         s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
             auto projection = s->projection;
             if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
@@ -1201,6 +1220,8 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (sky_edge_active)
+                s->gpu.SkyEdge(cl.Get(), pipelines, sky_edge_strength, sky_edge_radius);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1212,6 +1233,8 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(),
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            if (sky_edge_active)
+                s->gpu.SkyEdgeFinish(cl.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)

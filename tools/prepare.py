@@ -79,7 +79,8 @@ def main():
         ('rr_convert_guides.hlsl', 'main', 'RRGuideShader', 'rr_convert_guides'),
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
         ('rr_live_gate.hlsl', 'Validate', 'RRLiveValidate', 'rr_live_validate'),
-        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display')]:
+        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
+        ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)

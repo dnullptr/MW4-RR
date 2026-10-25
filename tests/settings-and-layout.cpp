@@ -7,6 +7,7 @@
 #include "../src/rr_ray_density.h"
 #include "../src/rr_lighting_source.h"
 #include "../src/rr_responsivity.h"
+#include "../src/rr_sky_edge.h"
 #include "../src/rr_specular_distance.h"
 #include <cassert>
 #include <limits>
@@ -36,6 +37,14 @@ static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");
 
 int main() {
+    // Sky edge mask: preset F only, strength 0 or off sends nothing.
+    assert(rrskyedge::Use(true, -0.5f, true, 6));
+    assert(!rrskyedge::Use(false, -0.5f, true, 6));
+    assert(!rrskyedge::Use(true, 0.0f, true, 6));
+    assert(!rrskyedge::Use(true, -0.5f, false, 6));
+    assert(!rrskyedge::Use(true, -0.5f, true, 5));
+    assert(rrskyedge::ClampRadius(0) == 1 && rrskyedge::ClampRadius(9) == rrskyedge::MaxRadius &&
+           rrskyedge::ClampRadius(2) == 2);
     assert(rrvrsconfig::Allowed("VRS@0;123 = true // preserved\n", true, true));
     assert(rrvrsconfig::Allowed("VRS@0;123 = false\n", true, true));
     assert(!rrvrsconfig::Allowed("VRS@0;123 = true\n", false, true));

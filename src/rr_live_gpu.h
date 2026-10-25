@@ -14,6 +14,7 @@
 #include "../build/rr_live_validate.generated.h"
 #include "../build/rr_live_display.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include "../build/rr_sky_edge_mask.generated.h"
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
 #include "rr_transparency_guide.h"
@@ -108,8 +109,8 @@ struct Budget {
 struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root;
-    ComPtr<ID3D12PipelineState> converter, probability;
+    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root;
+    ComPtr<ID3D12PipelineState> converter, probability, sky_edge;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
@@ -157,6 +158,19 @@ struct Pipelines {
         Pipeline(gate_root.Get(), RRLiveBegin, sizeof(RRLiveBegin), gate[0]);
         Pipeline(gate_root.Get(), RRLiveValidate, sizeof(RRLiveValidate), gate[1]);
         Pipeline(gate_root.Get(), RRLiveDisplay, sizeof(RRLiveDisplay), gate[2]);
+        // Sky edge mask: Status SRV table, mask UAV table, 4 root constants.
+        ranges[0].NumDescriptors = 1;
+        ranges[1].NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER e[3]{};
+        for (unsigned i = 0; i < 2; ++i) {
+            e[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            e[i].DescriptorTable = {1, &ranges[i]};
+        }
+        e[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        e[2].Constants = {0, 0, 4};
+        rd = {3, e};
+        Root(rd, sky_edge_root);
+        Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
@@ -213,6 +227,8 @@ struct GpuFrame {
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R32_UINT)))
             return 0;
         auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        if (!add(distance)) // sky edge responsivity mask
+            return 0;
         distance.Flags = D3D12_RESOURCE_FLAG_NONE;
         if (!add(distance))
             return 0;
@@ -250,6 +266,8 @@ struct GpuFrame {
     // Owned copy of the native specular hit distance; hit_source is retained
     // until the recording that copied it retires.
     ComPtr<ID3D12Resource> specular_hit, hit_source;
+    // Sky edge responsivity mask (rrskyedge), written just before evaluation.
+    ComPtr<ID3D12Resource> sky_edge;
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
@@ -324,7 +342,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 12,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 13,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -336,6 +354,8 @@ struct GpuFrame {
             UAV(p, guides[i].Get(), 4 + i);
         }
         SRV(p, guides[3].Get(), 8);
+        sky_edge = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
+        UAV(p, sky_edge.Get(), 12);
         auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
         distance.Flags = D3D12_RESOURCE_FLAG_NONE;
         specular_hit = Allocate(p, b, distance);
@@ -558,6 +578,29 @@ struct GpuFrame {
         Order(cl);
         Change(cl, rr_output.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    // Between GateBegin and GateEnd: Status (guides[3]) is a shader resource.
+    // Leaves the mask readable by RR; SkyEdgeFinish returns it to COMMON.
+    void SkyEdge(ID3D12GraphicsCommandList *cl, Pipelines &p, float strength, UINT radius) {
+        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.sky_edge_root.Get());
+        cl->SetPipelineState(p.sky_edge.Get());
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, 8));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, 12));
+        UINT c[] = {w, h, radius, 0};
+        memcpy(&c[3], &strength, sizeof(strength));
+        cl->SetComputeRoot32BitConstants(2, 4, c, 0);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void SkyEdgeFinish(ID3D12GraphicsCommandList *cl) {
+        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
     }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {

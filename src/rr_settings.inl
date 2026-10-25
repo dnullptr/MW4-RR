@@ -4,6 +4,7 @@
 #include "rr_responsivity.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
+#include "rr_sky_edge.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -135,6 +136,24 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
+    bool sky_edge = rrskyedge::enabled;
+    if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge))
+        rrskyedge::enabled = sky_edge;
+    float edge_strength = rrskyedge::strength;
+    if (ImGui::SliderFloat("Sky edge strength", &edge_strength, -1.0f, 0.0f, "%.2f"))
+        rrskyedge::strength = rrresponsivity::Clamp(edge_strength);
+    int edge_radius = static_cast<int>(rrskyedge::ClampRadius(rrskyedge::radius));
+    if (ImGui::SliderInt("Sky edge width (pixels)", &edge_radius, 1,
+                         static_cast<int>(rrskyedge::MaxRadius)))
+        rrskyedge::radius = rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
+    ImGui::Text("Sky edge mask: %s", LiveRR().SkyEdgeActive() ? "active"
+                                     : !sky_edge                ? "off"
+                                     : rrresponsivity::Clamp(edge_strength) == 0
+                                         ? "off (strength 0)"
+                                         : "waiting (needs preset F)");
+    ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
+                       "steadier over time; moving branches may ghost. While on, it replaces the "
+                       "SSS responsivity mask.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
