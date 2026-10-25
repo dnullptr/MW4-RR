@@ -421,7 +421,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "Water coverage and these settings are logged to ReShade.log every 10 seconds. Game "
         "flags shows how much of the frame the game's prepass marks as special surfaces, as "
         "water, as overridden surfaces and with the water lighting marker: if water stays near "
-        "0% while you look at water, the game does not mark it.");
+        "0%% while you look at water, the game does not mark it.");
     ImGui::Separator();
     // Session-only: not saved, so a test mode never sticks across restarts.
     ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
