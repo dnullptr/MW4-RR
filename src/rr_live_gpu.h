@@ -34,6 +34,7 @@
 #include "rr_ray_density.h"
 #include "rr_ray_copies.h"
 #include "rr_water.h"
+#include "rr_gate_stats.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -350,13 +351,14 @@ struct GpuFrame {
         // The hit distance copy is also the conditioning target (a UAV).
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)))
             return 0;
-        auto buffer = rrprivate::Buffer(256);
+        auto buffer = rrprivate::Buffer(HeaderBytes); // header
         if (!add(buffer))
             return 0;
+        buffer = rrprivate::Buffer(StatsBytes); // stats
         buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (!add(buffer))
             return 0;
-        buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+        buffer.Flags = D3D12_RESOURCE_FLAG_NONE; // readback
         if (!add(buffer))
             return 0;
         buffer = rrprivate::Buffer(rrvrrt::Bytes(w, h));
@@ -395,6 +397,12 @@ struct GpuFrame {
     static constexpr UINT WeaponTarget = 17;
     // Hit distance conditioning: five sources (ConditionDistance), then its target.
     static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;
+    // The header (the gate's constants; CPU writes only its first HeaderWritten bytes, the rest
+    // stays zero and is the source of every stats zeroing copy) and the stats UAV with its
+    // readback (layout at Prepare, rr_gate_stats.h).
+    static constexpr UINT HeaderBytes = 256, HeaderWritten = 64,
+                          StatsBytes = rrgatestats::StatsBytes;
+    static constexpr UINT FiniteOffset = RR_STATS_NON_FINITE_COLOR;
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
     // Water guide mode Convert used for this frame (rrwater::Guide).
@@ -516,16 +524,22 @@ struct GpuFrame {
         }
         SRV(p, guides[3].Get(), 8);
         specular_hit = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
-        header = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
+        header = Allocate(p, b, rrprivate::Buffer(HeaderBytes), D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RANGE empty{};
         void *m{};
         Check(header->Map(0, &empty, &m), "live association upload map failed");
         header_map = (UINT *)m;
-        memset(m, 0, 256);
-        auto bd = rrprivate::Buffer(256);
+        memset(m, 0, HeaderBytes);
+        // stats bytes (rr_live_gate.hlsl), StatsBytes long: 0 bad, 4 copied, 8 isolated, 12
+        // sanitized SSS (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20..63
+        // hit distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..255 ray density
+        // (rr_vrrt_probability.hlsl, ReadRates); 256 non-finite color, 260 non-finite displayed
+        // output (rr_gate_stats.h, ReadFinite). The views are root UAVs, or (the VRRT reader's)
+        // a raw view of the whole buffer.
+        auto bd = rrprivate::Buffer(StatsBytes);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
-        readback = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
+        readback = Allocate(p, b, rrprivate::Buffer(StatsBytes), D3D12_HEAP_TYPE_READBACK);
     }
     // Water test storage for a w x h guide: the classification and two masks.
     static UINT64 WaterBytes(ID3D12Device *device, UINT w, UINT h) {
@@ -644,7 +658,8 @@ struct GpuFrame {
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // Zero the pass's statistics from the header's never-written tail.
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(stats.Get(), rrhitcond::StatsOffset, header.Get(), 64,
+        static_assert(HeaderWritten + rrhitcond::StatCount * 4 <= HeaderBytes);
+        cl->CopyBufferRegion(stats.Get(), rrhitcond::StatsOffset, header.Get(), HeaderWritten,
                              rrhitcond::StatCount * 4);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -762,8 +777,11 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Change(cl, guides[3].Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // Zero the rate statistics from the header's never-written tail.
-        constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 256 - rrdensity::Offset;
+        // Zero the rate statistics (64..255, nothing past them: the gate's BeginFrame zeroes its
+        // non-finite counts) from the header's never-written tail.
+        constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 4 * rrdensity::Count;
+        static_assert(rates >= HeaderWritten && rates + rate_bytes <= HeaderBytes &&
+                      rates + rate_bytes <= FiniteOffset);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(stats.Get(), rates, header.Get(), rates, rate_bytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -955,7 +973,7 @@ struct GpuFrame {
         Change(cl, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 256);
+        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, StatsBytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
     // SR time, after the SSS resolve. Reads this frame's classification and,
@@ -987,7 +1005,7 @@ struct GpuFrame {
         // Zero the water pixel count (stats byte 16) from the header's never-written tail.
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyBufferRegion(stats.Get(), 16, header.Get(), 64, 4);
+        cl->CopyBufferRegion(stats.Get(), 16, header.Get(), HeaderWritten, 4);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {water.heap.Get()};
@@ -1033,6 +1051,7 @@ struct GpuFrame {
         memcpy(&strength, &responsivity, sizeof(strength));
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
                     color_x, color_y, tolerate ? 1u : 0u, strength, 0, 0, 0};
+        static_assert(sizeof(c) <= HeaderWritten, "the stats zeroing source stays zero");
         memcpy(header_map, c, sizeof(c));
     }
     void Accept(bool yes) {
@@ -1054,6 +1073,22 @@ struct GpuFrame {
         D3D12_RANGE r{0, 16};
         Check(readback->Map(0, &r, &m), "live stats map failed");
         memcpy(v.data(), m, 16);
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
+    // Pixels with a non-finite channel: in the color RR receives, in the RR output the gate
+    // displays (none if rejected or blocked). Their stats bytes follow the hit distance
+    // statistics and the ray density, which ends at byte 256.
+    static_assert(rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
+                  rrdensity::Offset + 4 * rrdensity::Count <= FiniteOffset && FiniteOffset >= 256 &&
+                  RR_STATS_NON_FINITE_OUTPUT == FiniteOffset + 4 && FiniteOffset + 8 <= StatsBytes);
+    std::array<UINT, 2> ReadFinite() {
+        std::array<UINT, 2> v{};
+        void *m{};
+        D3D12_RANGE r{FiniteOffset, FiniteOffset + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live finite statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + FiniteOffset, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;

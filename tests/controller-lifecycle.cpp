@@ -1,7 +1,10 @@
 #define NOMINMAX
 #define RR_FILTER_DIAGNOSTIC
 #include "../src/rr_live.h"
+#include <algorithm>
 #include <cassert>
+#include <string>
+#include <thread>
 
 // CPU-only COM double. No device, adapter, queue, or GPU is created.
 struct CpuFence final : ID3D12Fence {
@@ -48,9 +51,12 @@ struct CpuFence final : ID3D12Fence {
         return E_NOTIMPL;
     }
 };
-// CPU-only resource double: only its reference count is observed.
+// CPU-only resource double: its reference count is observed; Map hands out mapped, when set,
+// and records the range read.
 struct CpuResource final : ID3D12Resource {
     ULONG refs = 1;
+    void *mapped{};
+    D3D12_RANGE read{};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override {
         return E_NOINTERFACE;
     }
@@ -78,8 +84,12 @@ struct CpuResource final : ID3D12Resource {
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void **) override {
         return E_NOTIMPL;
     }
-    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *, void **) override {
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *range, void **data) override {
+        if (!mapped)
+            return E_NOTIMPL;
+        read = range ? *range : D3D12_RANGE{};
+        *data = mapped;
+        return S_OK;
     }
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE *) override {}
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
@@ -101,10 +111,7 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{}, log_lines{};
-static void CountLog(const char *) {
-    ++log_lines;
-}
+static unsigned releases{}, destroys{};
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -112,6 +119,17 @@ static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
 static NVSDK_NGX_Result NVSDK_CONV DestroyParameters(NVSDK_NGX_Parameter *) {
     ++destroys;
     return NVSDK_NGX_Result_Success;
+}
+static std::string logged;
+static void Logged(const char *s) {
+    logged += s;
+    logged += '\n';
+}
+static NVSDK_NGX_Result NVSDK_CONV FeatureNotFound(NVSDK_NGX_Handle *) {
+    return NVSDK_NGX_Result(0xBAD00004u);
+}
+static NVSDK_NGX_Result NVSDK_CONV PlatformError(NVSDK_NGX_Parameter *) {
+    return NVSDK_NGX_Result(0xBAD00002u);
 }
 
 namespace rrlive {
@@ -708,6 +726,87 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
     }
+    // A failed retirement keeps its allocations and logs the NGX result, or the missing export.
+    static void RetirementFailure() {
+        Controller f;
+        f.logger = &Logged;
+        f.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        f.parameters = reinterpret_cast<NVSDK_NGX_Parameter *>(2);
+        f.api.release = FeatureNotFound;
+        f.QueueReconfigure();
+        assert(!f.Reconfigure() && f.failed && f.feature && f.parameters);
+        assert(logged == "RR feature retirement failed (0xBAD00004 FAIL_FeatureNotFound); "
+                         "allocations retained\n");
+        logged.clear();
+        Controller p;
+        p.logger = &Logged;
+        p.parameters = reinterpret_cast<NVSDK_NGX_Parameter *>(2);
+        p.api.destroy = PlatformError;
+        p.QueueReconfigure();
+        assert(!p.Reconfigure() && p.failed && p.parameters);
+        assert(logged == "RR parameter retirement failed (0xBAD00002 FAIL_PlatformError); "
+                         "allocations retained\n");
+        logged.clear();
+        Controller m;
+        m.logger = &Logged;
+        m.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        m.QueueReconfigure();
+        assert(!m.Reconfigure() && m.failed && m.feature);
+        assert(logged == "RR feature retirement failed (export missing); allocations retained\n");
+        logged.clear();
+    }
+    // Each stats reader maps only its own bytes, one after another: the gate (0..15), the
+    // water count (16), the hit distance statistics (20..63), the ray density (64..255)
+    // and the non-finite counts (256, 260), inside the 512-byte readback.
+    static void StatsReaders() {
+        static_assert(GpuFrame::StatsBytes == 512 && GpuFrame::FiniteOffset == 256);
+        UINT words[GpuFrame::StatsBytes / 4]; // the whole readback
+        for (UINT i = 0; i < GpuFrame::StatsBytes / 4; ++i)
+            words[i] = 100 + i; // word i holds 100 + its byte offset / 4
+        GpuFrame g;
+        auto *readback = new CpuResource;
+        readback->mapped = words;
+        g.readback.Attach(readback);
+        assert((g.ReadStats() == std::array<UINT, 4>{100, 101, 102, 103}));
+        assert(readback->read.Begin == 0 && readback->read.End == 16);
+        assert(g.ReadWaterPixels() == 104);
+        assert(readback->read.Begin == 16 && readback->read.End == 20);
+        const auto hit = g.ReadHitStats();
+        assert(hit.front() == 105 && hit.back() == 115);
+        assert(readback->read.Begin == 20 && readback->read.End == 64);
+        const auto rates = g.ReadRates();
+        assert(rates.front() == 116 && rates.back() == 163);
+        assert(readback->read.Begin == 64 && readback->read.End == 256);
+        assert((g.ReadFinite() == std::array<UINT, 2>{164, 165}));
+        assert(readback->read.Begin == 256 && readback->read.End == 264);
+    }
+    // A creation attempt's runtime is logged once, by the next Poll, with the controller mutex
+    // released: its module and DXGI queries never run under it.
+    static inline Controller *polled{};
+    static inline bool unlocked{};
+    static void LogUnlocked(const char *s) {
+        Logged(s);
+        // From another thread: the mutex is recursive, so this one would always get it.
+        std::thread([] {
+            if (polled->mutex.try_lock()) {
+                polled->mutex.unlock();
+                unlocked = true;
+            }
+        }).join();
+    }
+    static void RuntimeLog() {
+        Controller c;
+        polled = &c;
+        c.logger = &LogUnlocked;
+        c.runtime_report = {GetModuleHandleW(L"kernel32.dll"), nullptr};
+        c.Poll();
+        assert(logged.rfind("RR runtime: NGX core ", 0) == 0 && unlocked);
+        assert(std::count(logged.begin(), logged.end(), '\n') == 1);
+        c.Poll(); // Drained: the next Poll logs nothing.
+        assert(std::count(logged.begin(), logged.end(), '\n') == 1);
+        logged.clear();
+        polled = nullptr;
+    }
     static void WeaponDepth() {
         // The weapon depth test restarts RR only when its setting differs from the depth
         // type RR was created with. A test that could not run stays off through Reconfigure
@@ -726,12 +825,19 @@ struct ControllerCpuTest {
         assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Waiting);
         c.weapon_test.active = true;
         assert(c.WeaponDepthState() == State::Active);
-        c.logger = CountLog;
-        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        // The refusal names NGX's outcome.
+        c.logger = Logged;
+        const rrngxlog::Code refused(0xBAD00005u);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, refused.text);
         assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
-        assert(c.WeaponDepthState() == State::Refused && log_lines == 1);
-        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
-        assert(log_lines == 1); // Frames still in flight repeat the hold; logged once.
+        assert(c.WeaponDepthState() == State::Refused);
+        const std::string refusal = "Weapon depth test: RR did not accept linear depth (0xBAD00005 "
+                                    "FAIL_InvalidParameter); test off until its setting changes, "
+                                    "RR runs with hardware depth\n";
+        assert(logged == refusal);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, "threw");
+        assert(logged == refusal); // Frames still in flight repeat the hold; logged once.
+        logged.clear();
         c.logger = nullptr;
         c.feature = nullptr; // Released by Reconfigure in the game; no NGX here.
         c.QueueReconfigure();
@@ -821,6 +927,9 @@ struct ControllerCpuTest {
     }
     static void Run() {
         DevTests();
+        RetirementFailure();
+        StatsReaders();
+        RuntimeLog();
         WeaponDepth();
         HitDistanceTests();
         // Diagnostic route changes must retire existing work, then reset once.

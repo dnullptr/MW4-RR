@@ -14,6 +14,7 @@
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
+static unsigned config_warnings{}; // settings that differ from INSTALLATION.txt
 static rrsettings::Preferences preferences;
 static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
@@ -36,8 +37,8 @@ static void SaveToggles() {
                               requested_strength);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
 }
-static void ApplyEnabled() {
-    config_allowed = VrsConfigAllowsRR();
+static void ApplyEnabled(bool allowed) {
+    config_allowed = allowed;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
@@ -46,8 +47,12 @@ static void ApplyEnabled() {
     LiveRR().SetTolerateIsolated(requested_tolerate);
     requested_lobe = rrlighting::Valid(requested_lobe);
     rrbypass::lobe_source = requested_lobe;
+    LiveRR().SetCaptureLighting(requested_lobe);
     requested_strength = rrresponsivity::Clamp(requested_strength);
     LiveRR().SetResponsivity(requested_responsivity, requested_strength);
+}
+static void ApplyEnabled() {
+    ApplyEnabled(VrsConfigAllowsRR());
 }
 static void LoadSettings() {
     if (settings_loaded)
@@ -67,7 +72,10 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
-    ApplyEnabled();
+    // One read for the RR gate and the config report, so the report names the gate's answer.
+    const auto config = ReadGameConfig();
+    ApplyEnabled(VrsGateAllows(config));
+    config_warnings = ReportGameConfig(config, config_allowed);
 }
 static const char *PresetLabel(unsigned value) {
     for (unsigned i = 0; i < 4; ++i)
@@ -75,13 +83,18 @@ static const char *PresetLabel(unsigned value) {
             return rrpreset::names[i];
     return "Unknown";
 }
+// The game window has the focus. Lock-free: OnPresent tests it before any lock.
+static bool Foreground() {
+    DWORD foreground{};
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    return foreground == GetCurrentProcessId();
+}
 static void OnRuntime(reshade::api::effect_runtime *runtime) {
     Observer().Poll();
     {
         std::lock_guard lock(settings_mutex);
         LoadSettings();
-        DWORD foreground{};
-        GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+        const bool foreground = Foreground();
         static bool down[3]{};
         const int keys[] = {VK_F8, VK_F9, VK_F11};
         const bool ctrl_or_alt = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
@@ -89,8 +102,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         bool changed = false;
         for (unsigned i = 0; i < 3; ++i) {
             const bool pressed = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt,
-                                          foreground == GetCurrentProcessId())) {
+            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt, foreground)) {
                 if (i == 0)
                     requested_rr = !requested_rr;
                 else if (i == 1)
@@ -103,11 +115,11 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         }
         // Pause/Break, as every F key is taken; not with Ctrl (Ctrl+Pause is Break) or Alt held.
         // Its down and up arrive together, too briefly to poll, so ReShade's key messages are
-        // read; both in one frame show as released. A second request is ignored while active.
-        if (runtime && (runtime->is_key_pressed(VK_PAUSE) || runtime->is_key_released(VK_PAUSE)) &&
-            foreground == GetCurrentProcessId() && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-            !(GetAsyncKeyState(VK_MENU) & 0x8000))
-            LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
+        // read: on release only, as both in one frame show as released and a press whose down
+        // and up arrive apart then still requests once. A request is ignored while active.
+        if (runtime && runtime->is_key_released(VK_PAUSE) && foreground &&
+            !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_MENU) & 0x8000))
+            LiveRR().RequestCapture(); // Session only: not saved.
         if (changed) {
             ApplyEnabled();
             SaveToggles();
@@ -129,6 +141,16 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         if (ConditionStats().Summary(line, sizeof(line)))
             WriteLog(line);
     }
+}
+// Every present, before OnRuntime takes any lock: lock-free counts for the RR health line.
+static void OnPresent(reshade::api::effect_runtime *runtime) {
+    const bool focused = Foreground();
+    auto &shown = rrhealth::presentation;
+    shown.presents.fetch_add(1, std::memory_order_relaxed);
+    if (!focused)
+        shown.unfocused_presents.fetch_add(1, std::memory_order_relaxed);
+    shown.focused.store(focused, std::memory_order_relaxed);
+    OnRuntime(runtime);
 }
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));
@@ -292,7 +314,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
-        LiveRR().RequestCapture(requested_lobe);
+        LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();
     switch (capture.state) {
     case rrcapture::State::Armed:
@@ -489,6 +511,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     if (!config_allowed)
         ImGui::TextWrapped("RR configuration unavailable. Check that the campaign settings file is "
                            "read-only and contains a supported VRS value. See README.");
+    // "RR still runs" only while the gate allows RR, never under "RR configuration unavailable".
+    if (config_warnings)
+        ImGui::TextWrapped("Game config: %u %s from INSTALLATION.txt%s. See ReShade.log.",
+                           config_warnings,
+                           config_warnings == 1 ? "setting differs" : "settings differ",
+                           config_allowed ? " (RR still runs)" : "");
     if (status.rr == rrstatus::State::Unavailable)
         ImGui::TextWrapped("The game shut down its NGX runtime. Restart the game to restore RR.");
     const auto options = LiveRR().Options();

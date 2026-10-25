@@ -458,8 +458,7 @@ class Probe {
                     wcscmp(leaf, L"_nvngx.dll") == 0 || wcscmp(leaf, L"nvngx.dll") == 0;
                 const bool sr =
                     wcscmp(leaf, L"nvngx_dlss.dll") == 0 || wcsstr(path, L"\\ngx\\models\\dlss\\");
-                const bool rr = wcscmp(leaf, L"nvngx_dlssd.dll") == 0 ||
-                                wcsstr(path, L"\\ngx\\models\\dlssd\\");
+                const bool rr = RrModelPath(path);
                 const bool slmod = wcscmp(leaf, L"sl.interposer.dll") == 0;
                 if (!core && !sr && !rr && !slmod)
                     continue;
