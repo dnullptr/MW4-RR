@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "../src/rr_transparency_coverage.h"
 #include "../src/rr_live_gpu.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -398,9 +399,10 @@ struct FakeDevice final : Com<ID3D12Device> {
                                              D3D12_SUBRESOURCE_TILING *) override {
         Unexpected("GetResourceTiling");
     }
+    // Budget::Reserve looks the adapter up by LUID; no adapter has this one.
     LUID STDMETHODCALLTYPE GetAdapterLuid() override {
-        Unexpected("GetAdapterLuid");
-        return {};
+        events.push_back("adapter-luid");
+        return {0xffffffffu, 0x7fffffff};
     }
 };
 
@@ -670,7 +672,20 @@ struct FakePipelines {
 
 // Stand-in for the GpuFrame owner: its budget-checked Allocate, logged.
 struct FakeBudget {
-    UINT64 bytes{};
+    UINT64 limit = rrlive::Budget::Minimum, bytes{};
+    bool grant = true;            // whether DXGI would have room for the growth
+    std::vector<UINT64> reserves; // every Reserve request
+    bool Reserve(ID3D12Device *device, UINT64 required) {
+        assert(device);
+        events.push_back(Format("reserve %llu", (unsigned long long)required));
+        reserves.push_back(required);
+        if (required <= limit)
+            return true;
+        if (!grant)
+            return false;
+        limit = required;
+        return true;
+    }
 };
 struct FakeOwner {
     struct Call {
@@ -742,6 +757,22 @@ static bool Throws(auto &&f) {
 }
 static bool SameDesc(const D3D12_RESOURCE_DESC &a, const D3D12_RESOURCE_DESC &b) {
     return !memcmp(&a, &b, sizeof(a));
+}
+// The size queries Prepare makes for the budgeted resources from `from` on
+// (0 target, 1 control, 2 stats, 3 readback) before it allocates any of them.
+static std::vector<std::string> SizeQueries(unsigned from = 0) {
+    std::vector<std::string> v;
+    for (unsigned i = from; i < 4; ++i)
+        v.push_back(i ? Format("allocation-info dim=%u fmt=%u", D3D12_RESOURCE_DIMENSION_BUFFER,
+                               DXGI_FORMAT_UNKNOWN)
+                      : Format("allocation-info dim=%u fmt=%u", D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                               DXGI_FORMAT_R10G10B10A2_UNORM));
+    return v;
+}
+static std::vector<std::string> Join(std::vector<std::string> a,
+                                     const std::vector<std::string> &b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
 }
 
 // The guide set of a GpuFrame: normal/roughness, diffuse, specular, status.
@@ -1029,16 +1060,18 @@ static void TestPrepare() {
     assert(gpu.stats.Get() == owner.Find("stats") && gpu.readback.Get() == owner.Find("readback"));
     // Own bytes for reporting; the owner and its budget carry the same allocation.
     assert(gpu.bytes == TotalBytes && owner.bytes == TotalBytes && budget.bytes == TotalBytes);
-    const std::vector<std::string> order = {
-        Format("create-heap type=%u n=1 flags=0 mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
-        Format("create-heap type=%u n=5 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
-        "map control sub=0 read=0-0",
-        "map readback sub=0 read=all",
-        Format("rtv coverage fmt=%u dim=%u at=0x10000", DXGI_FORMAT_R10G10B10A2_UNORM,
-               D3D12_RTV_DIMENSION_TEXTURE2DMS),
-        Format("srv coverage fmt=%u dim=%u map=%#x at=0x20000", DXGI_FORMAT_R10G10B10A2_UNORM,
-               D3D12_SRV_DIMENSION_TEXTURE2DMS, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)};
+    // The four sizes are queried first; the ledger had room, so nothing was reserved.
+    assert(budget.reserves.empty() && budget.limit == rrlive::Budget::Minimum);
+    const std::vector<std::string> order = Join(
+        SizeQueries(),
+        {Format("create-heap type=%u n=1 flags=0 mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
+         Format("create-heap type=%u n=5 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
+         "map control sub=0 read=0-0", "map readback sub=0 read=all",
+         Format("rtv coverage fmt=%u dim=%u at=0x10000", DXGI_FORMAT_R10G10B10A2_UNORM,
+                D3D12_RTV_DIMENSION_TEXTURE2DMS),
+         Format("srv coverage fmt=%u dim=%u map=%#x at=0x20000", DXGI_FORMAT_R10G10B10A2_UNORM,
+                D3D12_SRV_DIMENSION_TEXTURE2DMS, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)});
     assert(events == order);
     // The control buffer starts zeroed (its zero region clears the stats).
     for (auto b : owner.Find("control")->memory)
@@ -1070,15 +1103,20 @@ static void TestPrepareResumes() {
         Gpu gpu;
         events.clear();
         assert(!gpu.Prepare(owner, p, budget, Scene()) && !gpu.Ready());
-        assert(owner.calls.size() == at + 1 && events.empty());
+        assert(owner.calls.size() == at + 1 && events == SizeQueries());
         const UINT64 kept = at ? FakeOwner::TargetBytes + (at - 1) * FakeOwner::BufferBytes : 0;
         assert(gpu.bytes == kept && owner.bytes == kept && budget.bytes == kept);
         assert(bool(gpu.target) == (at > 0) && bool(gpu.control) == (at > 1) &&
                bool(gpu.stats) == (at > 2) && !gpu.readback);
         assert(!gpu.ControlAddress() || at > 1);
         owner.calls.clear();
+        events.clear();
         assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
         assert(owner.calls.size() == 4 - at);
+        // Only the still-missing resources are sized again.
+        const auto sized = SizeQueries(at);
+        assert(events.size() > sized.size() &&
+               std::equal(sized.begin(), sized.end(), events.begin()));
         assert(owner.calls[0].type == (at == 0   ? D3D12_HEAP_TYPE_DEFAULT
                                        : at == 1 ? D3D12_HEAP_TYPE_UPLOAD
                                        : at == 2 ? D3D12_HEAP_TYPE_DEFAULT
@@ -1098,7 +1136,7 @@ static void TestPrepareResumes() {
         events.clear();
         assert(!gpu.Prepare(owner, p, budget, Scene()) && !gpu.Ready());
         assert(owner.calls.size() == 4 && gpu.bytes == TotalBytes);
-        assert(events.size() == at + 1);
+        assert(events.size() == 4 + at + 1);
         events.clear();
         assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
         assert(owner.calls.size() == 4 && device.heaps.size() == 2);
@@ -1140,13 +1178,170 @@ static void TestPrepareLiveFrame() {
     events.clear();
     assert(!frame.coverage.Prepare(frame, pipelines, budget, Scene()));
     assert(!frame.coverage.Ready() && !frame.coverage.target && !frame.coverage.bytes);
-    assert(!frame.bytes && !budget.bytes);
-    const std::vector<std::string> order = {Format("allocation-info dim=%u fmt=%u",
-                                                   D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                                                   DXGI_FORMAT_R10G10B10A2_UNORM),
-                                            "check-architecture"};
+    assert(!frame.bytes && !budget.bytes && budget.limit == rrlive::Budget::Minimum);
+    // The ledger had room (no Reserve); GpuFrame::Allocate sized the target again.
+    const auto order = Join(
+        SizeQueries(), {Format("allocation-info dim=%u fmt=%u", D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                               DXGI_FORMAT_R10G10B10A2_UNORM),
+                        "check-architecture"});
     assert(events == order);
     pipelines = {};
+}
+
+// The live budget at its ceiling: Budget::Reserve sets limit to exactly what
+// the pool needs above the minimum, and coverage is not in that projection.
+// Prepare asks the budget to grow by what coverage needs; when DXGI has no
+// room (here: no adapter matches), it defers without allocating, instead of
+// GpuFrame::Allocate's hard "reserve exceeded" failure.
+static void TestPrepareFullLedger() {
+    for (const UINT64 headroom : {UINT64(0), UINT64(4096)}) {
+        FakeDevice device;
+        rrlive::Pipelines pipelines;
+        pipelines.device = &device;
+        rrlive::Budget budget;
+        budget.limit = 2ull << 30;
+        budget.bytes = budget.limit - headroom;
+        rrlive::GpuFrame frame;
+        events.clear();
+        bool prepared = true;
+        std::string error;
+        try {
+            prepared = frame.coverage.Prepare(frame, pipelines, budget, Scene());
+        } catch (const std::exception &e) {
+            error = e.what();
+        }
+        if (!error.empty())
+            printf("full ledger (headroom %llu): Prepare threw \"%s\"\n",
+                   (unsigned long long)headroom, error.c_str());
+        assert(error.empty() && !prepared);
+        // Nothing allocated or counted, and the ceiling did not move.
+        assert(!frame.coverage.Ready() && !frame.coverage.target && !frame.coverage.control &&
+               !frame.coverage.stats && !frame.coverage.readback && !frame.coverage.bytes);
+        assert(!frame.bytes && budget.bytes == budget.limit - headroom &&
+               budget.limit == 2ull << 30);
+        // Only the four size queries, then Reserve's adapter lookup (when DXGI loads).
+        const auto sized = SizeQueries();
+        assert(events.size() >= sized.size() &&
+               std::equal(sized.begin(), sized.end(), events.begin()));
+        for (size_t i = sized.size(); i < events.size(); ++i)
+            assert(events[i] == "adapter-luid");
+        pipelines = {};
+    }
+}
+
+// The ledger rule with a recording budget: Reserve is asked for exactly the
+// ledger plus the still-missing resources, before anything is allocated.
+static void TestPrepareReserve() {
+    constexpr UINT64 full = 3ull << 30;
+    // Refused: nothing allocated, nothing counted; the retry with room succeeds.
+    {
+        FakeDevice device;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        budget.limit = budget.bytes = full;
+        budget.grant = false;
+        Gpu gpu;
+        events.clear();
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && !gpu.Ready());
+        assert(owner.calls.empty() && !gpu.bytes && budget.bytes == full && budget.limit == full);
+        assert(events == Join(SizeQueries(), {Format("reserve %llu", full + TotalBytes)}));
+        budget.grant = true;
+        assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
+        assert(budget.reserves.size() == 2 && budget.reserves[1] == full + TotalBytes);
+        assert(budget.limit == full + TotalBytes && budget.bytes == full + TotalBytes);
+        assert(owner.calls.size() == 4 && gpu.bytes == TotalBytes);
+    }
+    // Resumed: only the missing stats and readback are counted.
+    {
+        FakeDevice device;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        owner.defer_at = 2;
+        Gpu gpu;
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && budget.reserves.empty());
+        const UINT64 kept = FakeOwner::TargetBytes + FakeOwner::BufferBytes;
+        assert(budget.bytes == kept);
+        budget.limit = budget.bytes + FakeOwner::BufferBytes; // room for one buffer only
+        budget.grant = false;
+        events.clear();
+        owner.calls.clear();
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && owner.calls.empty());
+        assert(events ==
+               Join(SizeQueries(2), {Format("reserve %llu", kept + 2 * FakeOwner::BufferBytes)}));
+        budget.grant = true;
+        assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready() && owner.calls.size() == 2);
+        assert(budget.limit == kept + 2 * FakeOwner::BufferBytes && gpu.bytes == TotalBytes);
+    }
+    // A ledger already above its ceiling also asks; one that fits exactly does not.
+    {
+        FakeDevice device;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        budget.limit = full;
+        budget.bytes = full + 1;
+        budget.grant = false;
+        Gpu gpu;
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && owner.calls.empty());
+        assert(budget.reserves.size() == 1 && budget.reserves[0] == full + 1 + TotalBytes);
+        budget.bytes = full - TotalBytes;
+        budget.reserves.clear();
+        assert(gpu.Prepare(owner, p, budget, Scene()) && budget.reserves.empty());
+        assert(budget.bytes == full && owner.calls.size() == 4);
+    }
+    // Only descriptor heaps missing: nothing to budget, so no Reserve even above the ceiling.
+    {
+        FakeDevice device;
+        device.heap_fail_at = 0;
+        device.heap_result = E_OUTOFMEMORY;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        Gpu gpu;
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && owner.calls.size() == 4);
+        budget.limit = budget.bytes - 1;
+        budget.grant = false;
+        events.clear();
+        assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
+        assert(budget.reserves.empty() && owner.calls.size() == 4);
+        assert(events[0] ==
+               Format("create-heap type=%u n=1 flags=0 mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_RTV));
+    }
+    // Unknown, failed or overflowing sizes are hard failures, before any allocation.
+    for (unsigned c = 0; c < 4; ++c) {
+        FakeDevice device;
+        if (c == 0)
+            device.texture_size = 0;
+        else if (c == 1)
+            device.buffer_size = UINT64_MAX;
+        else if (c == 2)
+            device.texture_size = device.buffer_size = 1ull << 62;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        if (c == 3)
+            budget.limit = budget.bytes = UINT64_MAX - 1; // ledger + needed overflows
+        Gpu gpu;
+        assert(Throws([&] { gpu.Prepare(owner, p, budget, Scene()); }));
+        assert(owner.calls.empty() && budget.reserves.empty() && !gpu.bytes && !gpu.Ready());
+    }
+    // A lone missing resource of unknown size, even on an empty ledger.
+    {
+        FakeDevice device;
+        FakePipelines p(&device);
+        FakeOwner owner;
+        FakeBudget budget;
+        owner.defer_at = 3;
+        Gpu gpu;
+        assert(!gpu.Prepare(owner, p, budget, Scene()) && gpu.stats && !gpu.readback);
+        budget.bytes = 0;
+        device.buffer_size = UINT64_MAX;
+        owner.calls.clear();
+        assert(Throws([&] { gpu.Prepare(owner, p, budget, Scene()); }));
+        assert(owner.calls.empty() && budget.reserves.empty() && !gpu.readback);
+    }
 }
 
 static void TestCapture() {
@@ -1198,6 +1393,27 @@ static void TestControl() {
     unprepared.Seal(true);
     assert(!unprepared.ControlAddress());
     static_assert(noexcept(s.gpu.WriteControl(c)) && noexcept(s.gpu.Seal(true)));
+}
+
+// Control::zero is the source Record clears the stats from: WriteControl keeps
+// it zero whatever the caller passes, so the stats never accumulate.
+static void TestControlZero() {
+    Slot s;
+    auto &memory = s.Get("control").memory;
+    auto c = Make(Tuning{}, 1920, 1080);
+    for (unsigned i = 0; i < 4; ++i)
+        c.zero[i] = 0x11111111u * (i + 1);
+    c.reserved[3] = 6;
+    c.padding[0] = 5;
+    s.gpu.WriteControl(c);
+    Control mapped;
+    memcpy(&mapped, memory, sizeof(mapped));
+    for (auto z : mapped.zero)
+        assert(z == 0);
+    // Every other word is the caller's.
+    auto expected = c;
+    memset(expected.zero, 0, sizeof(expected.zero));
+    assert(!memcmp(&mapped, &expected, sizeof(mapped)));
 }
 
 static void TestDescriptors() {
@@ -1305,6 +1521,7 @@ static void TestHarvest() {
     s.gpu.WriteDescriptors(s.pipelines, g.resources);
     FakeList list;
     s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
+    memcpy(memory, values, sizeof(values)); // the recorded copy lands on the GPU
     stats = s.gpu.Harvest();
     assert(stats.ran == 1 && stats.eligible == 2000 && stats.covered == 300 &&
            stats.opacity64 == 9600);
@@ -1315,6 +1532,32 @@ static void TestHarvest() {
     static_assert(sizeof(PassStats) == 16 && noexcept(s.gpu.Harvest()));
 }
 
+// A recorded SR list that never executes leaves no stale stats: Record clears
+// the readback words, so the next Harvest reports ran == 0 instead of the
+// previous completed dispatch again.
+static void TestHarvestUnexecuted() {
+    Slot s;
+    auto &memory = s.Get("readback").memory;
+    GuideSet g;
+    Pipeline pipeline;
+    assert(pipeline.Prepare(s.pipelines));
+    s.gpu.WriteDescriptors(s.pipelines, g.resources);
+    FakeList list;
+    s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
+    const UINT values[] = {1, 2000, 300, 9600};
+    memcpy(memory, values, sizeof(values)); // that dispatch completed
+    auto stats = s.gpu.Harvest();
+    assert(stats.ran == 1 && stats.eligible == 2000 && stats.covered == 300 &&
+           stats.opacity64 == 9600);
+    // Recorded again; the list is never executed, so no copy lands.
+    s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
+    stats = s.gpu.Harvest();
+    assert(!stats.ran && !stats.eligible && !stats.covered && !stats.opacity64);
+    // Only the 16 stats bytes are cleared.
+    for (size_t i = sizeof(PassStats); i < sizeof(memory); ++i)
+        assert(memory[i] == 0xcd);
+}
+
 static void TestRelease() {
     Slot s;
     auto &control = s.Get("control");
@@ -1322,7 +1565,11 @@ static void TestRelease() {
     events.clear();
     s.gpu.Release();
     assert(control.unmaps == 1 && readback.unmaps == 1);
-    assert(events.size() == 2);
+    // The CPU wrote the whole control buffer and, in Record, the readback stats words.
+    const std::vector<std::string> unmapped = {
+        "unmap control sub=0 written=all",
+        Format("unmap readback sub=0 written=0-%zu", sizeof(PassStats))};
+    assert(events == unmapped);
     assert(!s.gpu.Ready() && !s.gpu.target && !s.gpu.control && !s.gpu.stats && !s.gpu.readback);
     assert(!s.gpu.rtv && !s.gpu.heap && !s.gpu.bytes && !s.gpu.ControlAddress());
     assert(!s.gpu.Described() && s.gpu.Matches(Scene(1280, 720)));
@@ -1362,14 +1609,18 @@ int main() {
     TestPrepare();
     TestPrepareResumes();
     TestPrepareLiveFrame();
+    TestPrepareFullLedger();
+    TestPrepareReserve();
     TestCapture();
     TestControl();
+    TestControlZero();
     TestDescriptors();
     TestRecord();
     TestHarvest();
+    TestHarvestUnexecuted();
     TestRelease();
     TestFrameRelease();
     puts("PASS: transparency coverage ticket, typed-load gate, blend pipeline, coverage "
-         "resources, resumable preparation, capture, control, descriptors, recording, "
-         "harvest and release");
+         "resources, resumable preparation, ledger reservation, capture, control, "
+         "descriptors, recording, harvest and release");
 }

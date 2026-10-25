@@ -109,7 +109,7 @@ struct Gpu {
     UINT64 bytes{};             // this slot's coverage bytes, for reporting only
     UINT stride{};
     UINT *control_map{};
-    const UINT *readback_map{};
+    UINT *readback_map{}; // the GPU copies PassStats here; Record clears those words
     std::array<ID3D12Resource *, 4> described{}; // guides behind heap [1..4] (identity only)
     bool ready{}, recorded{};
 
@@ -128,14 +128,17 @@ struct Gpu {
         d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         return d;
     }
-    // Target, control, stats and readback; descriptor heaps are not counted.
+    // The budgeted resources in allocation order: target, control, stats and
+    // readback. Descriptor heaps are not budgeted.
+    static std::array<D3D12_RESOURCE_DESC, 4> Descs(const D3D12_RESOURCE_DESC &scene) {
+        return {CoverageDesc(scene), rrprivate::Buffer(256), StatsDesc(), rrprivate::Buffer(256)};
+    }
     template <class Query>
     static UINT64 RequiredBytes(const D3D12_RESOURCE_DESC &scene, Query query) {
         if (!Shape(scene))
             return 0;
         UINT64 total{};
-        for (const auto &d :
-             {CoverageDesc(scene), rrprivate::Buffer(256), StatsDesc(), rrprivate::Buffer(256)}) {
+        for (const auto &d : Descs(scene)) {
             const UINT64 n = query(d);
             if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
                 return 0;
@@ -160,14 +163,38 @@ struct Gpu {
     bool Ready() const {
         return ready;
     }
+    // Bytes the budgeted resources that are still null need. A zero, unknown
+    // or overflowing size is a hard failure.
+    UINT64 Missing(ID3D12Device *device, const D3D12_RESOURCE_DESC &scene) const {
+        const ID3D12Resource *resources[] = {target.Get(), control.Get(), stats.Get(),
+                                             readback.Get()};
+        const auto descs = Descs(scene);
+        UINT64 total{};
+        for (size_t i = 0; i < descs.size(); ++i) {
+            if (resources[i])
+                continue;
+            const UINT64 n = device->GetResourceAllocationInfo(0, 1, &descs[i]).SizeInBytes;
+            rrprivate::Require(n && n != UINT64_MAX && total <= UINT64_MAX - n,
+                               "coverage allocation size unavailable");
+            total += n;
+        }
+        return total;
+    }
     // Resumable: each resource is created only while it is null. Every
     // resource goes through owner.Allocate (rrlive::GpuFrame::Allocate), so it
-    // is budget-checked, added to the frame's and the budget's bytes, and
-    // counted in the slot's base bytes by the pool reservations; bytes keeps
-    // this slot's share for reporting. Nothing reserves pool memory ahead for
-    // coverage: a slot that has not allocated it yet is not pre-reserved, so
-    // under tight VRAM this returns false (AllocationDeferred), and the caller
-    // reports Reason::Memory and retries after 1 s. Other failures throw.
+    // is budget-checked and added to the frame's and the budget's bytes; bytes
+    // keeps this slot's share for reporting. Coverage is not in the pool
+    // projection, and Budget::Reserve sets the ledger ceiling to exactly what
+    // the pool needs above its minimum, so the ledger can already be at its
+    // ceiling, which Allocate treats as a hard failure. Prepare therefore sizes
+    // the still-null resources first and, when the ledger cannot hold them,
+    // asks budget.Reserve to grow the ceiling by that much. Reserve grows it
+    // only for this actual allocation and only when DXGI has room. Once
+    // allocated, coverage is in GpuFrame::bytes, so the later pool reservations
+    // count it in this slot's base bytes. When Reserve refuses (nothing is
+    // allocated) or Allocate defers on its DXGI check, this returns false, and
+    // the caller reports Reason::Memory and retries after 1 s. Other failures
+    // throw.
     template <class Owner, class Pipelines, class Budget>
     bool Prepare(Owner &owner, Pipelines &p, Budget &budget, const D3D12_RESOURCE_DESC &scene) {
         using rrprivate::Check;
@@ -176,6 +203,11 @@ struct Gpu {
                            "coverage target extent or sample layout changed before retirement");
         if (ready)
             return true;
+        const UINT64 needed = Missing(p.device.Get(), scene);
+        rrprivate::Require(needed <= UINT64_MAX - budget.bytes, "coverage memory ledger overflow");
+        if (needed && (budget.bytes > budget.limit || needed > budget.limit - budget.bytes) &&
+            !budget.Reserve(p.device.Get(), budget.bytes + needed))
+            return false;
         auto allocate = [&](ComPtr<ID3D12Resource> &r, const D3D12_RESOURCE_DESC &d,
                             D3D12_HEAP_TYPE type, const D3D12_CLEAR_VALUE *clear = nullptr) {
             if (r)
@@ -184,18 +216,18 @@ struct Gpu {
             r = owner.Allocate(p, budget, d, type, clear);
             bytes += owner.bytes - before;
         };
+        const auto descs = Descs(scene);
         try {
             if (!target) {
                 // T = 1: fully transmissive in every channel and in alpha.
                 const D3D12_CLEAR_VALUE transmissive{DXGI_FORMAT_R10G10B10A2_UNORM,
                                                      {{1.f, 1.f, 1.f, 1.f}}};
-                const auto d = CoverageDesc(scene);
-                allocate(target, d, D3D12_HEAP_TYPE_DEFAULT, &transmissive);
-                desc = d;
+                allocate(target, descs[0], D3D12_HEAP_TYPE_DEFAULT, &transmissive);
+                desc = descs[0];
             }
-            allocate(control, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
-            allocate(stats, StatsDesc(), D3D12_HEAP_TYPE_DEFAULT);
-            allocate(readback, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
+            allocate(control, descs[1], D3D12_HEAP_TYPE_UPLOAD);
+            allocate(stats, descs[2], D3D12_HEAP_TYPE_DEFAULT);
+            allocate(readback, descs[3], D3D12_HEAP_TYPE_READBACK);
             D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
             if (!rtv)
                 CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv)),
@@ -217,7 +249,7 @@ struct Gpu {
         }
         if (!readback_map) {
             Check(readback->Map(0, nullptr, &m), "coverage readback map failed");
-            readback_map = static_cast<const UINT *>(m);
+            readback_map = static_cast<UINT *>(m);
         }
         stride = p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_RENDER_TARGET_VIEW_DESC view{};
@@ -294,9 +326,14 @@ struct Gpu {
         rrsss::Transition(cl, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                           D3D12_RESOURCE_STATE_COMMON);
     }
+    // The whole control buffer, except that Control::zero, the source Record
+    // clears the stats from, stays zero whatever c holds.
     void WriteControl(const Control &c) noexcept {
-        if (control_map)
-            memcpy(control_map, &c, sizeof(c));
+        if (!control_map)
+            return;
+        memcpy(control_map, &c, sizeof(c));
+        memset(reinterpret_cast<unsigned char *>(control_map) + offsetof(Control, zero), 0,
+               sizeof(Control::zero));
     }
     // Submission-time gate: word 0 only.
     void Seal(bool admitted) noexcept {
@@ -307,9 +344,10 @@ struct Gpu {
     D3D12_GPU_VIRTUAL_ADDRESS ControlAddress() const noexcept {
         return control ? control->GetGPUVirtualAddress() : 0;
     }
-    // The stats the last Record copied back, once per Record; zero otherwise.
-    // Call it only once that recording's slot has completed (slot reuse
-    // guarantees it), so the values describe an earlier frame of this slot.
+    // The stats the last Record copied back, once per Record; zero otherwise,
+    // and ran == 0 when that Record's list never executed. Call it only once
+    // that recording's slot has completed (slot reuse guarantees it), so the
+    // values describe an earlier frame of this slot.
     PassStats Harvest() noexcept {
         PassStats s{};
         if (!recorded || !readback_map)
@@ -351,6 +389,12 @@ struct Gpu {
         Transition(cl, stats.Get(), uav, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, sizeof(PassStats));
         Transition(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, common);
+        // Clear the readback words now, so a list that never executes leaves
+        // ran == 0 for the next Harvest instead of the previous dispatch's
+        // stats again. Safe: this slot's previous dispatch has completed (the
+        // slot is reused only after its fence), so its copy has already landed.
+        if (readback_map)
+            memset(readback_map, 0, sizeof(PassStats));
         recorded = true;
     }
     // Unmaps and drops everything. The bytes stay in the owner's ledger:
@@ -359,8 +403,8 @@ struct Gpu {
         if (control_map)
             control->Unmap(0, nullptr);
         if (readback_map) {
-            D3D12_RANGE none{};
-            readback->Unmap(0, &none);
+            const D3D12_RANGE cleared{0, sizeof(PassStats)}; // Record's CPU writes
+            readback->Unmap(0, &cleared);
         }
         *this = {};
     }
