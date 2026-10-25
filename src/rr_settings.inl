@@ -71,7 +71,7 @@ static const char *PresetLabel(unsigned value) {
             return rrpreset::names[i];
     return "Unknown";
 }
-static void OnRuntime(reshade::api::effect_runtime *) {
+static void OnRuntime(reshade::api::effect_runtime *runtime) {
     Observer().Poll();
     {
         std::lock_guard lock(settings_mutex);
@@ -97,6 +97,13 @@ static void OnRuntime(reshade::api::effect_runtime *) {
             }
             down[i] = pressed;
         }
+        // Pause/Break, as every F key is taken; not with Ctrl (Ctrl+Pause is Break) or Alt held.
+        // Its down and up arrive together, too briefly to poll, so ReShade's key messages are
+        // read; both in one frame show as released. A second request is ignored while active.
+        if (runtime && (runtime->is_key_pressed(VK_PAUSE) || runtime->is_key_released(VK_PAUSE)) &&
+            foreground == GetCurrentProcessId() && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetAsyncKeyState(VK_MENU) & 0x8000))
+            LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
         if (changed) {
             ApplyEnabled();
             SaveToggles();
@@ -201,6 +208,31 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
+    if (ImGui::Button("Capture RR inputs (Pause)"))
+        LiveRR().RequestCapture(requested_lobe);
+    const auto capture = LiveRR().CaptureStatus();
+    switch (capture.state) {
+    case rrcapture::State::Armed:
+        ImGui::TextUnformatted("Capture: waiting for RR");
+        break;
+    case rrcapture::State::Collecting:
+        ImGui::Text("Capture: collecting %u/8 frames", capture.collected);
+        break;
+    case rrcapture::State::Writing:
+        ImGui::TextUnformatted("Capture: writing files...");
+        break;
+    case rrcapture::State::Saved:
+        ImGui::TextWrapped("Capture saved to %s", capture.message.c_str());
+        break;
+    case rrcapture::State::Failed:
+        ImGui::TextWrapped("Capture failed: %s", capture.message.c_str());
+        break;
+    case rrcapture::State::Idle:
+        break;
+    }
+    ImGui::TextWrapped("Saves 8 consecutive frames of everything RR is given, plus the Status "
+                       "guide and RR's output, to mw4-rr-captures in the game folder. About 50 "
+                       "bytes per render pixel plus 8 per output pixel, per frame. Session only.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
