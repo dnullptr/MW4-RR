@@ -41,8 +41,15 @@ void CoverageLive(Slot &s, bool live) {
     s.transparency.coverage_live = live;
 }
 void CoverageReset(Slot &s, ID3D12GraphicsCommandList *cl) {
-    if (s.coverage.capture.Get() == cl)
-        CoverageLive(s, false);
+    if (s.coverage.capture.Get() != cl)
+        return;
+    CoverageLive(s, false);
+    // A list reset before its submission never ran its captures: the target
+    // holds nothing of this frame.
+    if (!s.coverage.submitted) {
+        s.coverage.cleared = false;
+        s.coverage.captures_oit = s.coverage.captures_refr = s.coverage.captures_refr_alpha = 0;
+    }
 }
 // The pool reservation that coverage on every slot needs, beyond what the
 // slots already hold: count * (required - the largest coverage a slot holds).
@@ -104,11 +111,30 @@ void CoverageReportLocked(ULONGLONG now) {
     if (now - blend_report < 10000)
         return;
     blend_report = now;
-    const auto &k = blend_counters;
-    if (blend_enabled && (k.frames || k.captures_oit || k.captures_refr || k.admitted || k.ran ||
-                          k.last != rrblend::Reason::None)) {
-        char line[320];
-        rrblend::Report(k, line, sizeof(line));
+    // Every window while RR runs, all-zero ones included, so "no transparency
+    // seen" reads differently from "refused" and from "failed" or
+    // "unavailable", which show in every window, not only the first.
+    if (enabled && !failed && !retired) {
+        auto &k = blend_counters;
+        const char *state = "on";
+        if (!blend_enabled)
+            state = "off";
+        else if (blend_failed) {
+            state = "failed";
+            k.last = rrblend::Reason::Failed;
+        } else if (blend_unavailable != rrblend::Reason::None) {
+            state = "unavailable";
+            k.last = blend_unavailable;
+        }
+        char line[400];
+        if (!blend_enabled)
+            snprintf(line, sizeof(line), "Transparency albedo blend (10s): off");
+        else {
+            const int n = rrblend::Report(k, line, sizeof(line));
+            if (n > 0 && size_t(n) < sizeof(line))
+                snprintf(line + n, sizeof(line) - size_t(n), " changed=%llu state=%s",
+                         static_cast<unsigned long long>(k.covered), state);
+        }
         Log(line);
     }
     blend_counters = {};

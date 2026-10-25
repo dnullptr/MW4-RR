@@ -1386,23 +1386,95 @@ struct ControllerCpuTest {
         r.S().gpu.coverage.readback_map = nullptr;
     }
 
+    // A capture list reset before its submission ran nothing: its captures and
+    // its clear are dropped. A submitted list's captures ran and are kept.
+    static void ResetUnsubmitted() {
+        Rig r;
+        auto &s = r.S();
+        s.pre_live = true; // the slot stays in use across the reset
+        auto t = r.Capture(r.list);
+        r.c.CoverageCaptured(std::move(t), rrblend::Kind::Refraction, true);
+        assert(s.coverage.cleared && s.coverage.captures_refr == 1);
+        r.c.Reset(&r.list);
+        assert(s.busy && !s.coverage.Live() && !s.transparency.Live());
+        assert(!s.coverage.cleared && !s.coverage.captures_oit && !s.coverage.captures_refr &&
+               !s.coverage.captures_refr_alpha);
+        // The list is recorded again: its first capture clears again.
+        t = r.Capture(r.list);
+        assert(t && t.first);
+        r.c.CoverageCaptured(std::move(t), rrblend::Kind::Oit);
+        s.coverage.submitted = true;
+        r.c.Reset(&r.list);
+        assert(!s.coverage.Live() && s.coverage.cleared && s.coverage.captures_oit == 1);
+        s.gpu.coverage.control_map = nullptr;
+        s.gpu.coverage.readback_map = nullptr;
+    }
+
+    // While RR runs, every 10 s window logs, all-zero ones included; a failed
+    // or unavailable blend shows in every window.
     static void Report() {
         Controller c;
         c.logger = [](const char *line) { logs.emplace_back(line); };
         logs.clear();
+        c.SetEnabled(true);
         c.CoverageReportLocked(100000);
         c.blend_counters.captures_oit = 3;
+        c.blend_counters.covered = 1234;
         c.CoverageReportLocked(105000);
         assert(logs.empty() && c.blend_counters.captures_oit == 3);
         c.CoverageReportLocked(110000);
-        assert(logs.size() == 1 && Logged("Transparency albedo blend (10s): frames=0 captures=3"));
-        assert(c.blend_counters.captures_oit == 0);
-        c.CoverageReportLocked(120000); // nothing happened: no line
-        assert(logs.size() == 1);
+        assert(logs.size() == 1 &&
+               Logged("Transparency albedo blend (10s): frames=0 captures=3 oit=3 refr=0") &&
+               Logged("lastReject=none changed=1234 state=on"));
+        assert(c.blend_counters.captures_oit == 0 && c.blend_counters.covered == 0);
+        // Nothing transparent seen: the line still comes, all zero.
+        logs.clear();
+        c.CoverageReportLocked(120000);
+        assert(logs.size() == 1 &&
+               Logged("frames=0 captures=0 oit=0 refr=0 admitted=0 eligible=0.0% covered=0.0%") &&
+               Logged("lastReject=none changed=0 state=on"));
+        // A refusal is named.
+        c.blend_counters.last = rrblend::Reason::NoSlot;
+        c.CoverageReportLocked(130000);
+        assert(logs.size() == 2 && Logged("lastReject=no-slot changed=0 state=on"));
+        // A failed blend shows in consecutive windows.
+        logs.clear();
+        c.blend_failed = true;
+        c.CoverageReportLocked(140000);
+        c.CoverageReportLocked(150000);
+        assert(logs.size() == 2);
+        for (const auto &line : logs)
+            assert(line.find("captures=0 oit=0 refr=0") != std::string::npos &&
+                   line.find("lastReject=failed changed=0 state=failed") != std::string::npos);
+        // So does an unavailable one.
+        logs.clear();
+        c.blend_failed = false;
+        c.blend_unavailable = rrblend::Reason::Typed;
+        c.CoverageReportLocked(160000);
+        c.CoverageReportLocked(170000);
+        assert(logs.size() == 2);
+        for (const auto &line : logs)
+            assert(line.find("lastReject=typed-load changed=0 state=unavailable") !=
+                   std::string::npos);
+        c.blend_unavailable = rrblend::Reason::None;
+        // Blend off: one short line per window, counters reset.
+        logs.clear();
         c.blend_counters.frames = 1;
         c.SetTransparencyBlendEnabled(false);
-        c.CoverageReportLocked(130000); // disabled: no line, counters reset
-        assert(logs.size() == 1 && c.blend_counters.frames == 0);
+        c.CoverageReportLocked(180000);
+        assert(logs.size() == 1 && logs[0] == "Transparency albedo blend (10s): off");
+        assert(c.blend_counters.frames == 0);
+        // RR off, failed or retired: no line.
+        c.SetTransparencyBlendEnabled(true);
+        c.SetEnabled(false);
+        c.CoverageReportLocked(190000);
+        c.SetEnabled(true);
+        c.failed = true;
+        c.CoverageReportLocked(200000);
+        c.failed = false;
+        c.retired = true;
+        c.CoverageReportLocked(210000);
+        assert(logs.size() == 1);
     }
 
     static void Run() {
@@ -1415,6 +1487,7 @@ struct ControllerCpuTest {
         for (int order : {0, 1, 2})
             Submission(order);
         Shutdown();
+        ResetUnsubmitted();
         Report();
     }
 };
