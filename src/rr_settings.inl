@@ -36,8 +36,8 @@ static void SaveToggles() {
                               requested_strength);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
 }
-static void ApplyEnabled() {
-    config_allowed = VrsConfigAllowsRR();
+static void ApplyEnabled(bool allowed) {
+    config_allowed = allowed;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
@@ -48,6 +48,9 @@ static void ApplyEnabled() {
     rrbypass::lobe_source = requested_lobe;
     requested_strength = rrresponsivity::Clamp(requested_strength);
     LiveRR().SetResponsivity(requested_responsivity, requested_strength);
+}
+static void ApplyEnabled() {
+    ApplyEnabled(VrsConfigAllowsRR());
 }
 static void LoadSettings() {
     if (settings_loaded)
@@ -67,8 +70,10 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
-    ApplyEnabled();
-    config_warnings = ReportGameConfig();
+    // One read for the RR gate and the config report, so the report names the gate's answer.
+    const auto config = ReadGameConfig();
+    ApplyEnabled(VrsGateAllows(config));
+    config_warnings = ReportGameConfig(config, config_allowed);
 }
 static const char *PresetLabel(unsigned value) {
     for (unsigned i = 0; i < 4; ++i)
@@ -490,11 +495,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     if (!config_allowed)
         ImGui::TextWrapped("RR configuration unavailable. Check that the campaign settings file is "
                            "read-only and contains a supported VRS value. See README.");
+    // "RR still runs" only while the gate allows RR, never under "RR configuration unavailable".
     if (config_warnings)
-        ImGui::TextWrapped("Game config: %u %s from INSTALLATION.txt (RR still runs). See "
-                           "ReShade.log.",
+        ImGui::TextWrapped("Game config: %u %s from INSTALLATION.txt%s. See ReShade.log.",
                            config_warnings,
-                           config_warnings == 1 ? "setting differs" : "settings differ");
+                           config_warnings == 1 ? "setting differs" : "settings differ",
+                           config_allowed ? " (RR still runs)" : "");
     if (status.rr == rrstatus::State::Unavailable)
         ImGui::TextWrapped("The game shut down its NGX runtime. Restart the game to restore RR.");
     const auto options = LiveRR().Options();

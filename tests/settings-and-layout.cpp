@@ -15,10 +15,12 @@
 #include "../src/rr_trace_model.h"
 #include "../src/rr_hit_condition.h"
 #include "../src/rr_water.h"
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 constexpr rrsettings::Preferences defaults;
@@ -174,7 +176,10 @@ static void GameConfigTests() {
            "DxrDenoiser=DLSS Ray Reconstruction, DLSSSharpnessMP=0, DLSSFrameGeneration=false, "
            "DLSSFrameGenerationmultiType=Dynamic Auto, DLSSPerfModeMP=Maximum Quality, "
            "DxrMode@0=On, DxrMode@1=High, VRS=true, MaxFpsInGame=250, MaxFpsOutOfFocus=30, "
-           "SustainabilityReduceQualityIdle=full");
+           "SustainabilityReduceQualityIdle@0=full, SustainabilityReduceQualityIdle@1=30 seconds");
+    // Every entry of a shown name is logged, by index when there are several: a second VRS shows.
+    lines = Lines(Config() + ConfigLine("VRS@0", "false"), warnings);
+    assert(warnings == 0 && lines[0].find(", VRS@0=true, VRS@0=false, ") != std::string::npos);
 
     // Each required key: a wrong value, a different case and a missing entry.
     const char *required[][3] = {{"MotionBlur", "Off", "Cinematic Only"},
@@ -205,13 +210,24 @@ static void GameConfigTests() {
         // The gate looks only at read-only and VRS: a broken rule never turns RR off.
         assert(rrvrsconfig::Allowed(Config(key, wrong), true, true));
     }
-    // Every entry of a ruled name must comply, whatever its index.
+    // Every entry of a ruled name must comply, whatever its index; when the name has several,
+    // each warning names its entry.
     lines = Lines(Config() + ConfigLine("MotionBlur@1", "On"), warnings);
-    assert(warnings == 1 && Has(lines, "Game config warning: MotionBlur=On; INSTALLATION.txt "
+    assert(warnings == 1 && Has(lines, "Game config warning: MotionBlur@1=On; INSTALLATION.txt "
                                        "requires Off"));
     lines = Lines(Config("MotionBlur@0", "On") + ConfigLine("MotionBlur@1", "Script"), warnings);
-    assert(warnings == 2);
+    assert(warnings == 2 && lines.size() == 3);
+    assert(lines[1] == "Game config warning: MotionBlur@0=On; INSTALLATION.txt requires Off");
+    assert(lines[2] == "Game config warning: MotionBlur@1=Script; INSTALLATION.txt requires Off");
     lines = Lines(Config() + ConfigLine("MotionBlur@1", "off"), warnings);
+    assert(warnings == 0);
+    // Names and values match in any case: a lower-case key line, an upper-case value.
+    lines = Lines(Config("MotionBlur@0", nullptr) + ConfigLine("motionblur@0", "On"), warnings);
+    assert(warnings == 1 && lines.size() == 2 &&
+           lines[1] == "Game config warning: MotionBlur=On; INSTALLATION.txt requires Off");
+    lines = Lines(Config("MotionBlur@0", nullptr) + ConfigLine("motionblur@0", "off"), warnings);
+    assert(warnings == 0);
+    lines = Lines(Config("WeaponMotionBlur@0", "FALSE"), warnings);
     assert(warnings == 0);
 
     // DxrMode@0 must be On; @1 picks a quality and must not be On.
@@ -233,8 +249,6 @@ static void GameConfigTests() {
     }
     lines = Lines(Config("DxrMode@1", nullptr), warnings); // nothing set to On: no warning
     assert(warnings == 0 && lines[0].find("DxrMode@1=<missing>") != std::string::npos);
-    lines = Lines(Config("DxrMode@1", "On"), warnings);
-    assert(warnings == 1);
 
     // An empty or unrelated file warns for every required key and logs <missing>.
     for (const char *text : {"", "\r\n// nothing\r\nVRS@0 = true\r\n"}) {
@@ -280,9 +294,11 @@ static void GameConfigTests() {
     }
     lines = Lines(Config("DLSSSharpnessMP@0", nullptr), warnings);
     assert(lines.size() == 1);
-    // Only the first entry of a name is logged and judged for the notes.
+    // Only the first entry of a name is judged for the notes; both are logged.
     lines = Lines(Config() + ConfigLine("DLSSFrameGeneration@0", "true"), warnings);
-    assert(lines.size() == 1);
+    assert(lines.size() == 1 &&
+           lines[0].find(", DLSSFrameGeneration@0=false, DLSSFrameGeneration@0=true, ") !=
+               std::string::npos);
     // Values, then warnings, then both notes in this order; only the warning counts.
     auto mixed = Config("MotionBlur@0", "On");
     Swap(mixed, "DLSSFrameGeneration@0;57752;20945 = false", "DLSSFrameGeneration@0 = true");

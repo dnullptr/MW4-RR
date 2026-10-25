@@ -88,7 +88,7 @@ inline constexpr Rule rules[] = {
     {"DxrMode", "0", "On", false},
     {"DxrMode", "1", "On", true},
 };
-// Logged so the live values are visible: the first entry of the name, or the given index.
+// Logged so the live values are visible: every entry of the name, or of the given index.
 struct Shown {
     const char *name, *index;
 };
@@ -103,6 +103,16 @@ inline constexpr Shown shown[] = {
 };
 inline std::string Label(const char *name, const char *index) {
     return index ? std::string(name) + "@" + index : std::string(name);
+}
+// How a line names an entry: by the given index, else by its own when the name has several
+// entries (so a duplicate shows which one it is), else by the name alone.
+inline std::string Label(const std::vector<Entry> &entries, const char *name, const char *index,
+                         const Entry &entry) {
+    if (index || entry.index.empty())
+        return Label(name, index);
+    const auto same = std::count_if(entries.begin(), entries.end(),
+                                    [&](const Entry &e) { return Is(e, name, nullptr); });
+    return Label(name, same > 1 ? entry.index.c_str() : nullptr);
 }
 // Locale-free: a digit 1-9 before any exponent.
 inline bool Nonzero(const std::string &number) {
@@ -120,10 +130,17 @@ inline unsigned Check(const std::string &text, std::vector<std::string> &lines) 
     const auto entries = Parse(text);
     std::string values = "Game config values: ";
     for (const auto &item : shown) {
-        const auto *entry = Find(entries, item.name, item.index);
         if (&item != shown)
             values += ", ";
-        values += Label(item.name, item.index) + "=" + (entry ? entry->value : "<missing>");
+        bool found = false;
+        for (const auto &entry : entries)
+            if (Is(entry, item.name, item.index)) {
+                values += std::string(found ? ", " : "") +
+                          Label(entries, item.name, item.index, entry) + "=" + entry.value;
+                found = true;
+            }
+        if (!found)
+            values += Label(item.name, item.index) + "=<missing>";
     }
     lines.push_back(values);
     unsigned warnings = 0;
@@ -137,8 +154,9 @@ inline unsigned Check(const std::string &text, std::vector<std::string> &lines) 
                 continue;
             found = true;
             if (Same(entry.value, rule.value) == rule.forbidden) {
-                lines.push_back("Game config warning: " + label + "=" + entry.value +
-                                "; INSTALLATION.txt requires " + wanted);
+                lines.push_back("Game config warning: " +
+                                Label(entries, rule.name, rule.index, entry) + "=" +
+                                entry.value + "; INSTALLATION.txt requires " + wanted);
                 ++warnings;
             }
         }

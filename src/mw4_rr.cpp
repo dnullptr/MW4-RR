@@ -964,12 +964,12 @@ static bool VrsGateAllows(const rrgameconfig::File &file) {
            rrvrsconfig::Allowed(file.text, file.readonly, true);
 }
 static bool VrsConfigAllowsRR() { return VrsGateAllows(ReadGameConfig()); }
-// Once per session, from LoadSettings. Logs and counts only: RR is never blocked by it.
-static unsigned ReportGameConfig() {
+// Once per session, from LoadSettings, with the file the RR gate read and its answer. Logs and
+// counts only: RR is never blocked by it.
+static unsigned ReportGameConfig(const rrgameconfig::File &file, bool gate_allows) {
     try {
-        const auto file = ReadGameConfig();
         std::vector<std::string> lines;
-        const auto warnings = rrgameconfig::Report(file, VrsGateAllows(file), lines);
+        const auto warnings = rrgameconfig::Report(file, gate_allows, lines);
         for (const auto &line : lines)
             WriteLog(line.c_str());
         return warnings;
