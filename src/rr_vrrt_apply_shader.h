@@ -10,12 +10,15 @@
 namespace rrapply {
 // Pinned native inputs: cs_vrrt_apply 6db012ccd3387024 and its older build 53958092126ea74a.
 // Their function bodies are identical; only the scene constant size differs.
+inline constexpr int Inputs = 2;
 inline int InputIndex(const void *data, size_t size) noexcept {
-    if (size == 7880 && rrsss::ShaderDigest(data, size,
-            "bc0f4944731d0221201e6f5ddcd40a4104d00fceeb0475d722c951b2a698df36"))
+    if (size == 7880 &&
+        rrsss::ShaderDigest(data, size,
+                            "bc0f4944731d0221201e6f5ddcd40a4104d00fceeb0475d722c951b2a698df36"))
         return 0;
-    if (size == 7848 && rrsss::ShaderDigest(data, size,
-            "f3a822565b2442d5c4913e96134a1602b8cb610fc391e5c7c8c681f7b11b2fb7"))
+    if (size == 7848 &&
+        rrsss::ShaderDigest(data, size,
+                            "f3a822565b2442d5c4913e96134a1602b8cb610fc391e5c7c8c681f7b11b2fb7"))
         return 1;
     return -1;
 }
@@ -61,8 +64,9 @@ inline bool Sha256Hex(const void *data, size_t size, char (&hex)[65]) noexcept {
 struct Prepared {
     std::array<std::shared_ptr<const std::vector<unsigned char>>, Variants> code;
     std::array<const char *, Variants> status{};
-    // Why a variant was refused: the missing anchor line, or the first round-trip difference.
-    std::string detail;
+    // Why each variant was refused: the missing anchor line, the compiler's first error line,
+    // or the first round-trip difference.
+    std::array<std::string, Variants> detail;
 };
 // The first line where two listings' code lines differ, for the log.
 inline std::string FirstDifference(const std::string &expected, const std::string &actual) {
@@ -110,7 +114,8 @@ inline Prepared BuildUnpinned(const void *native, size_t size, HMODULE module) n
             return result;
         auto disassemble = [&](const void *code, size_t bytes, std::string &text) {
             ComPtr<IDxcBlobEncoding> source, listing;
-            if (FAILED(library->CreateBlobWithEncodingFromPinned(code, UINT32(bytes), 0, &source)) ||
+            if (FAILED(
+                    library->CreateBlobWithEncodingFromPinned(code, UINT32(bytes), 0, &source)) ||
                 FAILED(compiler->Disassemble(source.Get(), &listing)) || !listing ||
                 listing->GetBufferSize() > 4 * 1024 * 1024)
                 return false;
@@ -120,6 +125,19 @@ inline Prepared BuildUnpinned(const void *native, size_t size, HMODULE module) n
         auto succeeded = [](IDxcOperationResult *op) {
             HRESULT status = E_FAIL;
             return op && SUCCEEDED(op->GetStatus(&status)) && SUCCEEDED(status);
+        };
+        // The first non-empty line of a failed operation's messages.
+        auto first_error = [](IDxcOperationResult *op) {
+            ComPtr<IDxcBlobEncoding> errors;
+            if (!op || FAILED(op->GetErrorBuffer(&errors)) || !errors)
+                return std::string();
+            const auto text = Plain(errors->GetBufferPointer(),
+                                    (std::min)(errors->GetBufferSize(), size_t(4096)));
+            const auto from = text.find_first_not_of("\n ");
+            if (from == std::string::npos)
+                return std::string();
+            return text.substr(from, (std::min)(text.find('\n', from), text.size()) - from)
+                .substr(0, 200);
         };
         std::string text;
         fail("shader-disassembly-failed");
@@ -131,29 +149,34 @@ inline Prepared BuildUnpinned(const void *native, size_t size, HMODULE module) n
             status = "shader-transformation-rejected";
             if (!Transform(edited, v)) {
                 if (const char *anchor = MissingAnchor(text))
-                    result.detail = std::string("missing line \"") + anchor + '"';
+                    result.detail[v] = std::string("missing line \"") + anchor + '"';
                 continue;
             }
             ComPtr<IDxcBlobEncoding> modified;
             ComPtr<IDxcOperationResult> assembled, validated;
             ComPtr<IDxcBlob> code;
             status = "shader-assembly-failed";
-            if (FAILED(library->CreateBlobWithEncodingOnHeapCopy(edited.data(), UINT32(edited.size()),
-                                                                 CP_UTF8, &modified)) ||
+            if (FAILED(library->CreateBlobWithEncodingOnHeapCopy(
+                    edited.data(), UINT32(edited.size()), CP_UTF8, &modified)) ||
                 FAILED(assembler->AssembleToContainer(modified.Get(), &assembled)) ||
-                !succeeded(assembled.Get()) || FAILED(assembled->GetResult(&code)) || !code)
+                !succeeded(assembled.Get()) || FAILED(assembled->GetResult(&code)) || !code) {
+                result.detail[v] = first_error(assembled.Get());
                 continue;
+            }
             status = "shader-validation-failed";
-            if (FAILED(validator->Validate(code.Get(), DxcValidatorFlags_InPlaceEdit, &validated)) ||
-                !succeeded(validated.Get()))
+            if (FAILED(
+                    validator->Validate(code.Get(), DxcValidatorFlags_InPlaceEdit, &validated)) ||
+                !succeeded(validated.Get())) {
+                result.detail[v] = first_error(validated.Get());
                 continue;
+            }
             std::string again;
             status = "shader-round-trip-mismatch";
             if (!disassemble(code->GetBufferPointer(), code->GetBufferSize(), again))
                 continue;
             if (const auto expected = CodeLines(edited), actual = CodeLines(again);
                 expected != actual) {
-                result.detail = FirstDifference(expected, actual);
+                result.detail[v] = FirstDifference(expected, actual);
                 continue;
             }
             const auto *bytes = static_cast<const unsigned char *>(code->GetBufferPointer());
@@ -165,8 +188,8 @@ inline Prepared BuildUnpinned(const void *native, size_t size, HMODULE module) n
         for (unsigned v = 1; v < Variants; ++v) {
             result.code[v].reset();
             result.status[v] = "shader-preparation-exception";
+            result.detail[v].clear();
         }
-        result.detail.clear();
     }
     return result;
 }
@@ -175,21 +198,37 @@ inline Prepared Build(const void *native, size_t size, HMODULE module) noexcept 
         return BuildUnpinned(nullptr, 0, nullptr);
     return BuildUnpinned(native, size, module);
 }
+// Pipeline creation only keeps a copy of a supported input, so the game's own path does no
+// compiler work. The variants are built the first time the test asks for one, once per input;
+// every pipeline built from that input shares the result.
 class ShaderCache {
     std::mutex mutex;
-    std::array<bool, 2> attempted{};
-    std::array<Prepared, 2> prepared;
+    std::array<std::vector<unsigned char>, Inputs> source;
+    std::array<bool, Inputs> attempted{};
+    std::array<Prepared, Inputs> prepared;
 
   public:
-    // A supported input is prepared once; every pipeline built from it shares the result.
-    Prepared Get(const void *native, size_t size, HMODULE module) {
+    // The input index of a supported native shader, or -1.
+    int Remember(const void *native, size_t size) {
         const int input = InputIndex(native, size);
         if (input < 0)
+            return -1;
+        std::lock_guard lock(mutex);
+        if (source[input].empty()) {
+            const auto *bytes = static_cast<const unsigned char *>(native);
+            source[input].assign(bytes, bytes + size);
+        }
+        return input;
+    }
+    Prepared Get(int input, HMODULE module) {
+        if (input < 0 || input >= Inputs)
             return Build(nullptr, 0, nullptr);
         std::lock_guard lock(mutex);
+        if (source[input].empty())
+            return Build(nullptr, 0, nullptr);
         if (!attempted[input]) {
             attempted[input] = true;
-            prepared[input] = Build(native, size, module);
+            prepared[input] = Build(source[input].data(), source[input].size(), module);
         }
         return prepared[input];
     }

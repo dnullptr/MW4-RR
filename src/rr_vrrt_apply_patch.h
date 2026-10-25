@@ -9,8 +9,8 @@ namespace rrapply {
 // lobes against tap 0 of the same pixel, so lobe 2's rays land on lobe 1's pixels. Lobe 1 is
 // never changed; each lobe keeps its native probability, ray counts and lists.
 enum Noise : unsigned { Shared, Separate, Opposite, NoiseCount };
-inline constexpr const char *noise_labels[NoiseCount] = {
-    "Off (both lobes share one draw)", "Separate draws", "Opposite draws"};
+inline constexpr const char *noise_labels[NoiseCount] = {"Off (both lobes share one draw)",
+                                                         "Separate draws", "Opposite draws"};
 inline std::atomic<unsigned> noise{};
 // Shifts the 128x128 noise texture by a fixed hashed offset per 128-pixel screen tile, so tiles
 // no longer repeat one pattern. Each pixel keeps the native per-texel sequence over time.
@@ -46,10 +46,13 @@ inline long long NowMs() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-// variant: what was selected for this apply dispatch; patched: whether its copy was bound.
+// Called for every apply dispatch while RR runs. variant: what was selected (0 = off);
+// patched: whether its copy was bound. last_variant is what actually ran, so a capture taken
+// after the test is turned off records the native shader.
 inline void Dispatched(unsigned variant, bool patched) {
     last_variant.store(patched ? variant : 0, std::memory_order_relaxed);
-    (patched ? last_patched : last_fallback).store(NowMs(), std::memory_order_relaxed);
+    if (variant)
+        (patched ? last_patched : last_fallback).store(NowMs(), std::memory_order_relaxed);
 }
 enum class State { Off, Active, Unavailable, Waiting };
 inline State Current(unsigned selected) {
@@ -144,7 +147,9 @@ inline bool Transform(std::string &text, unsigned variant) {
     // Lobe 2 draws with 1 - u, so its rays avoid lobe 1's: every Bernoulli rate is at most 1/2,
     // so the two hit sets are disjoint. Its rate is shrunk by 2^-16 so that a noise level lying
     // exactly at 1 - p counts as a miss, as level p does for the native draw; that keeps lobe 2's
-    // hit count per rate equal to the native one for the 8-bit noise.
+    // hit count per rate equal to the native one for the 8-bit noise. (Exactly so for a
+    // correctly rounded 1/k; a fast reciprocal 1 ulp high at k = 3, 5, 15 or 17, where 1/k is a
+    // noise level, gives the native draw one extra level of the 256.)
     if (n == Opposite &&
         !ReplaceLine(text, Draw,
                      "  %rrsel.second = icmp ne i32 %34, 0\n"
@@ -158,7 +163,8 @@ inline bool Transform(std::string &text, unsigned variant) {
         return true;
     // Per 128-pixel screen tile, a fixed toroidal offset hashed from the tile coordinate
     // (lowbias32), added to every tap's texel. The slice, and so each pixel's sequence over
-    // time, stays native.
+    // time, stays native. Neighbours across a tile edge now read unrelated texels, so the
+    // noise loses its stratification along those fixed edges.
     return ReplaceLine(text, EntryAnchor,
                        std::string(EntryAnchor) +
                            "\n"

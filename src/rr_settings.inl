@@ -271,8 +271,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     // Session-only: not saved, so a test mode never sticks across restarts.
     ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
     int ray_noise = static_cast<int>(rrapply::NoiseOf(rrapply::noise.load()));
-    if (ImGui::Combo("Ray draws per lobe", &ray_noise, rrapply::noise_labels,
-                     rrapply::NoiseCount))
+    if (ImGui::Combo("Ray draws per lobe", &ray_noise, rrapply::noise_labels, rrapply::NoiseCount))
         rrapply::noise = rrapply::NoiseOf(static_cast<unsigned>(ray_noise));
     bool ray_untile = rrapply::untile;
     if (ImGui::Checkbox("Break the 128-pixel noise repeat", &ray_untile))
@@ -299,8 +298,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "draws gives lobe 2 its own noise value. Opposite draws makes lobe 2's "
                        "rays avoid lobe 1's, so fewer pixels get no fresh ray at all. Either way "
                        "each lobe keeps the game's ray rate. The repeat break shifts the game's "
-                       "128-pixel noise tile differently in each 128-pixel block of the screen. "
-                       "Judge with frame generation off.");
+                       "128-pixel noise tile differently in each 128-pixel block of the screen, "
+                       "which can leave faint fixed lines along the block edges. The first switch "
+                       "to an option pauses the game briefly while its shader is built. Judge "
+                       "with frame generation off.");
     ImGui::Separator();
     if (changed) {
         ApplyEnabled();
