@@ -10,12 +10,14 @@ enum Source : unsigned {
     FillBoth,    // both lobes filled that way
     CapGentle,   // raw, each sample capped at 8x its lobe's native temporal luminance
     CapStrong,   // raw, capped at 4x
+    WFill,       // raw colour; 4th half unboosted where sampled, native elsewhere
+    WNative,     // raw colour; 4th half from native temporal everywhere
     Count
 };
 inline constexpr const char *labels[Count] = {
     "Off (raw lighting)", "Lobe 1 from native temporal", "Lobe 2 from native temporal",
     "Lobe 2 fill gaps", "Both lobes fill gaps", "Raw, cap bright samples (8x)",
-    "Raw, cap bright samples (4x)"};
+    "Raw, cap bright samples (4x)", "Raw, AO fix A (fill gaps)", "Raw, AO fix B (native)"};
 inline constexpr unsigned Valid(unsigned source) {
     return source < Count ? source : Raw;
 }

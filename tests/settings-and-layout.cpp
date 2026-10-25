@@ -26,6 +26,10 @@ static_assert(rrlighting::CapGentle == 5 && rrlighting::CapStrong == 6);
 static_assert(rrlighting::Valid(rrlighting::CapStrong) == rrlighting::CapStrong);
 static_assert(std::string_view(rrlighting::labels[rrlighting::CapStrong]) ==
               "Raw, cap bright samples (4x)");
+static_assert(rrlighting::WFill == 7 && rrlighting::WNative == 8 &&
+              rrlighting::Valid(rrlighting::WNative) == rrlighting::WNative);
+static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
+              "Raw, AO fix B (native)");
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");

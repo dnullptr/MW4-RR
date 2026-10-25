@@ -62,6 +62,21 @@ uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,uint2 native,bool history
  float f=float(inverse);v=min(v*float4(f,f,f,f*f),65504);
  uint4 h=f32tof16(v);return uint2(h.x|(h.y<<16),h.z|(h.w<<16));
 }
+// RR_W_SOURCE leaves a lobe's colour raw and boosted but replaces its 4th half,
+// which the game appears to use as an occlusion term after this pass, so the
+// boost cannot wash it out: 1 = the fresh unboosted value where a ray landed and
+// native temporal elsewhere, 2 = native temporal everywhere.
+#ifndef RR_W_SOURCE
+#define RR_W_SOURCE 0
+#endif
+uint2 KeepW(uint2 scaled,uint2 raw,bool fresh,uint2 native){
+#if RR_W_SOURCE
+ uint w=RR_W_SOURCE==1&&fresh?raw.y>>16:native.y>>16;
+ return uint2(scaled.x,(scaled.y&65535)|(w<<16));
+#else
+ return scaled;
+#endif
+}
 uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if RR_NATIVE_FILL
  float4 v=float4(f16tof32(raw.x&65535),f16tof32(raw.x>>16),f16tof32(raw.y&65535),f16tof32(raw.y>>16));
@@ -92,6 +107,7 @@ void main(uint3 id:SV_DispatchThreadID){
  bool a,b;
  uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,nc.xy,(nw>>20)!=0,a);
  uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,nc.zw,((nw>>8)&4095)!=0,b);
+ ca=KeepW(ca,c.xy,a,nc.xy);cb=KeepW(cb,c.zw,b,nc.zw);
  uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
 #if RR_NATIVE_LOBE&1
  bool fa;ca=SelectLobe(c.xy,(wt>>20)!=0,nc.xy,fa);
