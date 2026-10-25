@@ -277,15 +277,54 @@ int main() {
     rates[2 * rrdensity::Buckets + 6] = 1;
     density.Add(rates);
     assert(density.Density(0) == 1.0 && density.Density(1) == 0.25);
+    // Per screen pixel the 100 unrequested lobe 2 pixels count too: 25 rays over 200 pixels.
+    assert(density.ScreenDensity(0) == 1.0 && density.ScreenDensity(1) == 0.125);
     assert(density.Report(1000 + rrdensity::Tracker::Interval, report));
-    assert(report.find("lobe1 raysPerPixel=1.000 full=100.0%") != std::string::npos);
-    assert(report.find("lobe2 raysPerPixel=0.250 full=0.0% 1/2-1/4=50.0%") != std::string::npos);
-    assert(report.find("none=50.0% threshold=0") != std::string::npos);
-    assert(report.find("lobe1 raysPerPixel=1.000 full=100.0% 1/2-1/4=0.0% 1/5-1/8=0.0% "
-                       "1/9-1/15=0.0% 1/16+=0.0% none=0.0% threshold=7") != std::string::npos);
-    assert(report.find("clamp=1") != std::string::npos);
+    assert(report ==
+           "RR ray density (10s): frames=1"
+           " | lobe1 raysPerRequestedPixel=1.000 raysPerScreenPixel=1.000 noFreshRay=0.0% "
+           "allPixels[full=100.0% 1/2-1/4=0.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
+           "notRequested=0.0%] threshold=7 boundary=0"
+           " | lobe2 raysPerRequestedPixel=0.250 raysPerScreenPixel=0.125 noFreshRay=87.5% "
+           "allPixels[full=0.0% 1/2-1/4=50.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
+           "notRequested=50.0%] threshold=0 boundary=0"
+           " | enabled=0 promote=0 clamp=1");
     report.clear();
     assert(!density.Report(1000 + 2 * rrdensity::Tracker::Interval, report) && report.empty());
+
+    // Unrequested pixels set the per-requested and per-screen rates and no-fresh-ray share apart.
+    rrdensity::Tracker mixed;
+    assert(!mixed.Report(0, report));
+    rrdensity::Frame mix{};
+    mix[0] = 20, mix[1] = 10, mix[2] = 30, mix[5] = 20, mix[10] = 10, mix[16] = 10;
+    mix[rrdensity::Buckets] = 50, mix[rrdensity::Buckets + 3] = 50;
+    mix[2 * rrdensity::Buckets] = 16, mix[2 * rrdensity::Buckets + 1] = 28;
+    mix[2 * rrdensity::Buckets + 2] = ~0u, mix[2 * rrdensity::Buckets + 3] = 5;
+    mix[2 * rrdensity::Buckets + 4] = mix[2 * rrdensity::Buckets + 5] = 1;
+    mixed.Add(mix);
+    mixed.Add(mix); // a second identical frame leaves every rate and share unchanged
+    // Lobe 1: 10 + 15 + 4 + 1 + 0.625 rays over 80 requested of 100 pixels.
+    assert(mixed.Density(0) == 30.625 / 80 && mixed.ScreenDensity(0) == 0.30625);
+    assert(mixed.Report(rrdensity::Tracker::Interval, report));
+    assert(report ==
+           "RR ray density (10s): frames=2"
+           " | lobe1 raysPerRequestedPixel=0.383 raysPerScreenPixel=0.306 noFreshRay=69.4% "
+           "allPixels[full=10.0% 1/2-1/4=30.0% 1/5-1/8=20.0% 1/9-1/15=10.0% 1/16+=10.0% "
+           "notRequested=20.0%] threshold=16 boundary=28"
+           " | lobe2 raysPerRequestedPixel=0.333 raysPerScreenPixel=0.167 noFreshRay=83.3% "
+           "allPixels[full=0.0% 1/2-1/4=50.0% 1/5-1/8=0.0% 1/9-1/15=0.0% 1/16+=0.0% "
+           "notRequested=50.0%] threshold=-1 boundary=5"
+           " | enabled=1 promote=1 clamp=0");
+    // The longest numbers the budget fields can print still fit (this line outgrew 512 bytes).
+    rrdensity::Tracker widest;
+    assert(!widest.Report(0, report));
+    rrdensity::Frame extreme = mix;
+    for (unsigned i = 2 * rrdensity::Buckets; i < rrdensity::Count; ++i)
+        extreme[i] = 0x80000000u;
+    widest.Add(extreme);
+    assert(widest.Report(rrdensity::Tracker::Interval, report));
+    assert(report.size() > 512 && report.size() < 1024);
+    assert(report.ends_with(" | enabled=-2147483648 promote=-2147483648 clamp=-2147483648"));
 
     // Water responsivity needs preset F, a nonzero strength and this frame's water.
     rrwater::Settings water;
