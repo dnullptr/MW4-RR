@@ -772,6 +772,11 @@ class Controller {
             h.water_guide = water.guide;
             // One RR history, so one feature and one depth type for the whole run.
             h.weapon_depth = done[0].meta.linear_depth;
+            h.sky_edge_enabled = rrskyedge::enabled.load(std::memory_order_relaxed);
+            h.sky_edge_strength =
+                rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
+            h.sky_edge_radius =
+                rrskyedge::ClampRadius(rrskyedge::radius.load(std::memory_order_relaxed));
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {
@@ -1998,8 +2003,19 @@ class Controller {
             if (capture.Active())
                 captured = CaptureLocked(*s, cl.Get(), resources, evaluated,
                                          reset || color_scale_changed, projection);
-            if (captured)
-                s->captured.meta.linear_depth = weapon_on;
+            if (captured) {
+                auto &m = s->captured.meta;
+                m.linear_depth = weapon_on;
+                m.color_scale = color_on ? color_scale : 1.0f;
+                m.guide_test = s->gpu.guide_test;
+                m.depth_floor = depth_on ? rrguidetest::DepthFloor : 0.0f;
+                m.responsivity_source = sky_edge_on           ? rrcapture::SkyEdgeMask
+                                        : water_responsivity  ? rrcapture::WaterMask
+                                        : responsivity_active ? rrcapture::SssMask
+                                                              : rrcapture::NoMask;
+                if (color_scale_changed)
+                    m.reset_reasons |= rrcapture::ColorScaleReset;
+            }
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {

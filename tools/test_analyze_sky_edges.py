@@ -345,6 +345,32 @@ class SyntheticCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             ase.analyze(manifest, frames, tmp)
 
+    def test_tree_tests_undone(self):
+        # Color brightness test (1/16) on every other frame and the sky depth floor on all: the
+        # analysis undoes both, so every verdict matches the clean capture.
+        manifest, frames = make_capture_with_output()
+        for i, (meta, frame) in enumerate(zip(manifest['frames'], frames)):
+            if i % 2:
+                meta['color_scale'] = 0.0625
+                frame['color'] = frame['color'] * np.float32(0.0625)
+                frame['rr_output'] = frame['rr_output'] * np.float32(0.0625)
+            meta['depth_floor'] = 1e-7
+            meta['responsivity_source'] = 'sky_edge'
+            frame['depth'] = np.where(frame['depth'] == 0, np.float32(1e-7), frame['depth'])
+        reference, original = make_capture_with_output()
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = ase.analyze(reference, original, tmp)
+            m = ase.analyze(manifest, frames, tmp)
+            report = (Path(tmp) / 'report.md').read_text()
+        self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                         {k: verdict(expected, k) for k in expected['verdicts']})
+        self.assertTrue(any('frames [1, 3, 5, 7]' in n for n in m['capture']['tests']))
+        self.assertIn('depth <= depth_floor treated as sky', report)
+        self.assertIn('responsivity mask from: sky_edge', report)
+        self.assertEqual(expected['capture']['tests'], [])
+        # The caller's arrays are left alone.
+        self.assertTrue((frames[0]['depth'] > 0).all())
+
     def test_a_consistent_inputs(self):
         m = self.clean
         self.assertEqual(verdict(m, 'H1'), 'supports')
