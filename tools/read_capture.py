@@ -6,8 +6,9 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
-Test passes that change RR's inputs (color_scale, depth_floor, and linear_depth: weapon depth's
-linear view depth): undo them with tools/analyze_sky_edges.py undo_tests(manifest, frames).
+Test passes that change RR's inputs (color_scale, contrast_knee, depth_floor, and linear_depth:
+weapon depth's linear view depth): undo them with tools/analyze_sky_edges.py undo_tests(manifest,
+frames).
 """
 import argparse
 import json
@@ -37,7 +38,7 @@ MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
 # The same, on the lighting input line, when every frame has one value.
 MASKED_ALL = {True: 'SSS guide applied', False: 'SSS guide missing on every frame: raw lighting'}
 # Per-frame test settings and their off values; the summary shows only the ones that are on.
-FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
+FRAME_TESTS = {'color_scale': 1, 'contrast_knee': 0, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
                'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
 
 

@@ -11,6 +11,8 @@
 #include "../src/rr_responsivity.h"
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
+#include "../src/rr_contrast_test.h"
+#include "../src/rr_guide_test.h"
 #include "../src/rr_specular_distance.h"
 #include "../src/rr_trace_model.h"
 #include "../src/rr_hit_condition.h"
@@ -395,6 +397,43 @@ int main() {
         int e{};
         assert(std::frexp(rrcolorscale::Factor(m), &e) == 0.5f && rrcolorscale::Factor(m) != 1.0f);
     }
+    // Contrast test: off and an out-of-range mode leave the color alone, each mode
+    // compresses more than the one before, compressing never brightens, and expanding
+    // gives the color back, from near black to FP16's largest value.
+    static_assert(rrcontrast::Knee(rrcontrast::Off) == 0.0f &&
+                  rrcontrast::Knee(rrcontrast::Count) == 0.0f);
+    assert(rrcontrast::CompressFactor(4.67f, 0.0f) == 1.0f &&
+           rrcontrast::ExpandFactor(4.67f, 0.0f) == 1.0f &&
+           rrcontrast::CompressFactor(0.0f, 1.0f) == 1.0f &&
+           rrcontrast::ExpandFactor(-1.0f, 1.0f) == 1.0f);
+    float previous_ratio = 28.0f;
+    for (unsigned m = 1; m < rrcontrast::Count; ++m) {
+        const float k = rrcontrast::Knee(m);
+        assert(k > 0 && (m == 1 || k < rrcontrast::Knee(m - 1)));
+        for (float v : {1e-9f, 1e-6f, 1e-4f, 0.002f, 0.0125f, 0.164f, 1.0f, 4.67f, 103.0f,
+                        65504.0f}) {
+            const float t = v * rrcontrast::CompressFactor(v, k);
+            assert(t > 0 && t <= v);
+            assert(std::abs(t * rrcontrast::ExpandFactor(t, k) - v) <= 2e-5f * v);
+        }
+        // With the brightness test at 16x, the game's largest value still comes back.
+        const float big = 65504.0f * 16;
+        const float tb = big * rrcontrast::CompressFactor(big, k);
+        assert(std::abs(tb * rrcontrast::ExpandFactor(tb, k) - big) <= 1e-4f * big);
+        // Sky over needles, 28x in the capture this test was made for.
+        const float ratio = (4.67f * rrcontrast::CompressFactor(4.67f, k)) /
+                            (0.164f * rrcontrast::CompressFactor(0.164f, k));
+        assert(ratio < previous_ratio && ratio > 1.0f);
+        previous_ratio = ratio;
+    }
+    assert(previous_ratio < 4.0f);
+    // Sky distance for the sky surface guide test: the first entry is the earlier test's
+    // floor, each later one puts the sky nearer, and an out-of-range entry falls back.
+    static_assert(rrguidetest::DepthFloor(rrguidetest::VeryFar) == 1e-7f &&
+                  rrguidetest::DepthFloor(rrguidetest::FloorCount) == 1e-7f);
+    for (unsigned f = 1; f < rrguidetest::FloorCount; ++f)
+        assert(rrguidetest::DepthFloor(f) > rrguidetest::DepthFloor(f - 1) &&
+               rrguidetest::DepthFloor(f) < 1.0f);
     assert(rrvrsconfig::Allowed("VRS@0;123 = true // preserved\n", true, true));
     assert(rrvrsconfig::Allowed("VRS@0;123 = false\n", true, true));
     assert(!rrvrsconfig::Allowed("VRS@0;123 = true\n", false, true));

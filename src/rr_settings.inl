@@ -9,6 +9,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_contrast_test.h"
 #include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
@@ -303,6 +304,53 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "guide and RR's output, to mw4-rr-captures in the game folder. About 50 "
                        "bytes per render pixel plus 8 per output pixel, per frame. Session only.");
     ImGui::Separator();
+    ImGui::TextUnformatted("Tree noise tests");
+    // Session-only: not saved, so a test mode never sticks across restarts.
+    unsigned guide_test = rrguidetest::Valid(rrguidetest::mode);
+    if (OptionCombo("Guide test (thin geometry)", guide_test, rrguidetest::labels,
+                    rrguidetest::panel, guide_test)) {
+        rrguidetest::mode = guide_test;
+        ++rrguidetest::changes;
+    }
+    if (guide_test == rrguidetest::SkySurface) {
+        int sky_distance = static_cast<int>(rrguidetest::ValidFloor(rrguidetest::floor));
+        if (ImGui::Combo("Sky distance", &sky_distance, rrguidetest::floor_labels,
+                         rrguidetest::FloorCount)) {
+            rrguidetest::floor = rrguidetest::ValidFloor(static_cast<unsigned>(sky_distance));
+            ++rrguidetest::changes;
+        }
+        ImGui::TextWrapped("How far away RR sees the sky, in game units. Hills sit a few times "
+                           "farther than the trees in front of them; normally the sky is "
+                           "infinitely far. Scenery past the chosen distance ends up behind "
+                           "the sky for RR, so judge trees close by.");
+        const auto floor = LiveRR().DepthFloorTest();
+        ImGui::Text("Sky depth floor: %s",
+                    floor == TestState::Active    ? "active"
+                    : floor == TestState::Blocked ? "off: not enough GPU memory (switch to "
+                                                    "another mode and back to retry)"
+                    : !rr_running                 ? "waiting for RR"
+                                                  : "waiting");
+    }
+    int contrast = static_cast<int>(rrcontrast::Valid(rrcontrast::mode));
+    if (ImGui::Combo("Color contrast test", &contrast, rrcontrast::labels, rrcontrast::Count)) {
+        rrcontrast::mode = rrcontrast::Valid(static_cast<unsigned>(contrast));
+        ++rrcontrast::changes;
+    }
+    const auto squeeze = LiveRR().ContrastTest();
+    ImGui::Text("Color contrast test: %s",
+                squeeze == TestState::Active    ? "active"
+                : contrast == 0                 ? "off"
+                : squeeze == TestState::Blocked ? "off: not enough GPU memory (change the "
+                                                  "setting to retry)"
+                : !rr_running                   ? "waiting for RR"
+                                                : "waiting");
+    ImGui::TextWrapped("Session-only test. Squeezes bright colors before RR and stretches RR's "
+                       "output back, so the sky behind branches is only a few times brighter "
+                       "than the needles for RR instead of about 28x. Shows whether the tree "
+                       "flicker follows that contrast. Stronger settings can darken noisy, "
+                       "bright spots a little. The SSS and transparency guides are left out "
+                       "while on.");
+    ImGui::Separator();
     ImGui::TextUnformatted("Running water experiments (this session only)");
     // Session-only: not saved, so a test mode never sticks across restarts.
     static rrwater::Settings water;
@@ -426,22 +474,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::Separator();
     // Tests already judged, kept for comparisons; collapsed by default.
     if (ImGui::CollapsingHeader("Older tests", 0)) {
-        // Session-only: not saved, so a test mode never sticks across restarts.
-        unsigned guide_test = rrguidetest::Valid(rrguidetest::mode);
-        if (OptionCombo("Guide test (thin geometry)", guide_test, rrguidetest::labels,
-                        rrguidetest::panel, guide_test)) {
-            rrguidetest::mode = guide_test;
-            ++rrguidetest::changes;
-        }
-        if (rrguidetest::Valid(guide_test) == rrguidetest::SkySurface) {
-            const auto floor = LiveRR().DepthFloorTest();
-            ImGui::Text("Sky depth floor: %s", floor == TestState::Active ? "active"
-                                               : floor == TestState::Blocked
-                                                   ? "off: not enough GPU memory (switch to "
-                                                     "another mode and back to retry)"
-                                               : !rr_running ? "waiting for RR"
-                                                             : "waiting");
-        }
         if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
             rrskyedge::enabled = sky_edge;
             ++rrskyedge::changes;

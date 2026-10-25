@@ -157,17 +157,42 @@ struct ControllerCpuTest {
         t.blocked = false;
         t.active = true;
         assert(c.Test(t, 4, true) == Controller::TestState::Idle); // RR not running
+        // The contrast and brightness tests share the color copy: a blocked copy is
+        // reported for the contrast test too, until either setting changes.
+        const bool was_enabled = c.enabled;
+        c.enabled = true;
+        c.feature = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        c.color_test.blocked = true;
+        c.color_test.changes = Controller::ColorChanges();
+        rrcontrast::mode = rrcontrast::Medium;
+        assert(c.ContrastTest() == Controller::TestState::Blocked);
+        ++rrcolorscale::changes;
+        assert(c.ContrastTest() == Controller::TestState::Idle);
+        c.color_test.changes = Controller::ColorChanges();
+        assert(c.ContrastTest() == Controller::TestState::Blocked);
+        ++rrcontrast::changes;
+        assert(c.ContrastTest() == Controller::TestState::Idle);
+        c.color_test.blocked = false;
+        c.color_test.active = true;
+        assert(c.ContrastTest() == Controller::TestState::Active);
+        rrcontrast::mode = rrcontrast::Off;
+        assert(c.ContrastTest() == Controller::TestState::Idle);
+        c.color_test.active = false;
+        c.feature = nullptr;
+        c.enabled = was_enabled;
         // Reconfigure gives back only the reserve the test textures added.
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
         c.hit_scratch.active = true;
         c.applied_color_scale = 4.0f;
+        c.applied_contrast_knee = 0.25f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
         assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
-               !c.hit_scratch.active && c.applied_color_scale == 1.0f);
+               !c.hit_scratch.active && c.applied_color_scale == 1.0f &&
+               c.applied_contrast_knee == 0.0f);
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();

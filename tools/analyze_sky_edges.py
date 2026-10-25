@@ -8,6 +8,7 @@ Tests these hypotheses on the captured frames (verdicts at the top of report.md)
   H5 input colour flicker               H6 bad values (NaN, Inf, negative, huge)
   H7 jitter does not match the image    H8 stochastic coverage (per-frame dither)
   H9 HDR scale of the sky against the geometry next to it
+  H10 coarse shading (VRS): edges snapped to a 2 or 4 px grid, or pixel pairs shaded once
 CLI:  python3 analyze_sky_edges.py CAPTURE_FOLDER --out OUT_DIR [--radius 2] [--crop x,y,w,h]
 API:  analyze(manifest, frames, out_dir, radius=2, crop=None) -> metrics dict, where
       manifest, frames are what read_capture.load(folder) returns.
@@ -99,6 +100,24 @@ H8_TILE_MIN_FLIPS = 50      # static flips (summed over all frame pairs) a tile 
 H8_SUPPORT_TILE_FRACTION, H8_AGAINST_TILE_FRACTION = 0.25, 0.10  # flips in dither-like tiles
 H9_SKY_RATIO = 20.0         # sky median / sky-edge non-sky median for a "supports (lead)"
 H9_BRIGHT_RANK = 0.99       # sky-edge sky pixels brighter than this share of non-sky pixels
+# H10: coarse shading (VRS). A b-px block (along x, or along y) is "mixed" when it holds sky and
+# non-sky. Edges a pixel shader decides (alpha-tested leaves: discard is per coarse pixel) snap to
+# the coarse grid, so one grid phase has far fewer mixed blocks than the others; rasterised edges
+# (terrain, wires) do not snap. Pairs of same-surface non-sky pixels with identical values show
+# coarse shading of the colour or the G-buffer guides.
+H10_BLOCKS = (2, 4)
+H10_MIN_MIXED = 200         # mixed blocks (all phases, all frames) per axis a global ratio needs
+H10_SUPPORT_RATIO, H10_AGAINST_RATIO = 0.75, 0.85  # best phase / median of the other phases
+H10_TILE = 32               # px; tiles find snapped foliage among unsnapped terrain and wires
+H10_TILE_MIN_MIXED = 40     # mixed 2-px blocks per axis a tile needs
+H10_TILE_SNAP = 0.5         # tile ratio at or below this, in x and in y, at one phase pair
+H10_SUPPORT_TILE_SHARE, H10_AGAINST_TILE_SHARE = 0.25, 0.10   # of the mixed 2-px blocks
+CONTRAST_SERIES_LIMIT, CONTRAST_MAX_EXPONENT = 0.01, 18.0   # src/rr_contrast_test.h
+H10_TILE_CONTROL = 3.0      # best phase pair's tile share over the best other pair (chance)
+H10_EQUAL_EXCESS, H10_EQUAL_RATIO = 0.10, 2.0   # identical pairs, best minus other phase / ratio
+H10_EQUAL_AGAINST = 0.02
+H10_MIN_PAIRS = 500         # same-surface pairs per phase an equality rate needs
+H10_CHANNELS = ('color', 'diffuse_albedo', 'normal_roughness', 'specular_albedo')
 
 # Region flags, one uint8 map per frame.
 VALID, SKY, SKY_BAND, HILL_BAND, BOUNDARY, HILL_EDGE = 1, 2, 4, 8, 16, 32
@@ -1100,6 +1119,125 @@ def hdr_scale_analysis(manifest, frames, regions, local):
     return out
 
 
+# ---- H10: coarse shading (VRS) -------------------------------------------------------------
+
+def _blocks(array, axis, size, phase):
+    """array (H, W, ...) cut into size-px blocks along axis starting at phase: (H', k, size, ...),
+    plus each block's first pixel coordinate along that axis (k,)."""
+    a = np.swapaxes(array, 0, 1) if axis == 0 else array
+    k = (a.shape[1] - phase) // size
+    cut = a[:, phase:phase + size * k]
+    return cut.reshape((a.shape[0], k, size) + a.shape[2:]), phase + size * np.arange(k)
+
+
+def mixed_blocks(frames, regions, axis, size, tile=H10_TILE):
+    """Mixed (sky and non-sky) blocks per phase, summed over frames, and per tile
+    (tiles_y, tiles_x, phase) for that axis."""
+    h, w = frames[0]['depth'].shape
+    counts = np.zeros(size, np.int64)
+    per_tile = np.zeros(((h + tile - 1) // tile, (w + tile - 1) // tile, size), np.int64)
+    for reg in regions:
+        for p in range(size):
+            sky, start = _blocks(has(reg, SKY), axis, size, p)
+            valid, _ = _blocks(has(reg, VALID), axis, size, p)
+            mixed = valid.all(-1) & sky.any(-1) & ~sky.all(-1)      # (rows, k)
+            counts[p] += int(mixed.sum())
+            rows, cols = np.nonzero(mixed)
+            along, across = start[cols] // tile, rows // tile
+            ty, tx = (across, along) if axis == 1 else (along, across)
+            np.add.at(per_tile, (ty, tx, p), 1)
+    return counts, per_tile
+
+
+def phase_ratio(counts):
+    """(best phase, best / median of the other phases); ratio None without counts."""
+    best = int(np.argmin(counts))
+    others = np.delete(counts, best)
+    median = float(np.median(others))
+    return best, (float(counts[best]) / median if median > 0 else None)
+
+
+def equal_pairs(frames, regions, axis):
+    """Identical same-surface non-sky pixel pairs (2-px blocks along axis) per channel, per
+    region (sky-edge band, interior) and phase: {channel: {region: [[equal, pairs] per phase]}}."""
+    out = {}
+    for name in H10_CHANNELS:
+        if not all(name in f for f in frames):
+            continue
+        rows = {'sky_edge_band': [[0, 0], [0, 0]], 'interior': [[0, 0], [0, 0]]}
+        for frame, reg in zip(frames, regions):
+            values = frame[name]
+            if values.ndim == 2:
+                values = values[..., None]
+            solid = has(reg, VALID) & ~has(reg, SKY)
+            depth = np.where(solid, frame['depth'], np.nan).astype(np.float64)
+            band, interior = has(reg, SKY_BAND) & solid, interior_mask(reg)
+            for p in range(2):
+                v, _ = _blocks(values, axis, 2, p)
+                d, _ = _blocks(depth, axis, 2, p)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    same = np.maximum(d[..., 0] / d[..., 1], d[..., 1] / d[..., 0]) <= SAME_SURFACE_RATIO
+                equal = same & np.all(v[:, :, 0] == v[:, :, 1], axis=-1)
+                for key, mask in (('sky_edge_band', band), ('interior', interior)):
+                    m, _ = _blocks(mask, axis, 2, p)
+                    pair = same & m.any(-1)
+                    rows[key][p][0] += int((equal & pair).sum())
+                    rows[key][p][1] += int(pair.sum())
+        out[name] = rows
+    return out
+
+
+def equality_excess(phases):
+    """[[equal, pairs] per phase] -> (rates, excess = best - other, ratio) or Nones when a phase
+    has fewer than H10_MIN_PAIRS pairs."""
+    if min(n for _, n in phases) < H10_MIN_PAIRS:
+        return None, None, None
+    rates = [e / n for e, n in phases]
+    hi, lo = max(rates), min(rates)
+    return rates, hi - lo, hi / max(lo, 1e-3)
+
+
+def coarse_shading_analysis(frames, regions):
+    """H10: does the sky/non-sky boundary snap to a coarse (2 or 4 px) grid, and are same-surface
+    pixel pairs identical on one grid phase only?"""
+    axes = {}
+    for axis, label in ((1, 'x'), (0, 'y')):
+        per = {}
+        for size in H10_BLOCKS:
+            counts, per_tile = mixed_blocks(frames, regions, axis, size)
+            best, ratio = phase_ratio(counts)
+            per[size] = {'counts': counts.tolist(), 'best_phase': best, 'ratio': ratio,
+                         'tiles': per_tile if size == 2 else None}
+        axes[label] = per
+    # Tiles snapped in x and in y, per 2-px phase pair. A VRS grid is one screen grid, so its
+    # tiles all land in one pair; static rasterised edges that snap by chance spread over all
+    # four, which the other pairs measure (the control). The pair is chosen from the tiles, not
+    # the frame-wide counts, which one long straight edge can tip.
+    tx, ty = axes['x'][2].pop('tiles'), axes['y'][2].pop('tiles')
+    axes['x'][4].pop('tiles'), axes['y'][4].pop('tiles')
+    enough = (tx.sum(-1) >= H10_TILE_MIN_MIXED) & (ty.sum(-1) >= H10_TILE_MIN_MIXED)
+    mixed = tx.sum(-1) + ty.sum(-1)
+    total = int(mixed.sum())
+    pairs = {}
+    for px in (0, 1):
+        for py in (0, 1):
+            with np.errstate(invalid='ignore', divide='ignore'):
+                rx = tx[..., px] / tx[..., 1 - px]
+                ry = ty[..., py] / ty[..., 1 - py]
+            snapped = enough & (rx <= H10_TILE_SNAP) & (ry <= H10_TILE_SNAP)
+            pairs[(px, py)] = (snapped, (float(mixed[snapped].sum()) / total) if total else 0.0)
+    best = max(pairs, key=lambda k: pairs[k][1])
+    snapped, share = pairs[best]
+    control = max(v[1] for k, v in pairs.items() if k != best)
+    equal = {label: equal_pairs(frames, regions, axis) for axis, label in ((1, 'x'), (0, 'y'))}
+    return {'axes': axes, 'tiles_fitted': int(enough.sum()), 'tiles_snapped': int(snapped.sum()),
+            'tile_phase': list(best), 'snapped_tile_share': share if total else None,
+            'control_tile_share': control if total else None,
+            'phase_pair_shares': {f'{k[0]}{k[1]}': v[1] for k, v in pairs.items()},
+            'snapped_tiles': [[int(y) * H10_TILE, int(x) * H10_TILE] for y, x in zip(*np.nonzero(snapped))][:20],
+            'mixed_2px_blocks': total, 'equal_pairs': equal}
+
+
 # ---- optional inputs: value ranges ---------------------------------------------------------
 
 def optional_input_ranges(frames, regions):
@@ -1575,12 +1713,68 @@ def verdict_h9(m):
     return v, text
 
 
+def h10_equality(h):
+    """Per channel and region: (rates x, rates y, min excess over x and y, min ratio)."""
+    out = {}
+    for name in H10_CHANNELS:
+        for region in ('sky_edge_band', 'interior'):
+            if name not in h['equal_pairs']['x']:
+                continue
+            ex = equality_excess(h['equal_pairs']['x'][name][region])
+            ey = equality_excess(h['equal_pairs']['y'][name][region])
+            if ex[0] is None or ey[0] is None:
+                continue
+            out[(name, region)] = (ex[0], ey[0], min(ex[1], ey[1]), min(ex[2], ey[2]), max(ex[1], ey[1]))
+    return out
+
+
+def verdict_h10(m):
+    h = m['H10']
+    ratios = {}
+    for label in ('x', 'y'):
+        for size in H10_BLOCKS:
+            a = h['axes'][label][size]
+            if sum(a['counts']) >= H10_MIN_MIXED and a['ratio'] is not None:
+                ratios[f'{size} px along {label}'] = (a['ratio'], a['best_phase'])
+    eq = h10_equality(h)
+    share, control = h['snapped_tile_share'], h.get('control_tile_share') or 0.0
+    coarse = [f"{n} ({r.replace('_', ' ')}) {pct(rx[0])}/{pct(rx[1])} along x, {pct(ry[0])}/{pct(ry[1])} along y"
+              for (n, r), (rx, ry, lo, ratio, hi) in eq.items() if lo >= H10_EQUAL_EXCESS and ratio >= H10_EQUAL_RATIO]
+    text = (f"best-phase / other-phase mixed sky-edge blocks: "
+            f"{', '.join(f'{k} {num(r, 2)} (phase {p})' for k, (r, p) in ratios.items()) or 'too few edges'}; "
+            f"{h['tiles_snapped']} of {h['tiles_fitted']} {H10_TILE}-px tiles snapped to the 2-px grid in x and y "
+            f"at phase {tuple(h.get('tile_phase') or ())}, holding {pct(share)} of the mixed blocks (best other "
+            f"phase pair, the chance level: {pct(control)}); identical same-surface pairs on one grid phase only: "
+            f"{'; '.join(coarse) or 'none'}. Only edges a pixel shader decides (alpha-tested leaves) snap to the "
+            f"VRS grid; static rasterised edges snap by chance and spread over all four phase pairs, so a low "
+            f"excess can still be real in a scene with few trees. Threshold: supports if a ratio <= "
+            f"{H10_SUPPORT_RATIO} with a tile excess over chance >= {pct(H10_AGAINST_TILE_SHARE)}, or an excess >= "
+            f"{pct(H10_SUPPORT_TILE_SHARE)}, both with the best pair >= {H10_TILE_CONTROL:g}x the chance level, "
+            f"or a channel identical on one phase (excess >= {pct(H10_EQUAL_EXCESS)} and x{H10_EQUAL_RATIO:g} in "
+            f"x and y); against if every ratio >= {H10_AGAINST_RATIO}, tile excess < {pct(H10_AGAINST_TILE_SHARE)} "
+            f"and no equality excess >= {pct(H10_EQUAL_AGAINST)}.")
+    if not ratios and not eq:
+        return 'inconclusive', 'too few sky edges and pixel pairs. ' + text
+    low = min((r for r, _ in ratios.values()), default=None)
+    share = share or 0.0
+    excess = share - control
+    above_chance = share >= H10_TILE_CONTROL * control
+    if coarse or (above_chance and (excess >= H10_SUPPORT_TILE_SHARE or
+                                    (low is not None and low <= H10_SUPPORT_RATIO and
+                                     excess >= H10_AGAINST_TILE_SHARE))):
+        return 'supports', text
+    if (low is None or low >= H10_AGAINST_RATIO) and excess < H10_AGAINST_TILE_SHARE and \
+            all(hi < H10_EQUAL_AGAINST for (_, _, _, _, hi) in eq.values()):
+        return 'against', text
+    return 'inconclusive', text
+
+
 HYPOTHESES = {'H0': ('RR output noise at sky edges', verdict_h0),
               'H1': ('class flicker', verdict_h1), 'H2': ('inconsistent inputs at the edge', verdict_h2),
               'H3': ('depth bleed', verdict_h3), 'H4': ('motion mismatch', verdict_h4),
               'H5': ('input colour flicker', verdict_h5), 'H6': ('bad values', verdict_h6),
               'H7': ('jitter mismatch', verdict_h7), 'H8': ('stochastic coverage', verdict_h8),
-              'H9': ('HDR scale', verdict_h9)}
+              'H9': ('HDR scale', verdict_h9), 'H10': ('coarse shading (VRS)', verdict_h10)}
 
 
 def verdicts(metrics):
@@ -2040,6 +2234,20 @@ def report_text(m):
                                           for k in ('sky', 'sky_edge_non_sky', 'interior_non_sky')]), '',
             f"pre_exposure per frame: {h9['pre_exposure']}; exposure_scale: {h9['exposure_scale']}.", '']
 
+    h10 = m['H10']
+    rows = [[f"{size} px along {label}", ' / '.join(map(str, a['counts'])), a['best_phase'], num(a['ratio'], 2)]
+            for label in ('x', 'y') for size, a in h10['axes'][label].items()]
+    out += ['## H10 coarse shading (VRS)', '', 'Mixed (sky and non-sky) blocks per grid phase, all frames:', '',
+            table(['blocks', 'mixed per phase', 'best phase', 'best / median other'], rows), '']
+    rows = []
+    for (name, region), (rx, ry, lo, ratio, hi) in h10_equality(h10).items():
+        rows.append([name, region.replace('_', ' '), ' / '.join(pct(r) for r in rx), ' / '.join(pct(r) for r in ry)])
+    if rows:
+        out += ['Identical same-surface non-sky pixel pairs per 2-px grid phase:', '',
+                table(['channel', 'region', 'along x (phase 0 / 1)', 'along y (phase 0 / 1)'], rows), '']
+    if h10['snapped_tiles']:
+        out += ['Snapped tiles (top-left y, x): ' + ', '.join(f'({y}, {x})' for y, x in h10['snapped_tiles']) + '.', '']
+
     if m['optional_inputs']:
         rows = [[name, region] + ([num(val[k]) for k in ('min', 'median', 'max')] if val else ['-'] * 3)
                 for name, regions in m['optional_inputs'].items() for region, val in regions.items()]
@@ -2074,6 +2282,16 @@ GUIDE_TESTS = {1: 'flip back-facing normals', 2: 'all normals face the camera',
                8: 'sky normals + non-zero sky depth', 9: 'sky roughness 0'}
 
 
+def expand_contrast(rgb, knee):
+    """Undo the contrast test's compression (src/rr_contrast_test.h ExpandFactor) on an RGB
+    float32 array, in place."""
+    t = rgb.max(axis=-1)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        y = np.minimum(t / np.float32(knee), np.float32(CONTRAST_MAX_EXPONENT))
+        factor = np.where(y < CONTRAST_SERIES_LIMIT, 1 + y * (0.5 + y / 6), np.expm1(y) / y)
+    rgb *= np.where(t > 0, factor, 1).astype(np.float32)[..., None]
+
+
 def hardware_depth(depth, mapping, sky_depth=0.0):
     """Weapon depth's linear view depth back to the game's hardware depth, in float32 as
     src/rr_weapon_depth.h Hardware: mapping is a frame's linear_depth (world depth = scale /
@@ -2097,7 +2315,7 @@ def hardware_depth(depth, mapping, sky_depth=0.0):
 def undo_tests(manifest, frames):
     """Frames captured with a tree-noise test or weapon depth on, brought back to the game's
     values: color and rr_output RGB divided by the frame's color_scale (the color copy's constant
-    alpha dropped), linear depth (a frame's linear_depth mapping) back to hardware depth, and sky
+    alpha dropped; contrast_knee expanded first), linear depth (a frame's linear_depth mapping) back to hardware depth, and sky
     depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged frames
     are the same objects."""
     if (manifest.get('settings') or {}).get('weapon_depth') and \
@@ -2107,23 +2325,30 @@ def undo_tests(manifest, frames):
                          'with weapon depth off, or with a newer build')
     entries = manifest.get('frames') or []
     out, scaled, floored, linear, sources, guides = [], [], [], [], set(), {}
+    squeezed = []
     for i, frame in enumerate(frames):
         meta = entries[i] if i < len(entries) else {}
         scale = meta.get('color_scale') or 1.0
+        knee = meta.get('contrast_knee') or 0.0
         floor = meta.get('depth_floor') or 0.0
         mapping = meta.get('linear_depth')
         sources.add(meta.get('responsivity_source') or 'unknown')
         guides.setdefault(meta.get('guide_test'), []).append(i)
-        if scale != 1.0 or floor > 0 or mapping:
+        if scale != 1.0 or knee > 0 or floor > 0 or mapping:
             frame = dict(frame)
         if mapping:
             linear.append(i)
             frame['depth'] = hardware_depth(frame['depth'], mapping, floor)
+        if knee > 0:
+            squeezed.append(i)
         if scale != 1.0:
             scaled.append(i)
+        if scale != 1.0 or knee > 0:
             for name in ('color', 'rr_output'):
                 if name in frame:
                     a = frame[name].astype(np.float32, copy=True)
+                    if knee > 0:
+                        expand_contrast(a[..., :3], knee)
                     a[..., :3] /= np.float32(scale)
                     # The scaled copy is RGBA32F with alpha 1; the game's color has no alpha.
                     frame[name] = a[..., :3] if name == 'color' else a
@@ -2137,6 +2362,9 @@ def undo_tests(manifest, frames):
     if scaled:
         notes.append(f'color brightness test on in frames {scaled}: color and rr_output divided by '
                      'their color_scale (the SSS and transparency guides were withheld)')
+    if squeezed:
+        notes.append(f'color contrast test on in frames {squeezed}: color and rr_output expanded by '
+                     'their contrast_knee (the SSS and transparency guides were withheld)')
     if linear:
         notes.append(f'weapon depth on in frames {linear}: linear view depth converted back to hardware '
                      'depth')
@@ -2197,6 +2425,7 @@ def analyze(manifest, frames, out_dir, radius=2, crop=None):
     m['H7'] = jitter_analysis(manifest, frames, regions)
     m['H8'] = stochastic_coverage_analysis(manifest, frames, regions, unions)
     m['H9'] = hdr_scale_analysis(manifest, frames, regions, hdr_local)
+    m['H10'] = coarse_shading_analysis(frames, regions)
     m['optional_inputs'] = optional_input_ranges(frames, regions)
     m['verdicts'] = verdicts(m)
     m['images'] = write_images(out_dir, frames, regions, flips, vote_maps, std_map, m['crop'])

@@ -6,7 +6,8 @@ so sky/non-sky flips at thin edges arise from the jitter alone: a bright texture
 thin dark diagonal wire, a thin branch and a canopy that move +2 px per frame (with matching
 motion vectors), and a hill whose far and near parts make a depth edge well away from the sky.
 Faults are injected per case: (b) depth shifted 1 px or colour blended at edges, (c) filtered
-depth, (d) NaN colour, (e) sky motion on tree edges, (f) a foliage patch dithered per frame.
+depth, (d) NaN colour, (e) sky motion on tree edges, (f) a foliage patch dithered per frame,
+(g) 2x2 coarse shading (VRS) on the alpha-tested branch and canopy.
 H0 cases add rr_output, the scene sampled at the unjittered output pixel centres (a converged RR):
 (a) with per-frame gain noise at sky edges only, (b) stable (plus a reset frame that must be
 skipped), (c) absent (older captures), (d) at a non-integer scale of the render size.
@@ -60,8 +61,9 @@ def segment_distance(px, py, a, b):
     return np.hypot(px - (ax + t * (bx - ax)), py - (ay + t * (by - ay)))
 
 
-def surface_ids(px, py, frame, dither):
-    """Front-most surface at each sample point (largest reverse-Z depth wins)."""
+def surface_ids(px, py, frame, dither, skip=()):
+    """Front-most surface at each sample point (largest reverse-Z depth wins), surfaces in skip
+    left out."""
     shift = TREE_SPEED * frame
     ids = np.full(px.shape, SKY)
     best = np.zeros(px.shape)
@@ -76,6 +78,8 @@ def surface_ids(px, py, frame, dither):
         inside = ((px - 22) / 13) ** 2 + ((py - 40) / 8) ** 2 <= 1
         shapes.append((DITHER, inside & (rng.random(px.shape) < DITHER_COVERAGE)))
     for surface, mask in shapes:
+        if surface in skip:
+            continue
         take = mask & (DEPTH[surface] > best)
         ids[take], best[take] = surface, DEPTH[surface]
     return ids
@@ -102,11 +106,11 @@ def surface_color(ids, px, py):
     return color
 
 
-def render_frame(frame, dither=False):
+def render_frame(frame, dither=False, skip=()):
     gy, gx = np.mgrid[0:H, 0:W].astype(np.float64)
     jx, jy = JITTER[frame]
     px, py = gx + 0.5 + jx, gy + 0.5 + jy
-    ids = surface_ids(px, py, frame, dither)
+    ids = surface_ids(px, py, frame, dither, skip)
     lut = lambda table: np.array([table[s] for s in range(7)], np.float32)[ids]  # noqa: E731
     motion = np.zeros((H, W, 2), np.float32)
     motion[(ids == BRANCH) | (ids == CANOPY)] = (-TREE_SPEED, 0)   # points to the previous position
@@ -191,6 +195,30 @@ def nan_color(frame, i):
 
 def sky_motion(frame, i):
     frame['motion'][edge_mask(frame['depth'])] = 0
+
+
+def coarse_foliage(frame, i):
+    """2x2 coarse shading (VRS) on the alpha-tested branch and canopy: each aligned 2x2 block takes
+    the coverage (discard runs once per coarse pixel) and the shading of its top-left sample, then
+    is depth-tested against what lies behind. The wire and the hills are rasterised as before."""
+    behind = render_frame(i, skip=(BRANCH, CANOPY))
+    foliage = (frame['depth'] == DEPTH[BRANCH]) | (frame['depth'] == DEPTH[CANOPY])
+    tl = lambda a: np.repeat(np.repeat(a[0::2, 0::2], 2, axis=0), 2, axis=1)  # noqa: E731
+    take = tl(foliage) & (tl(frame['depth']) > behind['depth'])
+    for name, value in frame.items():
+        mask = take if value.ndim == 2 else take[..., None]
+        frame[name] = np.where(mask, tl(value), behind[name]).astype(value.dtype)
+
+
+def coarse_foliage_with_roofs(frame, i):
+    """coarse_foliage, plus two full-width horizontal bars (rooflines) in the sky whose edges
+    sit on pixel boundaries 1.0, 3.0, 5.0 and 7.0. They are rasterised, but every one of their
+    mixed y-blocks lands in the leaves' grid phase 0 in every frame, which the snapped leaves
+    leave nearly empty, so the frame-wide count picks phase 1."""
+    coarse_foliage(frame, i)
+    for name, value in frame.items():
+        value[1:3] = value[70, 0]   # a far-hill pixel: static, finite depth
+        value[5:7] = value[70, 0]
 
 
 def make_capture(fault=None, dither=False):
@@ -465,6 +493,38 @@ class SyntheticCaptureTests(unittest.TestCase):
                 self.assertTrue((frames[0]['depth'] > 0).all())
                 self.assertEqual(frames[1]['color'].shape[-1], 4)
 
+    def test_contrast_test_undone(self):
+        # The contrast test compresses the brightest channel to knee * ln(1 + m / knee), hue kept,
+        # after the brightness test's factor (shaders/rr_color_scale.hlsl). The analysis expands
+        # color and rr_output back, so the values and every verdict match the clean capture.
+        def compress(rgb, knee):
+            m = rgb.max(axis=-1, keepdims=True)
+            x = m / np.float32(knee)
+            f = np.where(x < 0.01, 1 + x * (x / 3 - 0.5), np.log1p(x) / np.maximum(x, 1e-30))
+            return (rgb * np.where(m > 0, f, 1)).astype(np.float32)
+        for knee, s in ((1.0, 1.0), (0.25, 0.25), (0.05, 1.0)):
+            with self.subTest(knee=knee, scale=s):
+                manifest, frames = make_capture_with_output()
+                for meta, frame in zip(manifest['frames'], frames):
+                    meta['color_scale'], meta['contrast_knee'] = s, knee
+                    rgb = compress(frame['color'] * np.float32(s), knee)
+                    frame['color'] = np.concatenate([rgb, np.ones(rgb.shape[:2] + (1,), np.float32)], -1)
+                    out = frame['rr_output'].copy()
+                    out[..., :3] = compress(out[..., :3] * np.float32(s), knee)
+                    frame['rr_output'] = out
+                reference, original = make_capture_with_output()
+                undone, notes = ase.undo_tests(manifest, frames)
+                for name in ('color', 'rr_output'):
+                    np.testing.assert_allclose(undone[0][name][..., :3], original[0][name][..., :3],
+                                               rtol=2e-5, atol=1e-7)
+                self.assertTrue(any('contrast test on in frames' in n for n in notes))
+                if knee == 0.05:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        expected = ase.analyze(reference, original, tmp)
+                        m = ase.analyze(manifest, frames, tmp)
+                    self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                                     {k: verdict(expected, k) for k in expected['verdicts']})
+
     def test_tree_tests_undo_exact(self):
         # The floor replaced only depth == 0, so a game's negative or tiny depth stays as RR got
         # it; the scaled color copy loses its constant alpha and rr_output keeps its own.
@@ -531,6 +591,9 @@ class SyntheticCaptureTests(unittest.TestCase):
         self.assertNotEqual(verdict(m, 'H8'), 'supports')
         self.assertEqual(verdict(m, 'H9'), 'supports')   # bright synthetic sky: numbers must print
         self.assertIsNotNone(m['H9']['sky_over_edge_non_sky'])
+        self.assertEqual(verdict(m, 'H10'), 'against')
+        h = m['H10']
+        self.assertLess(h['snapped_tile_share'] - h['control_tile_share'], ase.H10_AGAINST_TILE_SHARE)
 
     def test_b1_depth_shifted_one_pixel(self):
         m = run(shift_depth)
@@ -561,6 +624,32 @@ class SyntheticCaptureTests(unittest.TestCase):
         for key in ('H2', 'H3', 'H4', 'H6', 'H7'):
             self.assertNotEqual(verdict(m, key), 'supports', key)
         self.assertGreater(m['H8']['jitter_fit']['sky']['share'], self.clean['H8']['jitter_fit']['sky']['share'])
+        self.assertNotEqual(verdict(m, 'H10'), 'supports')   # per-frame dither is not a fixed grid
+
+    def test_g_coarse_shading_on_foliage(self):
+        # Coverage and shading of the leaves snap to the 2x2 grid at phase 0; the wire and the
+        # skyline do not, so the global ratio is diluted but the leaf tiles and colour pairs show it.
+        m = run(coarse_foliage)
+        self.assertEqual(verdict(m, 'H10'), 'supports')
+        x, y = m['H10']['axes']['x']['2'], m['H10']['axes']['y']['2']
+        self.assertEqual((x['best_phase'], y['best_phase']), (0, 0))
+        self.assertLess(x['ratio'], ase.H10_SUPPORT_RATIO)
+        self.assertGreater(m['H10']['tiles_snapped'], 0)
+        self.assertEqual(m['H10']['tile_phase'], [0, 0])
+        self.assertGreater(m['H10']['snapped_tile_share'],
+                           ase.H10_TILE_CONTROL * m['H10']['control_tile_share'])
+        self.assertIn('color (sky edge band)', m['verdicts']['H10']['text'])
+        for key in ('H2', 'H3', 'H4', 'H6'):
+            self.assertNotEqual(verdict(m, key), 'supports', key)
+
+    def test_g2_long_straight_edges_do_not_hide_the_grid(self):
+        # The rooflines tip the frame-wide y count to phase 1. Tested only at that phase, the
+        # leaf tiles would not snap; chosen from the tiles, the grid shows in x phase 0.
+        m = run(coarse_foliage_with_roofs)
+        self.assertEqual(m['H10']['axes']['y']['2']['best_phase'], 1)
+        self.assertEqual(m['H10']['tile_phase'][0], 0)
+        self.assertGreater(m['H10']['tiles_snapped'], 0)
+        self.assertEqual(verdict(m, 'H10'), 'supports')
 
     def test_h0_a_output_flickers_at_sky_edges(self):
         manifest, frames = make_capture_with_output(flicker=0.4)
