@@ -18,6 +18,7 @@
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
 #include "rr_game_config.h"
+#include "rr_lod_bias_test.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -442,6 +443,59 @@ static void OnDestroyLayout(reshade::api::device *d, reshade::api::pipeline_layo
     ForgetRootLayout(layout);
     WithGraphicsBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
     WithBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
+}
+// LOD bias test (rr_lod_bias_test.h): the game's samplers as it creates them.
+static void LogLodBias(const reshade::api::sampler_desc &before, float after, bool is_static) {
+    static std::atomic<unsigned> logged{};
+    if (logged++ >= 8)
+        return;
+    char text[192];
+    snprintf(text, sizeof(text),
+             "LOD bias test: %s sampler filter 0x%x address %u/%u anisotropy %.0f bias %.2f -> %.2f",
+             is_static ? "static" : "heap", static_cast<unsigned>(before.filter),
+             static_cast<unsigned>(before.address_u), static_cast<unsigned>(before.address_v),
+             before.max_anisotropy, before.mip_lod_bias, after);
+    WriteLog(text);
+}
+static bool OnCreateSampler(reshade::api::device *d, reshade::api::sampler_desc &desc) {
+    const float offset = rrlodbias::Offset(rrlodbias::mode);
+    if (offset == 0 || d->get_api() != reshade::api::device_api::d3d12)
+        return false;
+    const auto before = desc;
+    if (!rrlodbias::Apply(desc, offset, rrlodbias::stats, false))
+        return false;
+    LogLodBias(before, desc.mip_lod_bias, false);
+    return true;
+}
+static bool OnCreateLayout(reshade::api::device *d, uint32_t &count,
+                           reshade::api::pipeline_layout_param *&params) {
+    const float offset = rrlodbias::Offset(rrlodbias::mode);
+    if (offset == 0 || d->get_api() != reshade::api::device_api::d3d12)
+        return false;
+    auto *const original = params;
+    try {
+        // Read by ReShade after this returns, within the same create call on this thread.
+        thread_local rrlodbias::LayoutCopy copy;
+        if (!rrlodbias::ApplyLayout(count, params, offset, rrlodbias::stats, copy))
+            return false;
+        for (unsigned i = 0; i < count; ++i)
+            if (rrlodbias::WithFlags(original[i].type) &&
+                original[i].descriptor_table_with_flags.ranges)
+                for (unsigned j = 0; j < original[i].descriptor_table_with_flags.count; ++j) {
+                    const auto &r = original[i].descriptor_table_with_flags.ranges[j];
+                    if (rrlodbias::HasStaticSamplers(r) &&
+                        rrlodbias::Biases(r.static_samplers[0]))
+                        LogLodBias(r.static_samplers[0],
+                                   params[i].descriptor_table_with_flags.ranges[j]
+                                       .static_samplers[0]
+                                       .mip_lod_bias,
+                                   true);
+                }
+        return true;
+    } catch (...) {
+        params = original; // the game's layout, unchanged
+        return false;
+    }
 }
 static void OnTables(reshade::api::command_list *list, reshade::api::shader_stage stages,
                      reshade::api::pipeline_layout layout, uint32_t first, uint32_t count,
@@ -1030,6 +1084,9 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::init_command_queue>(&OnQueue);
     reshade::register_event<reshade::addon_event::init_command_list>(&OnList);
+    LoadLodBias(); // before the game makes its samplers
+    reshade::register_event<reshade::addon_event::create_sampler>(&OnCreateSampler);
+    reshade::register_event<reshade::addon_event::create_pipeline_layout>(&OnCreateLayout);
     reshade::register_event<reshade::addon_event::init_pipeline_layout>(&OnLayout);
     reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(&OnDestroyLayout);
     reshade::register_event<reshade::addon_event::bind_descriptor_tables>(&OnTables);
