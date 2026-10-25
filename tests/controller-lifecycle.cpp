@@ -133,19 +133,67 @@ struct ControllerCpuTest {
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
+        c.hit_scratch.active = true;
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
         assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
-               c.applied_color_scale == 1.0f);
+               !c.hit_scratch.active && c.applied_color_scale == 1.0f);
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();
         assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
     }
+    static void HitDistanceTests() {
+        // The hit distance tests record nothing while off, act once on the single
+        // guide recording of a list, and stop showing active on any skip.
+        using rrhitcond::Outcome;
+        Controller c;
+        rrcompute::Snapshot restore;
+        auto state_of = [](ID3D12Resource *, D3D12_RESOURCE_STATES &) { return false; };
+        auto *weights = new CpuResource;
+        // Never called: slots only compare it with their recording.
+        auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(weights);
+        auto run = [&](ID3D12GraphicsCommandList *cl) {
+            return c.ConditionSpecularDistance(
+                cl, weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, restore, state_of);
+        };
+        assert(run(list) == Outcome::Off); // no test on
+        rrhitcond::fill = true;
+        assert(run(list) == Outcome::Off); // RR off
+        c.SetEnabled(true);
+        assert(run(list) == Outcome::Off); // hit distance off
+        c.SetSpecularHitEnabled(true);
+        assert(run(nullptr) == Outcome::Off);
+        assert(run(list) == Outcome::NoSlot);
+        auto &s = c.slots[0], &other = c.slots[1];
+        s.generation = other.generation = c.generation;
+        s.pre_live = true;
+        s.pre.Attach(list);
+        c.hit_scratch.active = true;
+        assert(run(list) == Outcome::NoCopy && !c.hit_scratch.active);
+        s.gpu.hit_ready = true;
+        s.gpu.specular_hit = weights;
+        c.hit_scratch.active = true;
+        assert(run(list) == Outcome::Weights && !c.hit_scratch.active); // not a 2D texture
+        other.pre_live = true;
+        other.pre.Attach(list);
+        assert(run(list) == Outcome::NoSlot); // two guide recordings on one list
+        other.pre.Detach();
+        other.pre_live = false;
+        s.hit_conditioned = true;
+        c.hit_scratch.active = true;
+        assert(run(list) == Outcome::Repeat && c.hit_scratch.active);
+        c.hit_condition_failed = true;
+        assert(run(list) == Outcome::Off);
+        s.pre.Detach();
+        rrhitcond::fill = false;
+        weights->Release();
+    }
     static void Run() {
         DevTests();
+        HitDistanceTests();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);
