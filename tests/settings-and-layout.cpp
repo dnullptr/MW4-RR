@@ -54,6 +54,16 @@ int main() {
     }
     h.Format = DXGI_FORMAT_R32_FLOAT;
     assert(!rrspecular::ValidSource(h, UINT(h.Width), h.Height, read));
+    rrspecular::Diagnostics stats;
+    char line[320];
+    assert(!stats.Summary(line, sizeof(line)));
+    assert(std::string_view(line).find("blurDispatches=0") != std::string_view::npos);
+    stats.Dispatch();
+    stats.Observe(rrspecular::Stage::Shape);
+    assert(stats.Summary(line, sizeof(line)));
+    assert(std::string_view(line).find("lastReject=shape") != std::string_view::npos);
+    assert(!stats.Summary(line, sizeof(line)));
+    assert(stats.Scan(1) && !stats.Scan(1) && stats.Candidate(1) && !stats.Candidate(1));
     d.Width = 16385;
     assert(!rrglass::Shape(d, 1));
     d.Width = 1920;
