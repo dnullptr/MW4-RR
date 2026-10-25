@@ -144,8 +144,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         rrskyedge::strength = rrresponsivity::Clamp(edge_strength);
     int edge_radius = static_cast<int>(rrskyedge::ClampRadius(rrskyedge::radius));
     if (ImGui::SliderInt("Sky edge width (pixels)", &edge_radius, 1,
-                         static_cast<int>(rrskyedge::MaxRadius)))
-        rrskyedge::radius = rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
+                         static_cast<int>(rrskyedge::MaxRadius), "%d",
+                         ImGuiSliderFlags_AlwaysClamp))
+        rrskyedge::radius =
+            edge_radius < 1 ? 1u : rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
     ImGui::Text("Sky edge mask: %s", LiveRR().SkyEdgeActive() ? "active"
                                      : !sky_edge                ? "off"
                                      : rrresponsivity::Clamp(edge_strength) == 0
@@ -176,6 +178,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         changed = true;
     ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive()      ? "active"
                                          : !requested_responsivity            ? "off"
+                                         : LiveRR().SkyEdgeActive() ? "replaced by sky edge mask"
                                          : rrresponsivity::Clamp(requested_strength) == 0
                                              ? "off (strength 0)"
                                              : "waiting (needs preset F and the SSS guide)");

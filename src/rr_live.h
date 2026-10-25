@@ -331,7 +331,10 @@ class Controller {
         return responsivity_active && enabled && !failed && !retired && sss_enabled &&
                !sss_failed &&
                rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
-                                   preset.has_effective, preset.effective);
+                                   preset.has_effective, preset.effective) &&
+               !rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
+                               rrskyedge::strength.load(std::memory_order_relaxed),
+                               preset.has_effective, preset.effective);
     }
     // Whether the latest evaluation sent the sky edge mask and it would still be sent now.
     bool SkyEdgeActive() {
@@ -1166,9 +1169,6 @@ class Controller {
                 preset.Created();
             }
             // Written by the SSS resolve below; null keeps RR's default responsiveness.
-            responsivity_active =
-                rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
-                                    preset.has_effective, preset.effective);
             const float sky_edge_strength =
                 rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
             const UINT sky_edge_radius =
@@ -1177,6 +1177,10 @@ class Controller {
             sky_edge_active =
                 rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
                                sky_edge_strength, preset.has_effective, preset.effective);
+            responsivity_active =
+                !sky_edge_active &&
+                rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
+                                    preset.has_effective, preset.effective);
             rreval::Resources resources{s->gpu.sr[0].Get(),
                                         s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
