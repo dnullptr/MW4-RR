@@ -36,6 +36,12 @@ struct Shape {
     bool compute{}, ignored{};
 };
 using CBVPair = rrvrrt::CBVs;
+// One compute root CBV of the current pipeline (RootCBV).
+struct RootCBVProof {
+    UINT parameter{};
+    UINT64 address{};
+    bool valid{};
+};
 struct Snapshot {
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12RootSignature> root;
@@ -701,6 +707,27 @@ class Tracker {
     bool HookTargets(const std::array<void *, Count> &targets, std::index_sequence<M...>) {
         return ((!targets[M] || Hook<Method(M)>(targets[M])) && ...);
     }
+    // RateCBVs and RootCBV, one register: exactly one compute space-0 CBV shape for `reg`, with
+    // flags 0, 2 or 4, bound as a nonzero 256-aligned root CBV. A passing match stores its
+    // parameter and address before the match count is checked.
+    static bool OneRootCBV(const Layout &layout, const State &s, UINT reg, UINT &parameter,
+                           UINT64 &address) {
+        unsigned matches = 0;
+        for (UINT p = 0; p < layout.count; ++p) {
+            const auto &shape = layout.params[p];
+            if (shape.kind != Kind::CBV || !shape.compute || shape.space ||
+                shape.shader_register != reg)
+                continue;
+            ++matches;
+            const auto &a = s.args[p];
+            if ((shape.flags != 0 && shape.flags != 2 && shape.flags != 4) || a.kind != Kind::CBV ||
+                !a.address || (a.address & 255))
+                return false;
+            parameter = p;
+            address = a.address;
+        }
+        return matches == 1;
+    }
 
   public:
     // Optional content observer registration must precede first Attach. Changing it
@@ -1085,26 +1112,37 @@ class Tracker {
         auto layout = layouts.find(root);
         if (layout == layouts.end())
             return result;
-        for (unsigned k = 0; k < 2; ++k) {
-            unsigned matches = 0;
-            for (UINT p = 0; p < layout->second.count; ++p) {
-                const auto &shape = layout->second.params[p];
-                if (shape.kind != Kind::CBV || !shape.compute || shape.space ||
-                    shape.shader_register != (k ? 3u : 1u))
-                    continue;
-                ++matches;
-                const auto &a = s.args[p];
-                if ((shape.flags != 0 && shape.flags != 2 && shape.flags != 4) ||
-                    a.kind != Kind::CBV || !a.address || (a.address & 255))
-                    return result;
-                result.parameters[k] = p;
-                result.addresses[k] = a.address;
-            }
-            if (matches != 1)
+        for (unsigned k = 0; k < 2; ++k)
+            if (!OneRootCBV(layout->second, s, k ? 3u : 1u, result.parameters[k],
+                            result.addresses[k]))
                 return result;
-        }
         result.valid = true;
         return result;
+    }
+    // RateCBVs' proof for the one register `reg` (b1 alone at the ray budget's resolve).
+    RootCBVProof RootCBV(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pipeline,
+                         ID3D12RootSignature *root, UINT reg) {
+        std::lock_guard install_lock(install_mutex);
+        std::lock_guard lock(mutex);
+        RootCBVProof result;
+        if (!healthy)
+            return result;
+        auto at = states.find(cl);
+        if (at == states.end())
+            return result;
+        auto &s = at->second;
+        if (!CoreTargetsEqual(Targets(cl), s.targets))
+            s.coverage_lost = true;
+        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
+            return result;
+        auto layout = layouts.find(root);
+        if (layout == layouts.end())
+            return result;
+        UINT parameter{};
+        UINT64 address{};
+        if (!OneRootCBV(layout->second, s, reg, parameter, address))
+            return result;
+        return {parameter, address, true};
     }
     Snapshot Capture(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *expected = nullptr) {
         std::lock_guard install_lock(install_mutex);

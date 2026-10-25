@@ -462,15 +462,17 @@ class Controller {
             if (!s.gpu.rr_output) {
                 return false;
             }
-            UINT64 base = 0, depth = 0;
+            UINT64 base = 0, depth = 0, kept = 0;
             for (const auto &slot : slots) {
                 UINT64 b{}, d{};
                 if (!SlotReservationParts(pipelines.device.Get(), slot.gpu, budget.limit, b, d) ||
-                    b < slot.gpu.sss.bytes)
+                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.ray_bytes)
                     return false;
-                base = (std::max)(base, b - slot.gpu.sss.bytes);
+                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.ray_bytes);
                 depth = (std::max)(depth, d);
             }
+            if (!PersistentBytes(kept))
+                return false;
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
@@ -485,11 +487,11 @@ class Controller {
             UINT64 required{};
             const auto optional_sss = rrsss::Gpu::RequiredBytes(pipelines.device.Get(), s.gpu.w,
                                                                 s.gpu.h, stencil.samples);
-            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, 0,
-                                        persistent.bytes, required) ||
+            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, 0, kept,
+                                        required) ||
                 !budget.Reserve(pipelines.device.Get(), required) ||
-                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, 0,
-                                        budget.limit, slots.size())) {
+                !rrsss::FitsOwnedBudget(base, depth, kept, optional_sss, 0, budget.limit,
+                                        slots.size())) {
                 return false;
             }
         }

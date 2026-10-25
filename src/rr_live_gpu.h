@@ -21,6 +21,7 @@
 #include "rr_sparse_copy.h"
 #include "rr_specular_distance.h"
 #include "rr_ray_density.h"
+#include "rr_ray_copies.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -113,6 +114,15 @@ struct Pipelines {
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
+    // The ray budget governor (shaders/rr_vrrt_governor.hlsl) on a game root signature, one PSO per
+    // root. An entry keeps its root alive, so a cached address cannot be reused by another root;
+    // `pipelines = {}` (after full retirement) releases them.
+    struct GovernorEntry {
+        ComPtr<ID3D12RootSignature> root;
+        ComPtr<ID3D12PipelineState> pso;
+        HRESULT failed = S_OK;
+    };
+    std::array<GovernorEntry, 4> governors;
     UINT stride{};
     void Initialize(ID3D12Device *d) {
         Require(d && !device, "live pipelines already initialized");
@@ -181,6 +191,43 @@ struct Pipelines {
         D3D12_ROOT_SIGNATURE_DESC desc{4, p};
         Root(desc, probability_root);
         Pipeline(probability_root.Get(), RRVrrtProbability, sizeof(RRVrrtProbability), probability);
+    }
+    // pso, else why not: hr E_INVALIDARG (no root or device, or a root of another device; nothing
+    // cached), E_OUTOFMEMORY (nothing cached, worth a retry), another failure of the creation
+    // (cached: every later call answers the same), or `full` (every entry holds another root).
+    struct GovernorPipeline {
+        ID3D12PipelineState *pso{};
+        HRESULT hr = S_OK;
+        bool full{};
+    };
+    GovernorPipeline Governor(ID3D12RootSignature *root) noexcept {
+        ComPtr<ID3D12Device> owner;
+        if (!root || !device || FAILED(root->GetDevice(IID_PPV_ARGS(&owner))) ||
+            !fg::SameNativeObject(owner.Get(), device.Get()))
+            return {nullptr, E_INVALIDARG, false};
+        GovernorEntry *empty{};
+        for (auto &e : governors) {
+            if (e.root.Get() == root)
+                return {e.pso.Get(), e.pso ? S_OK : e.failed, false};
+            if (!e.root && !empty)
+                empty = &e;
+        }
+        if (!empty)
+            return {nullptr, S_OK, true};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
+        d.pRootSignature = root;
+        d.CS = {RRVrrtGovernor, sizeof(RRVrrtGovernor)};
+        empty->root = root;
+        const HRESULT hr = device->CreateComputePipelineState(&d, IID_PPV_ARGS(&empty->pso));
+        if (SUCCEEDED(hr) && empty->pso)
+            return {empty->pso.Get(), S_OK, false};
+        if (hr == E_OUTOFMEMORY) {
+            *empty = {};
+            return {nullptr, E_OUTOFMEMORY, false};
+        }
+        empty->pso.Reset();
+        empty->failed = FAILED(hr) ? hr : E_FAIL;
+        return {nullptr, empty->failed, false};
     }
     void Pipeline(ID3D12RootSignature *r, const void *code, size_t bytes,
                   ComPtr<ID3D12PipelineState> &p) {
@@ -256,6 +303,21 @@ struct GpuFrame {
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
     bool use_depth{}, hit_ready{};
+    // The ray budget test (every offset is in rr_ray_copies.h): ray_cb (DEFAULT 64 KiB, COMMON
+    // outside a patch) is the patched resolve's b1, ray_values (UPLOAD 256 B) stays mapped at
+    // ray_map, ray_log (READBACK 256 B) collects the copies. ray_bytes is their share of `bytes`:
+    // optional, so kept out of the pool projection. ray_sources holds the native buffers this
+    // recording copied until Retire: resolve b1, b3, t0; apply b1, b3; patch b1.
+    ComPtr<ID3D12Resource> ray_cb, ray_values, ray_log;
+    UINT *ray_map{};
+    UINT64 ray_bytes{};
+    std::array<ComPtr<ID3D12Resource>, 6> ray_sources;
+    // A site's ray_sources slots: from `first`, one per native rrraycopy::Source it reads (B1, B3,
+    // Stats in that order).
+    struct RaySite {
+        unsigned first, slots;
+    };
+    static constexpr RaySite RayResolveSite{0, 3}, RayApplySite{3, 2}, RayPatchSite{5, 1};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
@@ -620,6 +682,130 @@ struct GpuFrame {
         readback->Unmap(0, &r);
         return v;
     }
+    // Ensures ray_log and ray_values (mapped once). False, with nothing allocated, when a size is
+    // unusable or the ledger cannot grow; Allocate may still throw AllocationDeferred or
+    // runtime_error. Idempotent.
+    bool PrepareRayLog(Pipelines &p, Budget &b) {
+        using rrprivate::Buffer;
+        if (!AllocateRay(p, b,
+                         {{&ray_log, Buffer(rrraycopy::LogBytes), D3D12_HEAP_TYPE_READBACK},
+                          {&ray_values, Buffer(rrraycopy::ValuesBytes), D3D12_HEAP_TYPE_UPLOAD}}))
+            return false;
+        if (!ray_map) {
+            D3D12_RANGE empty{};
+            void *m{};
+            Check(ray_values->Map(0, &empty, &m), "ray budget upload map failed");
+            memset(m, 0, rrraycopy::ValuesBytes);
+            ray_map = static_cast<UINT *>(m);
+        }
+        return true;
+    }
+    // PrepareRayLog, then ray_cb the same way. Idempotent.
+    bool PrepareRayPatch(Pipelines &p, Budget &b) {
+        const RayBuffer cb{&ray_cb, rrprivate::Buffer(rrraycopy::CbBytes), D3D12_HEAP_TYPE_DEFAULT};
+        return PrepareRayLog(p, b) && AllocateRay(p, b, {cb});
+    }
+    // CPU writes into ray_values while this slot records (not in flight), like header_map.
+    void WriteRaySerial(UINT serial) noexcept {
+        if (ray_map)
+            ray_map[rrraycopy::ValuesSerial / 4] = serial;
+    }
+    void WriteRayPlan(const rrraybudget::Plan &plan) noexcept {
+        if (!ray_map)
+            return;
+        const std::array<UINT, 4> governor{plan.mask, plan.headroom[0], plan.headroom[1], 0};
+        static_assert(rrraycopy::ValuesTargets + sizeof(plan.bits) <= rrraycopy::ValuesSerial &&
+                          sizeof(governor) == rrraycopy::GovernorBytes,
+                      "rr_ray_copies.h's ray_values layout");
+        memcpy(reinterpret_cast<char *>(ray_map) + rrraycopy::ValuesTargets, plan.bits.data(),
+               sizeof(plan.bits));
+        memcpy(reinterpret_cast<char *>(ray_map) + rrraycopy::ValuesGovernor, governor.data(),
+               sizeof(governor));
+    }
+    // The logging copies at the native resolve and at the native VRRT apply: the recorded Log bits,
+    // 0 when nothing was recorded (no ray_log/ray_map, this site already recorded in this
+    // recording, or nothing to copy). A source outside its buffer is dropped; t0 is copied only
+    // when its tracked state is a known read-only shader-resource state, inside a transition pair
+    // to state | COPY_SOURCE unless it already has COPY_SOURCE.
+    unsigned LogResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                        const rrvrrt::RayConstant &b3, const rrvrrt::RayStats &stats) noexcept {
+        if (!cl || !ray_log || !ray_map || RaySiteUsed(RayResolveSite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        from.Set(rrraycopy::Source::B3, b3.resource.Get(), b3.offset);
+        from.Set(rrraycopy::Source::Stats, stats.resource.Get(), stats.offset);
+        const bool readable = stats.known && rrsparsecopy::Readable(stats.state);
+        const auto list = rrraycopy::ResolveLog(
+            RayAvail(b1.resource.Get(), b1.offset, b1.avail), b1.upload,
+            RayAvail(b3.resource.Get(), b3.offset, b3.avail), b3.upload,
+            readable ? RayAvail(stats.resource.Get(), stats.offset, stats.avail) : 0);
+        return RecordRayLog(cl, list, from, RayResolveSite, stats.state);
+    }
+    unsigned LogApply(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                      const rrvrrt::RayConstant &b3) noexcept {
+        if (!cl || !ray_log || !ray_map || RaySiteUsed(RayApplySite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        from.Set(rrraycopy::Source::B3, b3.resource.Get(), b3.offset);
+        const auto list =
+            rrraycopy::ApplyLog(RayAvail(b1.resource.Get(), b1.offset, b1.avail), b1.upload,
+                                RayAvail(b3.resource.Get(), b3.offset, b3.avail), b3.upload);
+        return RecordRayLog(cl, list, from, RayApplySite, {});
+    }
+    // ray_cb's GPU VA after recording the copies that fill it (the game's first 608 bytes of b1
+    // with the plan's targets and governor constants), its barrier to VERTEX_AND_CONSTANT_BUFFER |
+    // COPY_SOURCE and the Executed copy; 0 with nothing recorded. The caller binds the VA,
+    // dispatches, runs the governor, restores, then calls EndPatch.
+    UINT64 PatchResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
+                        const rrraybudget::Plan &plan) noexcept {
+        if (!cl || !ray_cb || !ray_values || !ray_map || !ray_log || !b1.resource || !b1.upload ||
+            b1.avail < rrraycopy::GameBytes ||
+            RayAvail(b1.resource.Get(), b1.offset, b1.avail) < rrraycopy::GameBytes ||
+            plan.mask < 1 || plan.mask > 3 || RaySiteUsed(RayPatchSite))
+            return 0;
+        auto from = RayOwn();
+        from.Set(rrraycopy::Source::B1, b1.resource.Get(), b1.offset);
+        const auto fill = rrraycopy::PatchFill(plan.mask);
+        const UINT64 va = ray_cb->GetGPUVirtualAddress();
+        if (!fill.count || !from.Covers(fill) || !from.Covers(rrraycopy::Executed) || !va)
+            return 0;
+        ray_sources[RayPatchSite.first] = b1.resource;
+        WriteRayPlan(plan);
+        Change(cl, ray_cb.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (unsigned i = 0; i < fill.count; ++i)
+            RecordRay(cl, fill.copies[i], from);
+        Change(cl, ray_cb.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_COPY_SOURCE);
+        RecordRay(cl, rrraycopy::Executed, from);
+        return va;
+    }
+    // After a PatchResolve that returned a VA, once the patched dispatch and the governor are
+    // recorded.
+    void EndPatch(ID3D12GraphicsCommandList *cl) noexcept {
+        if (cl && ray_cb)
+            Change(cl, ray_cb.Get(),
+                   D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                       D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_COMMON);
+    }
+    // The gate's words of ray_log. Valid only after the recording's GPU work completed.
+    bool ReadRayLog(std::array<std::uint32_t, rrraybudget::LogWords> &out) noexcept {
+        static_assert(sizeof(out) == rrraycopy::LogRead, "the gate's words of the ray log");
+        out = {};
+        if (!ray_log)
+            return false;
+        void *m{};
+        D3D12_RANGE r{0, rrraycopy::LogRead};
+        if (FAILED(ray_log->Map(0, &r, &m)))
+            return false;
+        if (m)
+            memcpy(out.data(), m, sizeof(out));
+        r = {0, 0};
+        ray_log->Unmap(0, &r);
+        return m != nullptr;
+    }
     void Retire() {
         sources = {};
         constants = {};
@@ -627,13 +813,140 @@ struct GpuFrame {
         probability_inputs = {};
         hit_source.Reset();
         hit_ready = false;
+        ray_sources = {};
     }
     void Release(Budget &b) {
         if (header_map)
             header->Unmap(0, nullptr);
+        if (ray_map)
+            ray_values->Unmap(0, nullptr);
         Require(b.bytes >= bytes, "live allocation ledger underflow");
         b.bytes -= bytes;
         *this = {};
+    }
+
+  private:
+    // What each rrraycopy::Source reads: a buffer and the byte its offsets count from.
+    struct RayFrom {
+        std::array<ID3D12Resource *, 5> resource{};
+        std::array<UINT64, 5> start{};
+        void Set(rrraycopy::Source s, ID3D12Resource *r, UINT64 offset) noexcept {
+            resource[unsigned(s)] = r;
+            start[unsigned(s)] = offset;
+        }
+        bool Covers(const rrraycopy::Copy &c) const noexcept {
+            return unsigned(c.source) < resource.size() && resource[unsigned(c.source)];
+        }
+        bool Covers(const rrraycopy::List &l) const noexcept {
+            if (l.count > l.copies.size())
+                return false;
+            for (unsigned i = 0; i < l.count; ++i)
+                if (!Covers(l.copies[i]))
+                    return false;
+            return true;
+        }
+    };
+    struct RayBuffer {
+        ComPtr<ID3D12Resource> *resource;
+        D3D12_RESOURCE_DESC desc;
+        D3D12_HEAP_TYPE type;
+    };
+    // Allocates the missing `buffers` after reserving their sum in the ledger (overflow-checked).
+    bool AllocateRay(Pipelines &p, Budget &b, std::initializer_list<RayBuffer> buffers) {
+        if (!p.device)
+            return false;
+        UINT64 needed{};
+        for (const auto &x : buffers)
+            if (!*x.resource) {
+                const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &x.desc).SizeInBytes;
+                if (!n || n == UINT64_MAX || needed > UINT64_MAX - n)
+                    return false;
+                needed += n;
+            }
+        if (!needed)
+            return true;
+        if (b.bytes > UINT64_MAX - needed || !b.Reserve(p.device.Get(), b.bytes + needed))
+            return false;
+        for (const auto &x : buffers)
+            if (!*x.resource) {
+                const UINT64 before = bytes;
+                *x.resource = Allocate(p, b, x.desc, x.type);
+                ray_bytes += bytes - before;
+            }
+        return true;
+    }
+    RayFrom RayOwn() const noexcept {
+        RayFrom f;
+        f.Set(rrraycopy::Source::Values, ray_values.Get(), 0);
+        f.Set(rrraycopy::Source::Cb, ray_cb.Get(), 0);
+        return f;
+    }
+    // `avail` when [offset, offset + avail) lies inside the buffer `r`, else 0 (no copy reads it).
+    static UINT64 RayAvail(ID3D12Resource *r, UINT64 offset, UINT64 avail) noexcept {
+        if (!r)
+            return 0;
+        const auto d = r->GetDesc();
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && offset <= d.Width &&
+                       avail <= d.Width - offset
+                   ? avail
+                   : 0;
+    }
+    bool RaySiteUsed(const RaySite &site) const noexcept {
+        for (unsigned i = site.first; i < site.first + site.slots && i < ray_sources.size(); ++i)
+            if (ray_sources[i])
+                return true;
+        return false;
+    }
+    // The ray_sources slot of a native source at `site`, or nullptr when the site has none for it.
+    ComPtr<ID3D12Resource> *RaySlot(const RaySite &site, rrraycopy::Source s) noexcept {
+        const auto at = site.first + unsigned(s);
+        return unsigned(s) <= unsigned(rrraycopy::Source::Stats) && unsigned(s) < site.slots &&
+                       at < ray_sources.size()
+                   ? &ray_sources[at]
+                   : nullptr;
+    }
+    // One copy of the plan; the caller has checked it (RayFrom::Covers) before the first command.
+    void RecordRay(ID3D12GraphicsCommandList *cl, const rrraycopy::Copy &c,
+                   const RayFrom &from) noexcept {
+        const auto s = unsigned(c.source);
+        cl->CopyBufferRegion(c.target == rrraycopy::Target::Log ? ray_log.Get() : ray_cb.Get(),
+                             c.at, from.resource[s], from.start[s] + c.from, c.bytes);
+    }
+    static bool Native(rrraycopy::Source s) noexcept {
+        return s == rrraycopy::Source::B1 || s == rrraycopy::Source::B3 ||
+               s == rrraycopy::Source::Stats;
+    }
+    // LogResolve/LogApply after their checks: retains the native sources in the site's
+    // ray_sources slots, then records the list; the t0 copies (Source::Stats) go last, inside the
+    // transition pair unless `stats_state` already has COPY_SOURCE.
+    unsigned RecordRayLog(ID3D12GraphicsCommandList *cl, const rrraycopy::List &list,
+                          const RayFrom &from, const RaySite &site,
+                          D3D12_RESOURCE_STATES stats_state) noexcept {
+        if (!list.count || !from.Covers(list))
+            return 0;
+        bool stats = false;
+        for (unsigned i = 0; i < list.count; ++i) {
+            const auto s = list.copies[i].source;
+            stats = stats || s == rrraycopy::Source::Stats;
+            if (Native(s) && !RaySlot(site, s))
+                return 0;
+        }
+        for (unsigned i = 0; i < list.count; ++i)
+            if (const auto s = list.copies[i].source; Native(s))
+                *RaySlot(site, s) = from.resource[unsigned(s)];
+        for (unsigned i = 0; i < list.count; ++i)
+            if (list.copies[i].source != rrraycopy::Source::Stats)
+                RecordRay(cl, list.copies[i], from);
+        if (stats) {
+            auto *t0 = from.resource[unsigned(rrraycopy::Source::Stats)];
+            const auto read = stats_state | D3D12_RESOURCE_STATE_COPY_SOURCE;
+            Change(cl, t0, stats_state, read);
+            for (unsigned i = 0; i < list.count; ++i)
+                if (list.copies[i].source == rrraycopy::Source::Stats)
+                    RecordRay(cl, list.copies[i], from);
+            Change(cl, t0, read, stats_state);
+        }
+        return list.bits;
     }
 };
 inline bool SlotReservationParts(ID3D12Device *device, const rrlive::GpuFrame &frame, UINT64 limit,

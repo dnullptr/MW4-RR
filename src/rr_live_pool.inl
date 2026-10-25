@@ -1,5 +1,17 @@
 // Included inside Controller. deque growth preserves every live Slot address.
 private:
+// The persistent term of the pool projections: the persistent frame plus every slot's ray budget
+// buffers, which are optional (never multiplied into the per-slot size) but allocated, so they stay
+// inside budget.limit. False on overflow.
+bool PersistentBytes(UINT64 &total) const {
+    total = persistent.bytes;
+    for (const auto &s : slots) {
+        if (s.gpu.ray_bytes > UINT64_MAX - total)
+            return false;
+        total += s.gpu.ray_bytes;
+    }
+    return true;
+}
 bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
                  const D3D12_RESOURCE_DESC *native_depth = nullptr, UINT guide_width = 0,
                  UINT guide_height = 0, UINT64 extra_persistent = 0) {
@@ -10,9 +22,10 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
     for (const auto &s : slots) {
         UINT64 b{}, d{};
         if (!SlotReservationParts(pipelines.device.Get(), s.gpu, budget.limit, b, d) ||
-            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes)
+            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes ||
+            b - s.gpu.sss.bytes - s.gpu.transparency.bytes < s.gpu.ray_bytes)
             return false;
-        b -= s.gpu.sss.bytes + s.gpu.transparency.bytes;
+        b -= s.gpu.sss.bytes + s.gpu.transparency.bytes + s.gpu.ray_bytes;
         if (s.gpu.rr_output) {
             const auto n = allocation(s.gpu.rr_output->GetDesc());
             if (!n || n == UINT64_MAX || n > b)
@@ -53,10 +66,11 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
             depth = (std::max)(depth, texture + buffer);
         }
     }
-    UINT64 required{};
-    if (extra_persistent > UINT64_MAX - persistent.bytes || output > UINT64_MAX - base ||
-        !rrtrans::RequiredSlots(count, base + output, depth, sss, glass, 0,
-                                persistent.bytes + extra_persistent, required))
+    UINT64 required{}, kept{};
+    if (!PersistentBytes(kept) || extra_persistent > UINT64_MAX - kept ||
+        output > UINT64_MAX - base ||
+        !rrtrans::RequiredSlots(count, base + output, depth, sss, glass, 0, kept + extra_persistent,
+                                required))
         return false;
     return budget.Reserve(pipelines.device.Get(), required);
 }
