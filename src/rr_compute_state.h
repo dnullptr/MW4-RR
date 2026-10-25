@@ -23,6 +23,21 @@ struct OutputBindings {
     UINT64 generation{}, serial{};
     bool known{}, covered{};
 };
+// One native ExecuteIndirect as the tracker forwarded it. replay re-issues it
+// through the same trampoline, so this detour, Update and the observer never see
+// the replay. It is still the add-on's own command: record it under
+// rrinternal::Scope and Tracker::Internal like any other, since a hooked layer
+// below the trampoline can reach a detour again.
+struct IndirectCall {
+    ID3D12GraphicsCommandList *cl{};
+    ID3D12CommandSignature *signature{};
+    UINT max{};
+    ID3D12Resource *args{};
+    UINT64 args_offset{};
+    ID3D12Resource *count{};
+    UINT64 count_offset{};
+    void (*replay)(const IndirectCall &){};
+};
 enum class Kind { Empty, Table, Constants, CBV, SRV, UAV };
 struct Argument {
     Kind kind{};
@@ -86,6 +101,7 @@ struct Snapshot {
     }
 };
 class Tracker {
+    friend struct TrackerTestAccess;
     enum Method {
         PSO,
         Root,
@@ -154,6 +170,9 @@ class Tracker {
     std::atomic<bool> write_observers_healthy{true};
     void (*before_write)(ID3D12GraphicsCommandList *, WriteKind){};
     void (*bound_outputs)(const OutputBindings &){};
+    // Registered before Attach; an observer exception or a refused change nulls it.
+    std::atomic<void (*)(const IndirectCall &)> after_indirect{};
+    void (*indirect_log)(const char *){};
     bool (*shared_output_context)(ID3D12GraphicsCommandList *){};
     static inline Tracker *active{};
     struct Error {
@@ -180,6 +199,25 @@ class Tracker {
             bound_outputs(CaptureOutputBindings(cl));
         } catch (...) {
             write_observers_healthy = false;
+        }
+    }
+    void AfterIndirect(const IndirectCall &call) noexcept {
+        if (internal)
+            return;
+        auto *observer = after_indirect.load(std::memory_order_acquire);
+        if (!observer)
+            return;
+        Error preserve;
+        try {
+            observer(call);
+        } catch (...) {
+            // Only the first failure logs, even when two lists throw at once.
+            if (after_indirect.exchange(nullptr) && indirect_log)
+                try {
+                    indirect_log("RR indirect draw observer exception; observer disabled, "
+                                 "native call already forwarded");
+                } catch (...) {
+                }
         }
     }
     bool WriteCovered(State &s, const std::array<void *, Count> &current) const {
@@ -348,6 +386,11 @@ class Tracker {
             s.sss_cbvs.Invalidate();
             s.uncertain = true;
         });
+        active->AfterIndirect({cl, sig, n, args, offset, count, count_offset, &Replay<N>});
+    }
+    template <size_t N> static void Replay(const IndirectCall &c) {
+        Forward<Indirect, N>(c.cl, c.signature, c.max, c.args, c.args_offset, c.count,
+                             c.count_offset);
     }
     template <size_t N>
     static void STDMETHODCALLTYPE OnBundle(ID3D12GraphicsCommandList *cl,
@@ -725,6 +768,30 @@ class Tracker {
             return false;
         }
     }
+    // Called after each forwarded native ExecuteIndirect that is not Internal, outside
+    // the tracker lock. Same registration rule as above; a refusal or an observer
+    // exception turns off only this observer.
+    bool SetAfterIndirect(void (*observer)(const IndirectCall &),
+                          void (*log)(const char *)) noexcept {
+        try {
+            std::lock_guard install(install_mutex);
+            std::lock_guard lock(mutex);
+            const auto current = after_indirect.load();
+            if (!observer || !log || (!states.empty() && current != observer) ||
+                (current && (current != observer || indirect_log != log))) {
+                after_indirect = nullptr;
+                return false;
+            }
+            if (!current) {
+                indirect_log = log;
+                after_indirect.store(observer, std::memory_order_release);
+            }
+            return true;
+        } catch (...) {
+            after_indirect = nullptr;
+            return false;
+        }
+    }
     bool WriteObserverCoverage(ID3D12GraphicsCommandList *cl,
                                void (*before)(ID3D12GraphicsCommandList *, WriteKind),
                                void (*bound)(const OutputBindings &)) noexcept {
@@ -925,6 +992,20 @@ class Tracker {
     void ForgetRoot(ID3D12RootSignature *root) {
         std::lock_guard lock(mutex);
         layouts.erase(root);
+    }
+    // The 32-bit value count of a root-constants parameter, or -1 when the root
+    // signature or the parameter is not known to hold root constants.
+    int RootConstantWords(ID3D12RootSignature *root, UINT parameter) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            const auto i = layouts.find(root);
+            if (!root || i == layouts.end() || parameter >= i->second.count)
+                return -1;
+            const auto &shape = i->second.params[parameter];
+            return shape.kind == Kind::Constants && !shape.ignored ? int(shape.words) : -1;
+        } catch (...) {
+            return -1;
+        }
     }
     bool TableBound(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pipeline,
                     ID3D12RootSignature *root, UINT parameter, UINT64 address) {
