@@ -70,8 +70,7 @@ bool RayRefuse(RayWhy why, unsigned m) noexcept {
         !ray_waited[i]) {
         ray_waited[i] = true;
         char line[192];
-        std::snprintf(line, sizeof(line), "Ray budget test waiting: %s",
-                      rrraybudget::Text(why));
+        std::snprintf(line, sizeof(line), "Ray budget test waiting: %s", rrraybudget::Text(why));
         RayWrite(line);
     }
     return false;
@@ -88,8 +87,7 @@ void RayLogFailed(const char *what) noexcept {
         return;
     ray_log_failed = true;
     char line[320];
-    std::snprintf(line, sizeof(line),
-                  "RR ray budget: logging copies disabled for the session (%s)",
+    std::snprintf(line, sizeof(line), "RR ray budget: logging copies disabled for the session (%s)",
                   what && *what ? what : "unknown error");
     RayWrite(line);
 }
@@ -237,15 +235,15 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
     case RayWhy::StatsMismatch:
         for (unsigned l = 0; l < 2; ++l)
             if ((raised >> l & 1) && !rrraybudget::StatsCover(c, l)) {
-                std::snprintf(out, size, "lobe%u x=%u rawRays=%u", l + 1,
-                              unsigned(c.log[25 + l]), unsigned(f[RawRays + l]));
+                std::snprintf(out, size, "lobe%u x=%u rawRays=%u", l + 1, unsigned(c.log[25 + l]),
+                              unsigned(f[RawRays + l]));
                 return;
             }
         break;
     case RayWhy::Overflow:
         for (unsigned l = 0; l < 2; ++l)
-            if ((raised >> l & 1) && rrraybudget::Scheduled(f, l) + rrraybudget::ConsumerSlack >
-                                         c.armed.capacity[l]) {
+            if ((raised >> l & 1) &&
+                rrraybudget::Scheduled(f, l) + rrraybudget::ConsumerSlack > c.armed.capacity[l]) {
                 std::snprintf(out, size, "lobe%u worst=%llu entries=%llu", l + 1,
                               static_cast<unsigned long long>(rrraybudget::Scheduled(f, l)),
                               static_cast<unsigned long long>(c.armed.capacity[l]));
@@ -278,8 +276,7 @@ static rrraybudget::Completed RayFrame(const Slot &s, const rrdensity::Frame &ra
 // a stale or zero serial and its bits are dropped.
 static unsigned RaySerialBits(unsigned logged, const RayLogWords &log, UINT serial) noexcept {
     using namespace rrraybudget;
-    constexpr unsigned resolve =
-                           LogResolveTarget | LogExecuted | LogResolveScene | LogResolveStats,
+    constexpr unsigned resolve = LogResolveTarget | LogExecuted | LogResolveScene | LogResolveStats,
                        apply = LogApplyTarget | LogApplySettings36 | LogApplyScene251 |
                                LogApplyScene253;
     static_assert((resolve | apply) == 0xFF && !(resolve & apply), "two halves, every bit");
@@ -341,9 +338,8 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
         constexpr unsigned apply_bits =
             rrraybudget::LogApplyTarget | rrraybudget::LogApplySettings36 |
             rrraybudget::LogApplyScene251 | rrraybudget::LogApplyScene253;
-        if (!s.pre_submitted ||
-            (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
-             log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
+        if (!s.pre_submitted || (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
+                                 log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
             RayUnverified(s);
             return;
         }
@@ -380,15 +376,16 @@ void RayReport(UINT64 now) noexcept {
 }
 void RayActiveLog(unsigned m, const rrraybudget::Plan &plan) noexcept {
     char line[512];
-    int at = std::snprintf(line, sizeof(line), "Ray budget test active (%s):",
-                           rrraybudget::labels[rrraybudget::Valid(m)]);
+    int at =
+        std::snprintf(line, sizeof(line),
+                      "Ray budget test active (%s):", rrraybudget::labels[rrraybudget::Valid(m)]);
     for (unsigned l = 0; l < 2 && at > 0 && at < int(sizeof(line)); ++l)
-        at += (plan.mask >> l & 1)
-                  ? std::snprintf(line + at, sizeof(line) - at, "%s lobe%u %.3f -> %.3f",
-                                  l ? "," : "", l + 1, double(plan.native[l]),
-                                  double(plan.target[l]))
-                  : std::snprintf(line + at, sizeof(line) - at, "%s lobe%u %.3f (not raised)",
-                                  l ? "," : "", l + 1, double(plan.native[l]));
+        at +=
+            (plan.mask >> l & 1)
+                ? std::snprintf(line + at, sizeof(line) - at, "%s lobe%u %.3f -> %.3f",
+                                l ? "," : "", l + 1, double(plan.native[l]), double(plan.target[l]))
+                : std::snprintf(line + at, sizeof(line) - at, "%s lobe%u %.3f (not raised)",
+                                l ? "," : "", l + 1, double(plan.native[l]));
     const double extent = double(plan.armed.w) * double(plan.armed.h);
     if (at > 0 && at < int(sizeof(line)))
         std::snprintf(line + at, sizeof(line) - at,
@@ -427,8 +424,8 @@ template <class Record> unsigned RayLogCopies(Slot &s, UINT64 now, Record record
 }
 // Bookkeeping after the patched resolve and the governor were recorded. It never undoes them:
 // a failure here is a sticky stop.
-void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve &in,
-                UINT64 now, unsigned m) noexcept {
+void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve &in, UINT64 now,
+                unsigned m) noexcept {
     try {
         s.ray_patched = plan.mask;
         s.ray_written = {plan.bits[0], plan.bits[1]};
@@ -448,8 +445,8 @@ void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve
         RayStop(RayWhy::Exception, "after the controller dispatch");
     }
 }
-bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &in, UINT x,
-                      UINT y, UINT z, bool &dispatched) noexcept {
+bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &in, UINT x, UINT y,
+                      UINT z, bool &dispatched) noexcept {
     const UINT64 now = GetTickCount64();
     const unsigned m = rrraybudget::Valid(rrraybudget::mode.load(std::memory_order_relaxed));
     if (m != ray_logged_mode) {
@@ -483,8 +480,7 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         // This resolve writes its Budget natively unless the patch below succeeds (A4).
         if (in.budget_resource)
             RayClearMark(in.budget_resource, in.budget_offset);
-        ray_summary.Resolve(s.ray_applied,
-                            s.ray_applied && s.ray_apply_cb == in.settings.address);
+        ray_summary.Resolve(s.ray_applied, s.ray_applied && s.ray_apply_cb == in.settings.address);
         unsigned logged = 0;
         if (in.constants && now >= ray_retry_after && !ray_log_failed)
             logged = RayLogCopies(
@@ -606,8 +602,7 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
             rrraybudget::published[k].store(table ? lists.v[k].resource : 0,
                                             std::memory_order_relaxed);
         }
-        if ((log.settings.upload || log.scene.upload) && now >= ray_retry_after &&
-            !ray_log_failed)
+        if ((log.settings.upload || log.scene.upload) && now >= ray_retry_after && !ray_log_failed)
             RayLogCopies(s, now, [&] { return s.gpu.LogApply(cl, log.settings, log.scene); });
     } catch (...) {
         RayStop(RayWhy::Exception, "at the VRRT apply");
