@@ -354,8 +354,6 @@ struct GpuFrame {
             UAV(p, guides[i].Get(), 4 + i);
         }
         SRV(p, guides[3].Get(), 8);
-        sky_edge = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
-        UAV(p, sky_edge.Get(), 12);
         auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
         distance.Flags = D3D12_RESOURCE_FLAG_NONE;
         specular_hit = Allocate(p, b, distance);
@@ -578,6 +576,14 @@ struct GpuFrame {
         Order(cl);
         Change(cl, rr_output.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    // Allocated on first use, before recording; RequiredPrepassBytes already
+    // reserves it, so the mask costs no GPU memory while it stays off.
+    void PrepareSkyEdge(Pipelines &p, Budget &b) {
+        if (sky_edge)
+            return;
+        sky_edge = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
+        UAV(p, sky_edge.Get(), 12);
     }
     // Between GateBegin and GateEnd: Status (guides[3]) is a shader resource.
     // Leaves the mask readable by RR; SkyEdgeFinish returns it to COMMON.

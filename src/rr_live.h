@@ -1177,6 +1177,18 @@ class Controller {
             sky_edge_active =
                 rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
                                sky_edge_strength, preset.has_effective, preset.effective);
+            if (sky_edge_active) {
+                try {
+                    s->gpu.PrepareSkyEdge(pipelines, budget);
+                } catch (const rrprivate::AllocationDeferred &) {
+                    sky_edge_active = false;
+                    static bool reported{};
+                    if (!reported) {
+                        reported = true;
+                        Log("Sky edge mask waiting for GPU memory; RR runs without it");
+                    }
+                }
+            }
             responsivity_active =
                 !sky_edge_active &&
                 rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
