@@ -458,7 +458,7 @@ struct NativeDesc {
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R11G11B10_FLOAT;
         desc.DSVFormat = dsv;
-        desc.SampleDesc = {4, D3D12_STANDARD_MULTISAMPLE_PATTERN};
+        desc.SampleDesc = {4, UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)};
         desc.CachedPSO = {cached, sizeof(cached)};
     }
 };
