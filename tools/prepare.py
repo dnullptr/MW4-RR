@@ -80,12 +80,13 @@ def main():
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
         ('rr_live_gate.hlsl', 'Validate', 'RRLiveValidate', 'rr_live_validate'),
         ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
-        ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask')]:
+        ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask'),
+        ('rr_sky_depth_floor.hlsl', 'main', 'RRSkyDepthFloor', 'rr_sky_depth_floor')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)
     # Guide test variants (src/rr_guide_test.h).
-    for test in range(1, 7):
+    for test in range(1, 9):
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', 'main', '/D', f'RR_GUIDE_TEST={test}',
                         '/Fh', str(out / f'rr_convert_guides_test{test}.generated.h'),
                         '/Vn', f'RRGuideShaderTest{test}',

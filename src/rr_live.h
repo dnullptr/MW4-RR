@@ -1222,6 +1222,16 @@ class Controller {
                                        projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
             s->gpu.Depth(cl.Get(), states[1]);
+            if (rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
+                    rrguidetest::SkySurface &&
+                !s->gpu.DepthFloor(cl.Get(), pipelines, rrguidetest::DepthFloor)) {
+                static bool reported{};
+                if (!reported) {
+                    reported = true;
+                    Log("Guide test: sky depth floor unavailable (RR reads the game's depth "
+                        "directly); only sky normals changed");
+                }
+            }
             for (unsigned i = 0; i < 3; ++i)
                 if (i != 1 || !s->gpu.use_depth)
                     Change(cl.Get(), s->gpu.sr[i].Get(), states[i],

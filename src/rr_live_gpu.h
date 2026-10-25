@@ -9,6 +9,9 @@
 #include "../build/rr_convert_guides_test4.generated.h"
 #include "../build/rr_convert_guides_test5.generated.h"
 #include "../build/rr_convert_guides_test6.generated.h"
+#include "../build/rr_convert_guides_test7.generated.h"
+#include "../build/rr_convert_guides_test8.generated.h"
+#include "../build/rr_sky_depth_floor.generated.h"
 #include "rr_guide_test.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
@@ -109,8 +112,9 @@ struct Budget {
 struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root;
-    ComPtr<ID3D12PipelineState> converter, probability, sky_edge;
+    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
+        depth_floor_root;
+    ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
@@ -143,6 +147,10 @@ struct Pipelines {
                  converter_tests[4]);
         Pipeline(converter_root.Get(), RRGuideShaderTest6, sizeof(RRGuideShaderTest6),
                  converter_tests[5]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest7, sizeof(RRGuideShaderTest7),
+                 converter_tests[6]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest8, sizeof(RRGuideShaderTest8),
+                 converter_tests[7]);
         ranges[0].NumDescriptors = 3;
         ranges[1].NumDescriptors = 1;
         D3D12_ROOT_PARAMETER q[5]{};
@@ -171,6 +179,15 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
+        // Sky depth floor: depth copy UAV table, 4 root constants.
+        D3D12_ROOT_PARAMETER f[2]{};
+        f[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        f[0].DescriptorTable = {1, &ranges[1]};
+        f[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        f[1].Constants = {0, 0, 4};
+        rd = {2, f};
+        Root(rd, depth_floor_root);
+        Pipeline(depth_floor_root.Get(), RRSkyDepthFloor, sizeof(RRSkyDepthFloor), depth_floor);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
@@ -342,7 +359,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 13,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 14,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -521,9 +538,10 @@ struct GpuFrame {
                         rows == native.Height && width == native.Width * 4 && size,
                     "live depth plane footprint invalid");
             depth_buffer = Allocate(p, b, rrprivate::Buffer(size));
-            auto d = TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT);
-            d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            depth = Allocate(p, b, d);
+            // UAV only for the "non-zero sky depth" guide test (DepthFloor).
+            depth = Allocate(
+                p, b, TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT));
+            UAV(p, depth.Get(), 13);
         }
     }
     void Depth(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES source_state) {
@@ -550,6 +568,28 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_COMMON);
         Change(cl, depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    // After Depth(): lifts sky depth in the private copy (guide test SkySurface).
+    // Returns false when RR reads the game's depth directly and nothing can change.
+    bool DepthFloor(ID3D12GraphicsCommandList *cl, Pipelines &p, float floor) {
+        if (!use_depth || !depth)
+            return false;
+        const auto d = depth->GetDesc();
+        Change(cl, depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.depth_floor_root.Get());
+        cl->SetPipelineState(p.depth_floor.Get());
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, 13));
+        UINT c[] = {UINT(d.Width), d.Height, 0, 0};
+        memcpy(&c[2], &floor, sizeof(floor));
+        cl->SetComputeRoot32BitConstants(1, 4, c, 0);
+        cl->Dispatch((c[0] + 7) / 8, (c[1] + 7) / 8, 1);
+        Order(cl);
+        Change(cl, depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return true;
     }
     void BindGate(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history) {
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
@@ -713,7 +753,8 @@ inline bool SlotReservationParts(ID3D12Device *device, const rrlive::GpuFrame &f
     if (texture.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || texture.Width != depth_width ||
         texture.Height != depth_height || texture.DepthOrArraySize != 1 || texture.MipLevels != 1 ||
         texture.SampleDesc.Count != 1 || texture.SampleDesc.Quality ||
-        texture.Format != DXGI_FORMAT_R32_FLOAT || texture.Flags != D3D12_RESOURCE_FLAG_NONE)
+        texture.Format != DXGI_FORMAT_R32_FLOAT ||
+        texture.Flags != D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
         return false;
     if (buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !buffer.Width ||
         buffer.Height != 1 || buffer.DepthOrArraySize != 1 || buffer.MipLevels != 1 ||

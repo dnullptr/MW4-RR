@@ -63,7 +63,18 @@ void main(uint3 id : SV_DispatchThreadID)
     uint4 surface=PackedSurface.Load(int3(p,0));float depth=asfloat(surface.x);
     // NVIDIA's RR guide: sky diffuse albedo 0.5, specular albedo and normal 0.
     // Zero sky albedo smears thin foliage and wire edges against the sky.
-    if(depth==0 || surface.x==0x7f7fffffu){RRWriteEmpty(p,2,1);DiffuseAlbedo[p]=float4(0.5,0.5,0.5,1);return;}
+    if(depth==0 || surface.x==0x7f7fffffu){
+        RRWriteEmpty(p,2,1);DiffuseAlbedo[p]=float4(0.5,0.5,0.5,1);
+#if RR_GUIDE_TEST==7 || RR_GUIDE_TEST==8
+        // Sky as a surface: a normal facing the camera instead of 0, so RR cannot
+        // single sky pixels out by their normal. Sky uses the primary camera rows.
+        float2 skyClip=1-2*(float2(p)+0.5)*Scene[86].zw;
+        float3 skyRay=Scene[148].xyz*skyClip.x+Scene[149].xyz*skyClip.y+Scene[150].xyz;
+        float skyLength2=dot(skyRay,skyRay);
+        if(RRFinite(skyLength2) && skyLength2>=1e-20)NormalRoughness[p]=float4(-skyRay*rsqrt(skyLength2),1);
+#endif
+        return;
+    }
     if(!RRFinite(depth) || depth<=0 || depth>1)return;
     bool alternate=(surface.w&1u)!=0, special=(surface.w&2u)!=0, depthOverride=(surface.w&8u)!=0;
     if(alternate!=(depth>63.0/64.0) || (depthOverride&&!special))return;
