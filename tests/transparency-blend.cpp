@@ -1078,11 +1078,28 @@ static void TestPattern() {
     g = Sample();
     Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
     assert(g.diffuse[0] == 0.25f);
-    // Black: the mean is floored at 1e-4, so black stays black.
-    FillColor(color, 0.f);
+    // Too dark to scale by (mean below 1e-4): Diffuse, never a black material.
+    for (float dark : {0.f, 5e-5f}) {
+        FillColor(color, dark);
+        color[2][2][0] = 2.f * dark;
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        for (int i = 0; i < 3; ++i)
+            assert(g.diffuse[i] == 0.25f);
+    }
+    // At the floor the pattern applies again.
+    FillColor(color, 2e-4f);
     g = Sample();
-    Reference(Admitted(plain), 3, 3, 1, t, g, &color);
-    assert(g.diffuse[0] == 0.f && g.diffuse[1] == 0.f && g.diffuse[2] == 0.f);
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    assert(Near(g.diffuse[0], 0.25f));
+    FillColor(color, 2e-4f);
+    for (int dy = 0; dy < 5; ++dy)
+        for (int dx = 0; dx < 5; ++dx)
+            color[dy][dx][0] = color[dy][dx][1] = color[dy][dx][2] = (dx + dy) % 2 ? 1e-4f : 2e-4f;
+    color[2][2][0] = color[2][2][1] = color[2][2][2] = 1e-4f;
+    g = Sample(); // mean 1.48e-4: above the floor, the pixel is darker than it
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    assert(g.diffuse[0] < 0.25f && g.diffuse[0] > 0.1f);
 
     // The box is clamped to the extent: out-of-bounds taps are ignored.
     {

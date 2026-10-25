@@ -356,12 +356,13 @@ inline float Lerp(float x, float y, float s) {
 inline float Luma(const float (&c)[3]) {
     return c[0] * 0.299f + c[1] * 0.587f + c[2] * 0.114f;
 }
-// Smallest local mean luma the pattern target divides by.
+// Smallest local mean luma the pattern target divides by; below it, Diffuse.
 inline constexpr float PatternFloor = 1e-4f;
 // The pattern diffuse target of render pixel (x, y): Diffuse * colour / M,
 // saturated, where M is the mean luma of the 5x5 box of colour around the
 // pixel, over the taps inside width x height. color[dy + 2][dx + 2] is the
-// colour at (x + dx, y + dy). A non-finite colour or M gives Diffuse.
+// colour at (x + dx, y + dy). A non-finite colour or M, or M below
+// PatternFloor, gives Diffuse: a dark scene's glass never becomes black.
 inline void PatternTarget(const Control &control, uint32_t x, uint32_t y,
                           const float (&color)[5][5][3], float (&target)[3]) {
     float sum = 0.f, count = 0.f;
@@ -375,11 +376,10 @@ inline void PatternTarget(const Control &control, uint32_t x, uint32_t y,
         }
     const float mean = sum / count;
     const auto &c = color[2][2];
-    const bool finite =
-        std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]) && std::isfinite(mean);
+    const bool usable = std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]) &&
+                        std::isfinite(mean) && !(mean < PatternFloor);
     for (int ch = 0; ch < 3; ++ch)
-        target[ch] = finite ? Saturate(control.diffuse[ch] * c[ch] / (std::max)(mean, PatternFloor))
-                            : control.diffuse[ch];
+        target[ch] = usable ? Saturate(control.diffuse[ch] * c[ch] / mean) : control.diffuse[ch];
 }
 // transmittance[dy + 1][dx + 1] is t(q) for q = (x + dx, y + dy), the coverage
 // sample that maps to render pixel q. Taps outside width x height are ignored;

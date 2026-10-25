@@ -30,8 +30,8 @@ float3 Opacity(int2 q) {
 }
 // Pattern diffuse target of render pixel p: Diffuse * colour / M, saturated, where M is the
 // mean luma of the 5x5 colour box around p over the taps inside the extent. A non-finite
-// colour or M gives Diffuse. Precise, so that no fast-math (no-NaN/no-Inf) flag lets the
-// compiler drop the finiteness test.
+// colour or M, or M below 1e-4 (too dark to scale by), gives Diffuse. Precise, so that no
+// fast-math (no-NaN/no-Inf) flag lets the compiler drop the finiteness test.
 float3 PatternTarget(int2 p) {
     precise float sum = 0.0;
     float count = 0.0;
@@ -44,9 +44,9 @@ float3 PatternTarget(int2 p) {
     }
     precise float m = sum / count;
     precise float3 color = Color.Load(int3(p, 0)).rgb;
-    if (!all(isfinite(color)) || !isfinite(m))
+    if (!all(isfinite(color)) || !isfinite(m) || m < 1e-4)
         return Diffuse.rgb;
-    precise float3 target = Diffuse.rgb * color / max(m, 1e-4);
+    precise float3 target = Diffuse.rgb * color / m;
     return saturate(target);
 }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
