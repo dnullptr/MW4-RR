@@ -278,7 +278,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "only never uses the game's accumulation. The source view (debug) colours "
                        "each SSS pixel by where history + spatial took it from: blue a fresh "
                        "ray, green the game's history, yellow the average of nearby rays, red "
-                       "no ray nearby. Older options are under Older tests.");
+                       "no ray nearby. History first + spatial also uses the game's history where a "
+                       "fresh ray landed, so settled pixels never show a single noisy ray. Older "
+                       "options are under Older tests.");
     if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
         ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     // Session only: the combo never sets `changed`, so the test is never saved or loaded.

@@ -72,7 +72,7 @@ static_assert(rrlighting::SssNative2 == 9 && rrlighting::SssFill2 == 10 &&
               rrlighting::SssNative3 == 11 && rrlighting::SssFill3 == 12 &&
               rrlighting::SssFill2Spatial == 13 && rrlighting::SssSpatial2 == 14 &&
               rrlighting::SssFill2Settled == 15 && rrlighting::SssFillDebug == 16 &&
-              rrlighting::Count == 17);
+              rrlighting::SssHistory2 == 17 && rrlighting::Count == 18);
 static_assert(rrlighting::Valid(rrlighting::SssFill3) == rrlighting::SssFill3);
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssNative2]) ==
               "SSS pixels: lobe 2 native temporal");
@@ -87,8 +87,9 @@ static_assert(rrlighting::SssMasked(rrlighting::SssFill2Spatial) &&
               rrlighting::SssMasked(rrlighting::SssSpatial2) &&
               rrlighting::SssMasked(rrlighting::SssFill2Settled));
 static_assert(rrlighting::Valid(rrlighting::SssFill2Settled) == rrlighting::SssFill2Settled &&
-              rrlighting::Valid(17) == rrlighting::Raw &&
-              rrlighting::SssMasked(rrlighting::SssFillDebug));
+              rrlighting::Valid(18) == rrlighting::Raw &&
+              rrlighting::SssMasked(rrlighting::SssFillDebug) &&
+              rrlighting::SssMasked(rrlighting::SssHistory2));
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill2Spatial]) ==
               "SSS pixels: lobe 2 fill gaps, history + spatial (test)");
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssSpatial2]) ==

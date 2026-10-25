@@ -82,7 +82,8 @@ def main():
                                *extra)), False)
           for name, history, debug in (('SssFill2Spatial', 1, ()), ('SssSpatial2', 4096, ()),
                                        ('SssFill2Settled', 4, ()),
-                                       ('SssFillDebug', 1, ('-D', 'RR_FILL_DEBUG=1')))
+                                       ('SssFillDebug', 1, ('-D', 'RR_FILL_DEBUG=1')),
+                                       ('SssHistory2', 1, ('-D', 'RR_FILL_PREFER_NATIVE=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
     # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and

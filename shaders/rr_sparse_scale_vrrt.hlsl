@@ -122,6 +122,15 @@ uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if RR_FILL_DEBUG&&!RR_FILL_SPATIAL
 #error RR_FILL_DEBUG needs RR_FILL_SPATIAL
 #endif
+// RR_FILL_PREFER_NATIVE (as RR_FILL_SPATIAL): a pixel whose native lobe-2 field is at least
+// RR_FILL_HISTORY takes native temporal even where a fresh ray landed, so a settled pixel never
+// shows a single noisy sample; fresh unboosted samples are used only where there is no history.
+#ifndef RR_FILL_PREFER_NATIVE
+#define RR_FILL_PREFER_NATIVE 0
+#endif
+#if RR_FILL_PREFER_NATIVE&&(!RR_FILL_SPATIAL||RR_FILL_DEBUG)
+#error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL and not RR_FILL_DEBUG
+#endif
 #if RR_FILL_SPATIAL
 groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
 uint2 GroupMean(uint2 gt,out uint n){
@@ -196,6 +205,10 @@ void main(uint3 id:SV_DispatchThreadID){
 #if RR_FILL_SPATIAL
  uint found=1;
  if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy,found);
+#if RR_FILL_PREFER_NATIVE
+ if(fb&&((nw>>8)&4095)>=RR_FILL_HISTORY){
+  cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);}
+#endif
 #if RR_FILL_DEBUG
  {const float3 shade=fb?float3(0,0,1):((nw>>8)&4095)>=RR_FILL_HISTORY?float3(0,1,0):
                      found!=0?float3(1,1,0):float3(1,0,0);

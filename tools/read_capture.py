@@ -21,7 +21,7 @@ import numpy as np
 # 61 (R8_UNORM) is scaled to 0-1.
 FORMATS = {2: ('<f4', 4), 10: ('<f2', 4), 16: ('<f4', 2), 26: ('<u4', 1), 34: ('<f2', 2),
            41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1), 61: ('<u1', 1)}
-# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-16 need the SSS pre-denoise
+# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-17 need the SSS pre-denoise
 # build).
 LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from native temporal',
             'Lobe 2 fill gaps', 'Both lobes fill gaps', 'Raw, cap bright samples (8x)',
@@ -31,7 +31,8 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'SSS pixels: lobe 2 fill gaps, history + spatial (test)',
             'SSS pixels: lobe 2 spatial fill only (test)',
             'SSS pixels: lobe 2 fill gaps, settled + spatial (test)',
-            'SSS pixels: history + spatial source view (debug)']
+            'SSS pixels: history + spatial source view (debug)',
+            'SSS pixels: lobe 2 history first + spatial (test)']
 MIXED_LIGHTING = 0xFFFFFFFF  # A frame's lighting_input when it changed within the frame.
 # Per-frame lighting_masked: whether an SSS-masked lighting input had its SSS guide.
 MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
@@ -352,8 +353,8 @@ def self_test():
         mixed['settings'] = {**mixed['settings'], 'lighting_input': 0xFFFFFFFF}
         expect('lighting input 4294967295: mixed (changed within the frame)' in
                summary(mixed, frames), 'mixed header label')
-        mixed['settings']['lighting_input'] = 17
-        expect('lighting input 17: unknown' in summary(mixed, frames), 'unknown lighting label')
+        mixed['settings']['lighting_input'] = 18
+        expect('lighting input 18: unknown' in summary(mixed, frames), 'unknown lighting label')
         # Input states: a manifest without them (older builds) prints nothing new.
         expect('input states' not in text and 'differ in input states' not in text,
                'no input states line without the keys')
