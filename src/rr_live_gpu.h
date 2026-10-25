@@ -199,7 +199,7 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
-        // Color scale, sky depth floor and weapon depth tests: source SRV table,
+        // Color scale and sky depth floor tests, and weapon depth: source SRV table,
         // target UAV table, 8 root constants.
         e[2].Constants = {0, 0, 8};
         Root(rd, test_root);
@@ -257,8 +257,9 @@ struct Pipelines {
     void WaterPipeline() {
         if (water)
             return;
-        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
-                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
+        // t1 SSS mask; u0 responsivity, u1 disocclusion, u2 the water classification.
+        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 0},
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 0}};
         D3D12_ROOT_PARAMETER p[4]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         for (unsigned i = 0; i < 2; ++i) {
@@ -266,7 +267,7 @@ struct Pipelines {
             p[i + 1].DescriptorTable = {1, &ranges[i]};
         }
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        p[3].Descriptor.ShaderRegister = 2;
+        p[3].Descriptor.ShaderRegister = 3;
         D3D12_ROOT_SIGNATURE_DESC desc{4, p};
         Root(desc, water_root);
         Pipeline(water_root.Get(), RRWaterMasks, sizeof(RRWaterMasks), water);
@@ -345,7 +346,7 @@ struct GpuFrame {
                           DepthTarget = 15;
     // The guide shader's u4 water classification (WaterTarget).
     static constexpr UINT WaterSlot = 16;
-    // The weapon depth test's target, after the water slot.
+    // Weapon depth's target, after the water slot.
     static constexpr UINT WeaponTarget = 17;
     // Hit distance conditioning: five sources (ConditionDistance), then its target.
     static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;
@@ -457,10 +458,10 @@ struct GpuFrame {
         header_map = (UINT *)m;
         memset(m, 0, 256);
         // stats bytes (rr_live_gate.hlsl): 0 bad, 4 copied, 8 isolated, 12 sanitized SSS
-        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20..63 hit
+        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterCounts); 20..63 hit
         // distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..227 ray density
         // (ReadRates); 228 non-finite color, 232 non-finite displayed output (rr_gate_stats.h,
-        // ReadFinite).
+        // ReadFinite); 236..255 water prepass flags (rrwater::PrepassOffset, ReadWaterCounts).
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
@@ -901,36 +902,41 @@ struct GpuFrame {
         cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 256);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
-    // SR time, after the SSS resolve. Reads this frame's classification and,
-    // when merged, the SSS responsivity mask (left NON_PIXEL_SHADER_RESOURCE by
-    // that resolve); leaves both masks readable for RR until WaterFinish.
+    // SR time, after the SSS resolve. Counts this frame's classification codes,
+    // rewrites them as 1 on water and 0 elsewhere, and reads the SSS responsivity
+    // mask when merged (left NON_PIXEL_SHADER_RESOURCE by that resolve). Leaves
+    // the classification and both masks readable for RR until WaterFinish.
     void WaterPass(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *sss_mask) {
         Require(water.ready && water_written && p.water, "water masks unavailable");
         auto cpu = water.heap->GetCPUDescriptorHandleForHeapStart();
         const auto gpu = water.heap->GetGPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R8_UNORM;
+        srv.Format = DXGI_FORMAT_R16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
-        p.device->CreateShaderResourceView(water.mask.Get(), &srv, cpu);
-        srv.Format = DXGI_FORMAT_R16_FLOAT;
-        p.device->CreateShaderResourceView(sss_mask, &srv, {cpu.ptr + p.stride});
+        p.device->CreateShaderResourceView(sss_mask, &srv, cpu);
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
         uav.Format = DXGI_FORMAT_R16_FLOAT;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         p.device->CreateUnorderedAccessView(water.responsivity.Get(), nullptr, &uav,
-                                            {cpu.ptr + 2 * p.stride});
+                                            {cpu.ptr + p.stride});
         p.device->CreateUnorderedAccessView(water.disocclusion.Get(), nullptr, &uav,
+                                            {cpu.ptr + 2 * p.stride});
+        uav.Format = DXGI_FORMAT_R8_UNORM;
+        p.device->CreateUnorderedAccessView(water.mask.Get(), nullptr, &uav,
                                             {cpu.ptr + 3 * p.stride});
-        Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        for (auto *r : {water.responsivity.Get(), water.disocclusion.Get()})
+        for (auto *r : {water.mask.Get(), water.responsivity.Get(), water.disocclusion.Get()})
             Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // Zero the water pixel count (stats byte 16) from the header's never-written tail.
+        // Zero the water pixel count (stats byte 16) and the prepass flag counts
+        // (rrwater::PrepassOffset) from the header's never-written tail.
+        static_assert(rrwater::PrepassOffset == RR_STATS_NON_FINITE_OUTPUT + 4 &&
+                      rrwater::PrepassOffset + 4 * rrwater::PrepassCount <= 256);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(stats.Get(), 16, header.Get(), 64, 4);
+        cl->CopyBufferRegion(stats.Get(), rrwater::PrepassOffset, header.Get(), 64,
+                             4 * rrwater::PrepassCount);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {water.heap.Get()};
@@ -939,11 +945,11 @@ struct GpuFrame {
         cl->SetPipelineState(p.water.Get());
         cl->SetComputeRootConstantBufferView(0, header->GetGPUVirtualAddress());
         cl->SetComputeRootDescriptorTable(1, gpu);
-        cl->SetComputeRootDescriptorTable(2, {gpu.ptr + 2 * p.stride});
+        cl->SetComputeRootDescriptorTable(2, {gpu.ptr + p.stride});
         cl->SetComputeRootUnorderedAccessView(3, stats->GetGPUVirtualAddress());
         cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         Order(cl);
-        for (auto *r : {water.responsivity.Get(), water.disocclusion.Get()})
+        for (auto *r : {water.mask.Get(), water.responsivity.Get(), water.disocclusion.Get()})
             Change(cl, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
@@ -957,15 +963,20 @@ struct GpuFrame {
         memcpy(&header_map[14], &strength, sizeof(strength));
         header_map[15] = flags;
     }
-    // Water pixels counted by the latest WaterPass on this frame.
-    UINT ReadWaterPixels() {
-        UINT v{};
-        void *m{};
-        D3D12_RANGE r{16, 20};
-        Check(readback->Map(0, &r, &m), "live water statistics map failed");
-        memcpy(&v, static_cast<const char *>(m) + 16, sizeof(v));
-        r = {0, 0};
-        readback->Unmap(0, &r);
+    // Water pixels counted by the latest WaterPass on this frame. Two maps, so each
+    // reads only the water bytes (16, and 236..255), not the statistics between them.
+    rrwater::Counts ReadWaterCounts() {
+        rrwater::Counts v{};
+        const auto read = [&](UINT offset, void *out, UINT size) {
+            void *m{};
+            D3D12_RANGE r{offset, offset + size};
+            Check(readback->Map(0, &r, &m), "live water statistics map failed");
+            memcpy(out, static_cast<const char *>(m) + offset, size);
+            r = {0, 0};
+            readback->Unmap(0, &r);
+        };
+        read(16, &v.water, sizeof(v.water));
+        read(rrwater::PrepassOffset, v.prepass.data(), sizeof(v.prepass));
         return v;
     }
     // tolerate: count isolated unusable guide pixels instead of rejecting the frame.

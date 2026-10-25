@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-static unsigned originals{}, replacements{}, afters{};
+static unsigned originals{}, replacements{}, afters{}, skip_seen{}, replace_note{};
 static bool handle_rr = true, throw_rr = false, expect_reset = false, throw_original = false;
 static NVSDK_NGX_Result original_result = NVSDK_NGX_Result_Success;
 static NVSDK_NGX_Result Original(const NVSDK_NGX_Parameter *p) {
@@ -34,6 +34,8 @@ static NVSDK_NGX_Result NVSDK_CONV EvalC(ID3D12GraphicsCommandList *, const NVSD
 static bool Replace(ID3D12GraphicsCommandList *, const NVSDK_NGX_Parameter *,
                     NVSDK_NGX_Result &result) {
     ++replacements;
+    if (replace_note)
+        rrtrace::Probe::NoteSkip(replace_note);
     if (throw_rr)
         throw std::runtime_error("decline");
     result = NVSDK_NGX_Result_Success;
@@ -57,7 +59,10 @@ struct ProbeTestAccess {
         s.creation[UINT_PTR(h)].valid = true;
         probe.replace_evaluate = &Replace;
         probe.after_evaluate = [](ID3D12GraphicsCommandList *, Kind, const NVSDK_NGX_Parameter *,
-                                  NVSDK_NGX_Result) { ++afters; };
+                                  NVSDK_NGX_Result) {
+            ++afters;
+            skip_seen = Probe::CurrentSkip(); // What AfterSR reads on the native route.
+        };
         RecordingParams p;
         p.Set(NVSDK_NGX_Parameter_Reset, 0);
         auto call = [&](bool c) {
@@ -142,6 +147,31 @@ struct ProbeTestAccess {
         readonly_reset.values[NVSDK_NGX_Parameter_Reset] = 0;
         rrsr::ResetParameter readonly_check(&readonly_reset);
         assert(!readonly_check.Ready());
+        // Why native SR ran, for the capture log: set at the start of every evaluate, so a
+        // stale reason never survives, and refined by the replacement.
+        const auto skip = [&](const NVSDK_NGX_Parameter *q, bool c, auto callback) {
+            Probe::NoteSkip(rrsr::SkipCount);
+            skip_seen = rrsr::SkipCount;
+            c ? Probe::EvalCommon<0, true>(nullptr, h, q, nullptr)
+              : Probe::EvalCommon<0, false>(nullptr, h, q, callback);
+            return skip_seen;
+        };
+        handle_rr = false;
+        assert(skip(&p, false, nullptr) == rrsr::Declined);
+        assert(skip(&p, true, nullptr) == rrsr::Declined);
+        replace_note = rrsr::Unsafe; // TryReplaceSR names its own reason.
+        assert(skip(&p, false, nullptr) == rrsr::Unsafe);
+        replace_note = 0;
+        assert(skip(&readonly_reset, false, nullptr) == rrsr::ResetFixed);
+        throw_rr = true;
+        assert(skip(&p, false, nullptr) == rrsr::Threw);
+        throw_rr = false;
+        assert(skip(&p, false, cb) == rrsr::Callback);
+        s.creation[UINT_PTR(h)].valid = false;
+        assert(skip(&p, false, nullptr) == rrsr::Creation);
+        s.creation[UINT_PTR(h)].valid = true;
+        probe.replace_evaluate = nullptr;
+        assert(skip(&p, false, nullptr) == rrsr::NotCalled);
         Probe::active = nullptr;
     }
 };
@@ -195,7 +225,7 @@ static void CreationParameters() {
     rreval::CreateParameters(q, o);
     assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
     assert(flags == 0x1bf);
-    // Linear depth (the weapon depth test) drops DepthInverted as well, AutoExposure still.
+    // Linear depth (weapon depth) drops DepthInverted as well, AutoExposure still.
     o.flags = 75;
     RecordingParams l;
     rreval::CreateParameters(l, o, 6, true);
@@ -379,7 +409,7 @@ static void NgxLog() {
     rrngxlog::DescribeCreation(o, 6, false, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 11, "
                          "render 2224x1248, output 3840x2160"));
-    // Linear depth (the weapon depth test): the flags RR got lose DepthInverted too.
+    // Linear depth (weapon depth): the flags RR got lose DepthInverted too.
     rrngxlog::DescribeCreation(o, 6, true, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 3, "
                          "render 2224x1248, output 3840x2160"));

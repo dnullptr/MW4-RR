@@ -314,6 +314,21 @@ class Pool {
                                                         sizeof(RRVrrtScaleSssFill3Float)}
                                 : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill3,
                                                         sizeof(RRVrrtScaleSssFill3)};
+        case Source::SssFill2Spatial:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SpatialFloat,
+                                                        sizeof(RRVrrtScaleSssFill2SpatialFloat)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Spatial,
+                                                        sizeof(RRVrrtScaleSssFill2Spatial)};
+        case Source::SssSpatial2:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2Float,
+                                                        sizeof(RRVrrtScaleSssSpatial2Float)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2,
+                                                        sizeof(RRVrrtScaleSssSpatial2)};
+        case Source::SssFill2Settled:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SettledFloat,
+                                                        sizeof(RRVrrtScaleSssFill2SettledFloat)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Settled,
+                                                        sizeof(RRVrrtScaleSssFill2Settled)};
         default:
             return packed_float
                        ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}

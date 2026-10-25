@@ -23,6 +23,7 @@
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
 #include "rr_capture.h"
+#include <atomic>
 #include <mutex>
 #include <deque>
 #ifdef RR_FILTER_DIAGNOSTIC
@@ -69,12 +70,14 @@ class Controller {
         std::array<Observed, 4> states{};
         rreval::Options options;
         rrcapture::Capture captured; // The frame recorded on this slot, if any.
+        rrcapture::Lighting lighting; // What its first spatial passes prepared, while capturing.
         // Held until the slot retires: a replayed SR recording must never copy into freed memory.
         ComPtr<ID3D12Resource> capture_hold;
         unsigned capture_session{}; // The capture session capture_hold was recorded in.
         // TryReplaceSR's proof when it was not eligible while a capture was active.
         rrsr::StateProof proof;
         bool proof_failed{};
+        unsigned skip{}; // Why native SR ran (rrsr::Skip), kept by a capture of this frame.
     };
     struct Call {
         bool locked{};
@@ -122,16 +125,16 @@ class Controller {
     };
     // wide_output: RR's output while the color test brightens its input, in FP32
     // so the brightened result does not clip in the FP16 rr_output.
-    // weapon_test: the linear depth RR reads while the weapon depth test runs.
+    // weapon_test: the linear depth RR reads while weapon depth is on.
     // hit_scratch: the raw hit distance the conditioning reads while it rewrites
     // a slot's copy; used only inside one guide recording.
     DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test, hit_scratch;
     UINT64 test_reserve{};
-    // Weapon depth test (rrweapondepth): weapon_linear is the depth type the current RR
-    // feature was created with; weapon_hold says why the test stays off until its setting
-    // next changes. The hold outlives Reconfigure, so a test that cannot run restarts RR
+    // Weapon depth (rrweapondepth): weapon_linear is the depth type the current RR feature
+    // was created with; weapon_hold says why linear depth stays off until the setting next
+    // changes. The hold outlives Reconfigure, so linear depth that cannot run restarts RR
     // once, never over and over.
-    enum class WeaponHold { None, Memory, Projection, Refused };
+    using WeaponHold = rrweapondepth::Hold;
     bool weapon_linear{};
     WeaponHold weapon_hold{};
     unsigned weapon_hold_changes{};
@@ -176,6 +179,8 @@ class Controller {
     rrcapture::Session capture;
     std::shared_ptr<rrcapture::Outcome> capture_outcome;
     unsigned capture_lighting{};
+    // capture.Active(), set under the lock by CaptureChanged; NoteLighting reads it without it.
+    std::atomic<bool> capture_active{};
     unsigned capture_logged{}; // The capture session whose route and input states were logged.
     void Log(const char *s) {
         if (logger)
@@ -373,7 +378,7 @@ class Controller {
         return layout_pending || (preset.has_effective && preset.desired != preset.effective) ||
                (feature && weapon_linear != WeaponDepthWanted());
     }
-    // The weapon depth test's setting, unless held off since its last change. RR's depth
+    // The weapon depth setting, unless held off since its last change. RR's depth
     // type is fixed at creation, so a new feature takes it and a change restarts RR.
     bool WeaponDepthWanted() const {
         return rrweapondepth::enabled.load(std::memory_order_relaxed) &&
@@ -389,13 +394,13 @@ class Controller {
         weapon_hold_changes = changes;
         // UseTest already logged a memory failure.
         if (why == WeaponHold::Projection)
-            Log("Weapon depth test: the game's projection does not map to linear depth; test "
-                "off until its setting changes");
+            Log("Weapon depth: the game's projection does not map to linear depth; off until "
+                "the setting changes, RR runs with hardware depth");
         else if (why == WeaponHold::Refused) {
             char line[200];
             snprintf(line, sizeof(line),
-                     "Weapon depth test: RR did not accept linear depth%s%s%s; test off until its "
-                     "setting changes, RR runs with hardware depth",
+                     "Weapon depth: RR did not accept linear depth%s%s%s; off until the setting "
+                     "changes, RR runs with hardware depth",
                      outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
             Log(line);
         }
@@ -529,8 +534,9 @@ class Controller {
                 const bool sss = s.sss_used && !s.guides_withheld && s.sss.admission.accepted;
                 const bool glass =
                     s.transparency_used && !s.guides_withheld && s.transparency_accepted;
-                health.Frame(v,
-                             {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
+                // A frame whose gate never ran never reached RR: no guide counts for it.
+                health.Frame(v, {finite[0], finite[1], sss, glass, s.gate_recorded && s.hit_used,
+                                 s.gate_recorded && s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 if (s.gate_recorded && s.hit_conditioned)
@@ -538,7 +544,7 @@ class Controller {
                 else if (s.gate_recorded && s.hit_used && s.hit_test_on)
                     hit_pixels.Raw();
                 if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
-                    water_stats.Add(s.gpu.ReadWaterPixels(),
+                    water_stats.Add(s.gpu.ReadWaterCounts(),
                                     UINT64((std::min)(s.options.width, s.gpu.w)) *
                                         (std::min)(s.options.height, s.gpu.h));
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
@@ -586,6 +592,7 @@ class Controller {
             } catch (...) {
                 CaptureFailed("out of memory");
             }
+            CaptureChanged(); // A complete run is Writing.
             if (!done.empty())
                 WriteCaptureLocked(std::move(done));
         }
@@ -619,6 +626,10 @@ class Controller {
         } catch (...) {
         }
     }
+    // Follows every call that can change capture.state, under the lock.
+    void CaptureChanged() {
+        capture_active.store(capture.Active(), std::memory_order_relaxed);
+    }
     // A capture problem ends the capture, never RR. Fail is ignored while Writing, so a writer
     // that could not start (writer = true) ends its session with Finished instead.
     void CaptureFailed(const char *why, bool writer = false) {
@@ -635,6 +646,7 @@ class Controller {
             else
                 capture.Fail({});
         }
+        CaptureChanged();
         LogCaptureFailure();
     }
     // Everything a capture copies this frame: what RR is given, the Status guide and RR's output.
@@ -674,6 +686,8 @@ class Controller {
                      unsigned(sources[k].state));
         if (!replacement && s.proof_failed)
             rrsr::Describe(s.proof, why, sizeof(why));
+        else if (!replacement)
+            snprintf(why, sizeof(why), " (%s)", rrsr::SkipText(s.skip));
         snprintf(line, sizeof(line), "RR capture: %s; input states: %s, %s, %s%s%s",
                  replacement ? "RR replaces SR" : "native SR", inputs[0], inputs[1], inputs[2],
                  replacement      ? ""
@@ -746,6 +760,7 @@ class Controller {
                         return false;
                 }
                 capture.Begin(std::move(buffers));
+                CaptureChanged();
                 snprintf(line, sizeof(line), "RR capture: collecting %u frames, %llu MB each",
                          rrcapture::Frames, mb(frame.bytes));
                 Log(line);
@@ -766,6 +781,8 @@ class Controller {
                     from[k] = rrcapture::Contract;
                 }
             }
+            if (!replacement) // Noted by the probe or TryReplaceSR on this thread's evaluate.
+                s.skip = rrtrace::Probe::CurrentSkip();
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
                 frame.buffer.Reset();
@@ -777,6 +794,7 @@ class Controller {
                     return false;
             }
             if (!capture.Count()) {
+                CaptureChanged();
                 LogCaptureFailure();
                 return false;
             }
@@ -786,7 +804,9 @@ class Controller {
             m.viewport = s.viewport;
             m.reset = reset;
             m.reset_reasons = policy.LastReason();
-            m.lighting_input = capture_lighting;
+            // The lighting this frame's first spatial passes prepared (NoteLighting), or the
+            // setting when none noted it.
+            s.lighting.Stamp(m, capture_lighting);
             const auto pair = [](auto *to, auto a, auto b) {
                 to[0] = a;
                 to[1] = b;
@@ -884,6 +904,7 @@ class Controller {
             h.water_responsivity = water.responsivity;
             h.water_strength = water.strength;
             h.water_discard = water.discard;
+            h.water_discard_strength = water.discard_strength;
             h.water_animated = water.animated;
             h.water_guide = water.guide;
             // One RR history, so one feature and one depth type for the whole run, and Settle
@@ -909,6 +930,7 @@ class Controller {
         std::lock_guard lock(capture_outcome->mutex);
         if (capture_outcome->done)
             capture.Finished(capture_outcome->ok, std::move(capture_outcome->text));
+        CaptureChanged();
     }
 #include "rr_live_pool.inl"
   public:
@@ -969,12 +991,12 @@ class Controller {
         std::lock_guard lock(mutex);
         const bool wanted = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
                             rrguidetest::SkySurface;
-        // While the weapon depth test runs, its linear depth carries the floor instead.
+        // While RR has linear depth, it carries the floor instead.
         if (wanted && weapon_linear && weapon_test.active)
             return Test(weapon_test, weapon_test.changes, true);
         return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed), wanted);
     }
-    // Weapon depth test state for the panel. Restarting: RR is being recreated with the
+    // Weapon depth state for the panel. Restarting: RR is being recreated with the
     // depth type the setting asks for (the change takes effect once in-flight frames retire).
     enum class WeaponState { Off, Active, Waiting, Restarting, NoMemory, Unsupported, Refused };
     WeaponState WeaponDepthState() {
@@ -1017,6 +1039,7 @@ class Controller {
         std::lock_guard lock(mutex);
         water = value;
         water.strength = rrwater::Clamp(value.strength);
+        water.discard_strength = rrwater::Clamp(value.discard_strength);
         water.guide = rrwater::ValidGuide(value.guide);
         if (!rrwater::Wanted(water))
             water_retry_after = 0;
@@ -1036,6 +1059,8 @@ class Controller {
         v.discard = v.discard && v.ready && water.discard;
         v.animated = v.animated && v.ready && water.animated;
         v.coverage = v.ready ? float(water_stats.Last()) : -1.0f;
+        for (unsigned i = 0; i < rrwater::PrepassCount; ++i)
+            v.prepass[i] = v.ready ? float(water_stats.LastPrepass(i)) : -1.0f;
         return v;
     }
     void SetSssEnabled(bool value) {
@@ -1559,13 +1584,15 @@ class Controller {
         std::lock_guard lock(mutex);
         CaptureOutcomeLocked(); // A writer that has finished no longer blocks a new request.
         if (capture.Request()) {
+            CaptureChanged();
             capture_outcome.reset();
             Log("RR capture: requested");
             if (failed || retired) // Neither is ever cleared: nothing would be collected.
                 CaptureFailed("RR is not running");
         }
     }
-    // The Lighting input the settings apply; each captured frame records the one it ran with.
+    // The Lighting input the settings apply: only a captured frame whose first spatial pass
+    // noted none (NoteLighting) is stamped with it.
     void SetCaptureLighting(unsigned value) {
         std::lock_guard lock(mutex);
         capture_lighting = value;
@@ -1788,6 +1815,24 @@ class Controller {
     bool SamplingReady(ID3D12GraphicsCommandList *cl) {
         return bool(SamplingData(cl).buffer);
     }
+    // The lighting a first spatial pass on cl prepared, on the slot SamplingData gives it rates
+    // for; masked as in rrcapture::Meta. Without a capture this is one relaxed load.
+    void NoteLighting(ID3D12GraphicsCommandList *cl, unsigned lobe, int masked) {
+        if (!capture_active.load(std::memory_order_relaxed))
+            return;
+        std::lock_guard lock(mutex);
+        if (!capture.Active())
+            return;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return;
+                match = &s;
+            }
+        if (match)
+            match->lighting.Note(lobe, masked);
+    }
     bool RawWasCorrected(ID3D12GraphicsCommandList *cl) {
         std::lock_guard lock(mutex);
         for (auto &s : slots)
@@ -1873,12 +1918,27 @@ class Controller {
                       rrtrace::SlCall scope, HMODULE mod, UINT64 epoch, bool safe,
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired || NeedsReconfigure() || !safe || !scope.valid)
+        // Each refusal names itself for a capture's log (rrtrace::Probe::CurrentSkip).
+        const auto skip = [](unsigned why) {
+            rrtrace::Probe::NoteSkip(why);
             return false;
+        };
+        if (!enabled)
+            return skip(rrsr::Off);
+        if (failed || retired)
+            return skip(rrsr::Failed);
+        if (NeedsReconfigure())
+            return skip(rrsr::Reconfigure);
+        if (!safe)
+            return skip(rrsr::Unsafe);
+        if (!scope.valid)
+            return skip(rrsr::Scope);
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
         auto *s = Match(scope);
-        if (!native || !s || !s->pending_sr || s->sr.Get() != native.Get())
-            return false;
+        if (!s || !s->pending_sr)
+            return skip(rrsr::Scope);
+        if (!native || s->sr.Get() != native.Get())
+            return skip(rrsr::List);
         rrsr::StateProof proof;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
@@ -1886,6 +1946,8 @@ class Controller {
         }
         if (!rrsr::Eligible(proof)) {
             if (capture.Active()) { // CaptureLocked logs why; never fails replacement's caller.
+                s->proof = proof;   // Kept without aliasing when a lookup below throws.
+                s->proof_failed = true;
                 try {
                     for (unsigned i = 0; i < 4; ++i) {
                         D3D12_RESOURCE_STATES unaliased{};
@@ -1893,12 +1955,11 @@ class Controller {
                             proof.known[i] &&
                             !layouts.GetUnaliased(native.Get(), s->gpu.sr[i].Get(), unaliased);
                     }
-                    s->proof = proof;
-                    s->proof_failed = true;
+                    s->proof.aliased = proof.aliased;
                 } catch (...) {
                 }
             }
-            return false;
+            return skip(rrsr::Ineligible);
         }
         for (unsigned i = 0; i < 4; ++i)
             s->states[i] = {proof.states[i], true, true};
@@ -2052,36 +2113,33 @@ class Controller {
                 }
                 rrskydepth::Apply(projection);
             }
-            // Weapon depth test: RR's depth type is fixed when RR is created, so a frame
-            // follows the feature's type and a new feature takes the setting's. Linear depth
-            // matches the projection RR is given; with the sky guide test, sky stands for
-            // that test's depth floor.
+            // Weapon depth: RR's depth type is fixed when RR is created, so a frame follows
+            // the feature's type and a new feature takes the setting's (rrweapondepth::Choose).
+            // Linear depth matches the projection RR is given; with the sky guide test, sky
+            // stands for that test's depth floor.
             const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
-            bool weapon_on = feature ? weapon_linear : WeaponDepthWanted();
             // Read once, so the depth copy, the weapon mapping and a capture all agree.
             const float depth_floor =
                 rrguidetest::DepthFloor(rrguidetest::floor.load(std::memory_order_relaxed));
+            const float weapon_sky_depth =
+                s->gpu.guide_test == rrguidetest::SkySurface ? depth_floor : 0.0f;
+            const bool weapon_wanted = WeaponDepthWanted();
             rrweapondepth::Mapping weapon_map;
             const bool weapon_mapped =
-                weapon_on &&
-                rrweapondepth::Map(s->projection, projection,
-                                   s->gpu.guide_test == rrguidetest::SkySurface ? depth_floor
-                                                                                : 0.0f,
-                                   weapon_map);
-            if (!UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
-                         DXGI_FORMAT_R32_FLOAT, "Weapon depth test") &&
-                weapon_on) {
-                // No GPU memory or an unsupported projection holds the test off. A texture
-                // left at another size is only released: the restart allocates it again.
-                if (!weapon_mapped || weapon_test.blocked)
-                    HoldWeaponDepth(weapon_mapped ? WeaponHold::Memory : WeaponHold::Projection,
-                                    weapon_changes);
-                // A linear-depth RR is never given hardware depth: restart it instead.
-                if (feature) {
-                    QueueReconfigure();
-                    return false;
-                }
-                weapon_on = false;
+                rrweapondepth::Wants(feature, weapon_linear, weapon_wanted) &&
+                rrweapondepth::Map(s->projection, projection, weapon_sky_depth, weapon_map);
+            const bool weapon_texture =
+                UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R32_FLOAT, "Weapon depth");
+            const auto weapon_frame =
+                rrweapondepth::Choose(feature, weapon_linear, weapon_wanted, weapon_mapped,
+                                      weapon_texture, weapon_test.blocked);
+            bool weapon_on = weapon_frame.linear;
+            if (weapon_frame.hold != WeaponHold::None)
+                HoldWeaponDepth(weapon_frame.hold, weapon_changes);
+            if (weapon_frame.restart) {
+                QueueReconfigure();
+                return false;
             }
 
             const bool reset =
@@ -2137,7 +2195,7 @@ class Controller {
                     parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
                     // Read back from the parameters; decimal, as the "RR created" line above.
                     snprintf(line, sizeof(line),
-                             "Weapon depth test: RR created with linear depth (game create flags "
+                             "Weapon depth: RR created with linear depth (game create flags "
                              "%d, sent %d)",
                              o.flags, sent);
                     Log(line);
@@ -2194,7 +2252,7 @@ class Controller {
             applied_contrast_knee = applied_knee;
             // The guide mode this slot's guides were converted with, not the panel's
             // current one, so normals and depth always come from the same mode.
-            // The weapon depth test's linear depth carries the floor itself.
+            // Linear depth (weapon depth) carries the floor itself.
             const bool depth_on =
                 UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface && !weapon_on,
                         rrguidetest::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
@@ -2209,12 +2267,14 @@ class Controller {
                            !sky_edge_on &&
                            rrwater::UseResponsivity(water, s->water_used, preset.has_effective,
                                                     preset.effective),
-                       water_discard = s->water_used && water.discard,
+                       water_discard = s->water_used && water.discard &&
+                                       rrwater::DiscardLevel(water.discard_strength) != 0,
                        water_animated = s->water_used && water.animated,
                        water_merge = water_responsivity && responsivity_active;
             if (s->water_used)
                 s->gpu.WaterHeader(rrwater::Clamp(water.strength),
-                                   rrwater::Flags(water_responsivity, water_discard, water_merge));
+                                   rrwater::Flags(water_responsivity, water_discard, water_merge,
+                                                  rrwater::DiscardLevel(water.discard_strength)));
             water_status = {};
             water_status.ready = s->water_used;
             water_status.responsivity = water_responsivity;
@@ -2257,8 +2317,8 @@ class Controller {
                 weapon_logged = weapon_map;
                 char line[224];
                 snprintf(line, sizeof(line),
-                         "Weapon depth test: world depth %g / (depth + %g), sky %g, weapon "
-                         "slice in front of %g",
+                         "Weapon depth: world depth %.7g / (depth + %.7g), sky %.7g, weapon "
+                         "slice in front of %.7g",
                          weapon_map.scale, weapon_map.offset, weapon_map.sky,
                          weapon_map.scale / (1 + weapon_map.offset));
                 Log(line);
@@ -2308,10 +2368,15 @@ class Controller {
             if (captured) {
                 auto &m = s->captured.meta;
                 m.linear_depth = weapon_on;
+                if (weapon_on)
+                    m.linear_map = {weapon_map.scale, weapon_map.offset, weapon_map.sky};
                 m.color_scale = applied;
                 m.contrast_knee = applied_knee;
                 m.guide_test = s->gpu.guide_test;
-                m.depth_floor = depth_on ? depth_floor : 0.0f;
+                // Linear depth's sky stands for the floor, so its hardware depth has it too.
+                m.depth_floor = depth_on || (weapon_on && weapon_sky_depth > 0)
+                                    ? depth_floor
+                                    : 0.0f;
                 m.responsivity_source = sky_edge_on           ? rrcapture::SkyEdgeMask
                                         : water_responsivity  ? rrcapture::WaterMask
                                         : responsivity_active ? rrcapture::SssMask

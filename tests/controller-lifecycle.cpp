@@ -111,7 +111,14 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{};
+static unsigned releases{}, destroys{}, log_lines{};
+static void CountLog(const char *) {
+    ++log_lines;
+}
+static std::string last_log;
+static void KeepLog(const char *s) {
+    last_log = s;
+}
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -221,8 +228,8 @@ struct ControllerCpuTest {
         logged.clear();
     }
     // Each stats reader maps only its own bytes, one after another: the gate (0..15), the
-    // water count (16), the hit distance statistics (20..63), the ray density (64..227)
-    // and the non-finite counts (228, 232).
+    // hit distance statistics (20..63), the ray density (64..227), the non-finite counts
+    // (228, 232) and the water counts (16, then the prepass flags at 236..255).
     static void StatsReaders() {
         UINT words[64]; // the whole 256-byte readback
         for (UINT i = 0; i < 64; ++i)
@@ -233,8 +240,6 @@ struct ControllerCpuTest {
         g.readback.Attach(readback);
         assert((g.ReadStats() == std::array<UINT, 4>{100, 101, 102, 103}));
         assert(readback->read.Begin == 0 && readback->read.End == 16);
-        assert(g.ReadWaterPixels() == 104);
-        assert(readback->read.Begin == 16 && readback->read.End == 20);
         const auto hit = g.ReadHitStats();
         assert(hit.front() == 105 && hit.back() == 115);
         assert(readback->read.Begin == 20 && readback->read.End == 64);
@@ -243,6 +248,11 @@ struct ControllerCpuTest {
         assert(readback->read.Begin == 64 && readback->read.End == 228);
         assert((g.ReadFinite() == std::array<UINT, 2>{157, 158}));
         assert(readback->read.Begin == 228 && readback->read.End == 236);
+        const auto water = g.ReadWaterCounts();
+        assert(water.water == 104);
+        assert((water.prepass == std::array<std::uint32_t, rrwater::PrepassCount>{159, 160, 161,
+                                                                                  162, 163}));
+        assert(readback->read.Begin == 236 && readback->read.End == 256);
     }
     // A creation attempt's runtime is logged once, by the next Poll, with the controller mutex
     // released: its module and DXGI queries never run under it.
@@ -272,9 +282,9 @@ struct ControllerCpuTest {
         polled = nullptr;
     }
     static void WeaponDepth() {
-        // The weapon depth test restarts RR only when its setting differs from the depth
-        // type RR was created with. A test that could not run stays off through Reconfigure
-        // until its setting next changes, so it restarts RR once, never over and over.
+        // Weapon depth restarts RR only when its setting differs from the depth type RR was
+        // created with. Linear depth that could not run stays off through Reconfigure until
+        // the setting next changes, so it restarts RR once, never over and over.
         using State = Controller::WeaponState;
         auto *const created = reinterpret_cast<NVSDK_NGX_Handle *>(1);
         Controller c;
@@ -295,9 +305,9 @@ struct ControllerCpuTest {
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, refused.text);
         assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
         assert(c.WeaponDepthState() == State::Refused);
-        const std::string refusal = "Weapon depth test: RR did not accept linear depth (0xBAD00005 "
-                                    "FAIL_InvalidParameter); test off until its setting changes, "
-                                    "RR runs with hardware depth\n";
+        const std::string refusal = "Weapon depth: RR did not accept linear depth (0xBAD00005 "
+                                    "FAIL_InvalidParameter); off until the setting changes, RR "
+                                    "runs with hardware depth\n";
         assert(logged == refusal);
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, "threw");
         assert(logged == refusal); // Frames still in flight repeat the hold; logged once.
@@ -322,7 +332,7 @@ struct ControllerCpuTest {
         assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
         c.weapon_linear = false;
         c.feature = nullptr;
-        // While the weapon test runs, its linear depth carries the sky guide test's floor.
+        // While weapon depth runs, its linear depth carries the sky guide test's floor.
         c.feature = created;
         c.weapon_linear = c.weapon_test.active = true;
         rrguidetest::mode = rrguidetest::SkySurface;
@@ -389,6 +399,122 @@ struct ControllerCpuTest {
         rrhitcond::fill = false;
         weights->Release();
     }
+    static void CaptureLighting() {
+        // A first spatial pass notes the lighting it prepared on its frame's one guide
+        // recording, only while a capture is Armed or Collecting (capture_active).
+        Controller c;
+        c.SetEnabled(true);
+        auto &s = c.slots[0], &other = c.slots[1];
+        s.generation = other.generation = c.generation;
+        s.pre_live = s.native_sampling = true;
+        assert(!c.capture_active);
+        c.NoteLighting(nullptr, 9, 1); // No capture: nothing noted.
+        assert(!s.lighting.noted);
+        c.RequestCapture();
+        assert(c.capture.state == rrcapture::State::Armed && c.capture_active);
+        c.NoteLighting(nullptr, 9, 1);
+        assert(s.lighting.noted && s.lighting.input == 9 && s.lighting.masked == 1 &&
+               !s.lighting.mixed);
+        c.NoteLighting(nullptr, 9, 0); // A later pass of the frame without the SSS guide.
+        assert(s.lighting.mixed);
+        s.lighting = {};
+        other.pre_live = other.native_sampling = true; // Two match: neither is noted.
+        c.NoteLighting(nullptr, 4, -1);
+        assert(!s.lighting.noted && !other.lighting.noted);
+        other.native_sampling = false; // The dispatch's sampling rates are not its.
+        c.NoteLighting(nullptr, 4, -1);
+        assert(s.lighting.noted && s.lighting.input == 4 && !other.lighting.noted);
+        s.pending_sr = true; // Its SR call has begun.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(s.lighting.input == 4 && !s.lighting.mixed);
+        s.pending_sr = false;
+        c.capture_active = false; // Never locks or notes while the flag is off.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = true;
+        c.SetEnabled(false); // Armed waits for RR.
+        assert(c.capture.state == rrcapture::State::Armed && c.capture_active);
+        c.CaptureFailed("test");
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        c.SetEnabled(true);
+        s.generation = c.generation;
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = true; // Stale: the capture's state under the lock decides.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = false;
+        c.RequestCapture();
+        assert(c.capture_active);
+        c.retired = true; // A request while RR is retired fails at once.
+        c.CaptureFailed("test");
+        c.RequestCapture();
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        c.retired = false;
+        c.RequestCapture();
+        c.Failure("test"); // RR failing ends the capture.
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        // A slot's notes go with it (Reconfigure waits for no live recording).
+        s.pre_live = other.pre_live = false;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && !c.slots[0].lighting.noted);
+    }
+    static void ReplaceSkip() {
+        // Each refusal in TryReplaceSR names itself for this thread's evaluate
+        // (rrtrace::Probe::CurrentSkip), with or without a capture.
+        Controller c;
+        rrsparsecopy::Layouts layouts;
+        rrtrace::SlCall scope{};
+        const auto why = [&](bool safe) {
+            rrtrace::Probe::NoteSkip(rrsr::SkipCount);
+            assert(!c.TryReplaceSR(nullptr, nullptr, scope, nullptr, 0, safe, layouts));
+            return rrtrace::Probe::CurrentSkip();
+        };
+        assert(why(true) == rrsr::Off);
+        c.SetEnabled(true);
+        c.failed = true;
+        assert(why(true) == rrsr::Failed);
+        c.failed = false;
+        c.retired = true;
+        assert(why(true) == rrsr::Failed);
+        c.retired = false;
+        c.layout_pending = true;
+        assert(why(true) == rrsr::Reconfigure);
+        c.layout_pending = false;
+        assert(why(false) == rrsr::Unsafe);
+        assert(why(true) == rrsr::Scope); // No SL call.
+        scope = {true, sl::kFeatureDLSS, 5, 0};
+        assert(why(true) == rrsr::Scope); // No frame of that call.
+        auto &s = c.slots[0];
+        s.pre_live = true;
+        s.frame = 5;
+        s.viewport = 0;
+        assert(why(true) == rrsr::Scope); // Its SR call has not begun.
+        s.pending_sr = true;
+        assert(why(true) == rrsr::List); // Not on the SR call's list.
+        // The route log says why from the slot: a reason, or the failed proof.
+        c.logger = KeepLog;
+        const rrcapture::Sources sources{};
+        const std::array<unsigned, rrcapture::InputCount> from{};
+        s.skip = rrsr::ResetFixed;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log == "RR capture: native SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40; replacement not tried (reset parameter not "
+                           "writable)");
+        c.LogCaptureRoute(s, sources, from, true);
+        assert(last_log == "RR capture: RR replaces SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40");
+        s.proof_failed = true;
+        s.skip = rrsr::Ineligible;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not eligible: color missing, depth missing, "
+                                  "motion missing, output missing"));
+        s = {}; // Reset with the slot.
+        assert(s.skip == rrsr::NotCalled && !s.proof_failed);
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not tried (not called)"));
+        c.logger = nullptr;
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
@@ -396,6 +522,8 @@ struct ControllerCpuTest {
         RuntimeLog();
         WeaponDepth();
         HitDistanceTests();
+        CaptureLighting();
+        ReplaceSkip();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);
@@ -686,6 +814,12 @@ struct ControllerCpuTest {
         water.preset.Created();
         wet_status = water.WaterStatus();
         assert(wet_status.ready && wet_status.responsivity && !wet_status.discard);
+        // The panel's game flags follow the latest delivered frame's counts.
+        assert(wet_status.prepass[rrwater::Special] < 0);
+        water.water_stats.Add({2, {4, 2, 1, 3, 0}}, 16);
+        wet_status = water.WaterStatus();
+        assert(wet_status.coverage == 0.125f && wet_status.prepass[rrwater::Special] == 0.25f &&
+               wet_status.prepass[rrwater::Override] == 0.0625f);
         wet.discard = true;
         water.SetWater(wet);
         assert(water.WaterStatus().discard);

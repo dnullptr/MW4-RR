@@ -10,6 +10,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include "rr_weapon_depth.h"
 namespace rrcapture {
 // Device-free model of an RR input capture: what is saved, the files, the manifest and the
 // sequence that finds 8 consecutive delivered frames. The D3D12 side lives elsewhere.
@@ -119,11 +120,15 @@ struct Meta {
     // which ones RR took), and the water guide mode its guides were converted with.
     bool water_masks{};
     unsigned water_guide{};
-    bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
+    // Depth is linear view depth (weapon depth, rr_weapon_depth.h), not hardware depth, with
+    // this mapping: world depth = scale / (hardware depth + offset), sky = sky.
+    bool linear_depth{};
+    std::array<float, 3> linear_map{}; // scale, offset, sky
     // Tree-noise tests: the color brightness test's factor on RR's color (RR's output is in the
     // same scaled domain; 1 = off), the contrast test's knee (rr_contrast_test.h: the scaled
     // color, and RR's output, are compressed by it; 0 = off), the guide test mode this frame's
-    // guides were converted with, the depth sky was lifted to (0 = not lifted), and the
+    // guides were converted with, the depth sky was lifted to (0 = not lifted; with
+    // linear_depth, the hardware depth its sky stands for, which no raw texel equals), and the
     // responsivity mask RR took.
     float color_scale = 1.0f, contrast_knee{}, depth_floor{};
     unsigned guide_test{}, responsivity_source{};
@@ -133,12 +138,38 @@ struct Meta {
     float world_to_view[16]{}, view_to_clip[16]{};
     Camera camera;
     double cpu_time_ms{};
-    unsigned lighting_input{}; // The Lighting input (rr_lighting_source.h) applied this frame.
+    // The Lighting input (rr_lighting_source.h) this frame's lighting was prepared with, or
+    // MixedLighting: the requested input; a variant that failed to create prepares raw lighting
+    // under the same label. lighting_masked: 1 an SSS-masked input had its SSS guide, 0 it fell
+    // back to raw lighting, -1 neither (another input, not known, or mixed).
+    unsigned lighting_input{};
+    int lighting_masked = -1;
+};
+inline constexpr unsigned MixedLighting = 0xFFFFFFFFu; // The lighting changed within the frame.
+// What a frame's first spatial passes noted they prepared, until the frame is captured.
+struct Lighting {
+    bool noted{}, mixed{};
+    unsigned input{};
+    int masked = -1;
+    void Note(unsigned lobe, int guide) {
+        if (!noted) {
+            noted = true;
+            input = lobe;
+            masked = guide;
+        } else if (lobe != input || guide != masked) {
+            mixed = true;
+        }
+    }
+    // setting: the Lighting input the settings apply, for a frame that noted nothing.
+    void Stamp(Meta &m, unsigned setting) const {
+        m.lighting_input = mixed ? MixedLighting : noted ? input : setting;
+        m.lighting_masked = noted && !mixed ? masked : -1;
+    }
 };
 struct Header {
     std::string created;
     // create_flags: the flags RR was created with (rreval::CreateFlags drops the game's
-    // AutoExposure, and DepthInverted for the weapon depth test).
+    // AutoExposure, and DepthInverted with weapon depth's linear depth).
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{}, create_flags{};
     unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.
@@ -148,7 +179,7 @@ struct Header {
     float responsivity_strength{};
     // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
     bool water_responsivity{}, water_discard{}, water_animated{};
-    float water_strength{};
+    float water_strength{}, water_discard_strength{};
     unsigned water_guide{};
     // Sky edge responsivity mask test (rr_sky_edge.h).
     bool sky_edge_enabled{};
@@ -310,6 +341,20 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonNumber(f.Key("contrast_knee"), m.contrast_knee);
     JsonUint(f.Key("guide_test"), m.guide_test);
     JsonNumber(f.Key("depth_floor"), m.depth_floor);
+    // Weapon depth's mapping (rr_weapon_depth.h; tools/analyze_sky_edges.py undo_tests inverts
+    // it), or null for hardware depth.
+    f.Key("linear_depth");
+    if (m.linear_depth) {
+        o += '{';
+        JsonFields ld(o, ", ");
+        JsonNumber(ld.Key("scale"), m.linear_map[0]);
+        JsonNumber(ld.Key("offset"), m.linear_map[1]);
+        JsonNumber(ld.Key("sky"), m.linear_map[2]);
+        JsonNumber(ld.Key("slice"), rrweapondepth::Slice);
+        JsonNumber(ld.Key("knee"), rrweapondepth::Knee);
+        o += '}';
+    } else
+        o += "null";
     JsonString(f.Key("responsivity_source"), ResponsivitySourceName(m.responsivity_source));
     f.Key("stats");
     o += '{';
@@ -354,6 +399,10 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     o += "\n      }";
     JsonFixed(f.Key("cpu_time_ms"), m.cpu_time_ms);
     JsonUint(f.Key("lighting_input"), m.lighting_input);
+    if (m.lighting_masked < 0)
+        f.Key("lighting_masked") += "null";
+    else
+        JsonBool(f.Key("lighting_masked"), m.lighting_masked != 0);
     f.Key("inputs");
     o += "{\n        ";
     JsonFields in(o, ",\n        ");
@@ -391,6 +440,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("water_responsivity"), h.water_responsivity);
     JsonNumber(s.Key("water_strength"), h.water_strength);
     JsonBool(s.Key("water_discard"), h.water_discard);
+    JsonNumber(s.Key("water_discard_strength"), h.water_discard_strength);
     JsonBool(s.Key("water_animated"), h.water_animated);
     JsonUint(s.Key("water_guide"), h.water_guide);
     JsonBool(s.Key("weapon_depth"), h.weapon_depth);
@@ -500,10 +550,12 @@ template <class F> class Sequence {
                 continue;
             }
             // A reset frame begins a new RR history, so it can only start a run. A run also keeps
-            // one lighting input.
+            // one lighting input, with or without its SSS guide; a mixed frame joins no run.
             if (!run.empty() && (f.meta.reset || f.meta.serial != run.back().meta.serial + 1 ||
                                  f.width != run.back().width || f.height != run.back().height ||
-                                 f.meta.lighting_input != run.back().meta.lighting_input))
+                                 f.meta.lighting_input == MixedLighting ||
+                                 f.meta.lighting_input != run.back().meta.lighting_input ||
+                                 f.meta.lighting_masked != run.back().meta.lighting_masked))
                 Restart();
             run.push_back(std::move(f));
             if (run.size() == Frames) {

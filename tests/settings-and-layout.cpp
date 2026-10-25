@@ -27,7 +27,7 @@
 
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
-              defaults.preset == 6);
+              defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
 static_assert(!defaults.responsivity &&
               defaults.responsivity_strength == rrresponsivity::DefaultStrength);
@@ -36,8 +36,11 @@ static_assert(!rrwater::Wanted(rrwater::Settings{}));
 static_assert(rrwater::ValidGuide(rrwater::Physical) == rrwater::Physical);
 static_assert(rrwater::ValidGuide(rrwater::GuideCount) == rrwater::Mirror);
 static_assert(std::string_view(rrwater::guide_labels[rrwater::Mirror]) == "Game mirror (today)");
-static_assert(rrwater::Flags(true, false, false) == 1 && rrwater::Flags(false, true, false) == 2 &&
-              rrwater::Flags(false, false, true) == 4);
+static_assert(rrwater::Flags(true, false, false, 0) == 1 &&
+              rrwater::Flags(false, true, false, 0) == 2 &&
+              rrwater::Flags(false, false, true, 0) == 4 &&
+              rrwater::Flags(false, true, false, 255) == 0xFF02);
+static_assert(rrwater::Settings{}.discard_strength == 1.0f);
 // Stored values 0..2 keep their meaning; unknown values read as raw lighting.
 static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
@@ -54,7 +57,8 @@ static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
 // SSS-masked sources are appended; only they read the SSS guide.
 static_assert(rrlighting::SssNative2 == 9 && rrlighting::SssFill2 == 10 &&
               rrlighting::SssNative3 == 11 && rrlighting::SssFill3 == 12 &&
-              rrlighting::Count == 13);
+              rrlighting::SssFill2Spatial == 13 && rrlighting::SssSpatial2 == 14 &&
+              rrlighting::SssFill2Settled == 15 && rrlighting::Count == 16);
 static_assert(rrlighting::Valid(rrlighting::SssFill3) == rrlighting::SssFill3);
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssNative2]) ==
               "SSS pixels: lobe 2 native temporal");
@@ -65,6 +69,15 @@ static_assert(!rrlighting::SssMasked(rrlighting::Raw) &&
               rrlighting::SssMasked(rrlighting::SssNative2) &&
               rrlighting::SssMasked(rrlighting::SssFill3) &&
               !rrlighting::SssMasked(rrlighting::Count));
+static_assert(rrlighting::SssMasked(rrlighting::SssFill2Spatial) &&
+              rrlighting::SssMasked(rrlighting::SssSpatial2) &&
+              rrlighting::SssMasked(rrlighting::SssFill2Settled));
+static_assert(rrlighting::Valid(rrlighting::SssFill2Settled) == rrlighting::SssFill2Settled &&
+              rrlighting::Valid(16) == rrlighting::Raw);
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill2Spatial]) ==
+              "SSS pixels: lobe 2 fill gaps, history + spatial (test)");
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssSpatial2]) ==
+              "SSS pixels: lobe 2 spatial fill only (test)");
 // A guide serves the next few frames of its generation and extent, across wrap.
 constexpr rrsssmask::Record guide{true, 100, 7, 1280, 720};
 static_assert(rrsssmask::Usable(guide, 101, 7, 1280, 720) &&
@@ -644,20 +657,33 @@ int main() {
     // Water coverage reports once per interval, only with frames, then starts over.
     rrwater::Tracker coverage;
     assert(!coverage.Report(1000, report, water) && coverage.Last() < 0);
-    coverage.Add(25, 100);
-    coverage.Add(0, 100);
-    coverage.Add(5, 0); // no pixels: ignored
-    assert(coverage.Last() == 0.0);
+    assert(coverage.LastPrepass(rrwater::Special) < 0);
+    // special, water flag, override, bit 31, special rejected
+    coverage.Add({25, {30, 25, 5, 26, 1}}, 100);
+    coverage.Add({0, {10, 0, 10, 0, 0}}, 100);
+    coverage.Add({5, {5, 5, 5, 5, 5}}, 0); // no pixels: ignored
+    assert(coverage.Last() == 0.0 && coverage.LastPrepass(rrwater::Override) == 0.1);
+    assert(coverage.LastPrepass(rrwater::PrepassCount) < 0);
     water.discard = true;
+    water.discard_strength = 0.5f;
+    assert(rrwater::DiscardLevel(1.0f) == 255 && rrwater::DiscardLevel(0.5f) == 128 &&
+           rrwater::DiscardLevel(0.0f) == 0 && rrwater::DiscardLevel(2.0f) == 255 &&
+           rrwater::DiscardLevel(std::numeric_limits<float>::quiet_NaN()) == 0);
     assert(!coverage.Report(1000 + rrwater::Tracker::Interval - 1, report, water));
     assert(coverage.Report(1000 + rrwater::Tracker::Interval, report, water));
-    assert(report.find("frames=2 waterPixels avg=12.5% max=25.0% framesWithoutWater=1") !=
+    assert(report.find("frames=2 waterPixels avg=12.50% max=25.00% framesWithoutWater=1") !=
            std::string::npos);
-    assert(report.find("responsivity=off(1.00) discard=on animatedMask=off guides=0") !=
+    assert(report.find("responsivity=off(1.00) discard=on(0.50) animatedMask=off guides=0") !=
+           std::string::npos);
+    assert(report.find("prepass avg/max: special=20.00/30.00% waterFlag=12.50/25.00% "
+                       "override=7.50/10.00% bit31=13.00/26.00% specialRejected=0.50/1.00%") !=
            std::string::npos);
     report.clear();
     assert(!coverage.Report(1000 + 2 * rrwater::Tracker::Interval, report, water) &&
            report.empty() && coverage.Last() == 0.0);
+    // The latest frame stays on the panel across reports.
+    assert(coverage.LastPrepass(rrwater::Special) == 0.1);
+    static_assert(rrwater::PrepassCount == 5 && rrwater::PrepassOffset == 236);
 
     // Specular hit distance tests: classification, hole filling and the summaries.
     {
