@@ -142,8 +142,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         const auto floor = LiveRR().DepthFloorTest();
         ImGui::Text("Sky depth floor: %s",
                     floor == TestState::Active    ? "active"
-                    : floor == TestState::Blocked ? "off: not enough GPU memory (pick the mode "
-                                                    "again to retry)"
+                    : floor == TestState::Blocked ? "off: not enough GPU memory (switch to "
+                                                    "another mode and back to retry)"
                     : !rr_running                 ? "waiting for RR"
                                                   : "waiting");
     }
@@ -219,7 +219,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         changed = true;
     ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive()      ? "active"
                                          : !requested_responsivity            ? "off"
-                                         : edge == TestState::Active ? "replaced by sky edge mask"
+                                         : sky_edge && edge == TestState::Active
+                                             ? "replaced by sky edge mask"
                                          : rrresponsivity::Clamp(requested_strength) == 0
                                              ? "off (strength 0)"
                                              : "waiting (needs preset F and the SSS guide)");

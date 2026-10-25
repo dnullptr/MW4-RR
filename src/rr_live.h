@@ -101,7 +101,9 @@ class Controller {
         bool blocked{};    // no GPU memory: retried once its setting changes
         unsigned changes{}; // the setting's change count when it was blocked
     };
-    DevTest sky_edge_test, color_test, depth_test;
+    // wide_output: RR's output while the color test brightens its input, in FP32
+    // so the brightened result does not clip in the FP16 rr_output.
+    DevTest sky_edge_test, color_test, depth_test, wide_output;
     UINT64 test_reserve{};
     // Color scale RR's history was built with (color brightness test).
     float applied_color_scale = 1.0f;
@@ -127,9 +129,10 @@ class Controller {
     }
 
     // Whether a development test runs in this evaluation; creates its shared
-    // texture on first use. The reserve first grows by the texture's exact size,
-    // so the texture never takes memory a slot projection counted on, and a
-    // failure only keeps the test off (RR keeps running) until its setting changes.
+    // texture on first use. The pool projection must still fit with the texture
+    // added (the reserve grows only if it does not), so the texture never takes
+    // memory a slot counted on, and a failure only keeps the test off (RR keeps
+    // running) until its setting changes.
     bool UseTest(DevTest &t, bool wanted, unsigned changes, UINT w, UINT h, DXGI_FORMAT format,
                  const char *name) {
         t.active = false;
@@ -142,12 +145,11 @@ class Controller {
             const auto d = TextureDesc(w, h, format);
             const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
             const UINT64 old = budget.limit;
-            bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
-                      budget.Reserve(pipelines.device.Get(), old + n);
+            bool ok = n && n != UINT64_MAX && ReservePool(slots.size(), nullptr, nullptr, 0, 0, n);
             if (ok) {
                 try {
                     t.texture = persistent.Allocate(pipelines, budget, d);
-                    test_reserve += n;
+                    test_reserve += budget.limit - old;
                 } catch (const std::exception &) {
                     budget.limit = old;
                     ok = false;
@@ -285,7 +287,7 @@ class Controller {
         persistent.Release(budget);
         // The test textures were in the persistent ledger; give back the reserve
         // they added, never below what is still allocated.
-        sky_edge_test = color_test = depth_test = {};
+        sky_edge_test = color_test = depth_test = wide_output = {};
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
@@ -403,20 +405,31 @@ class Controller {
                rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
                                    preset.has_effective, preset.effective);
     }
-    // Development test state for the panel. Active: the latest evaluation used
-    // it and RR is still running. Blocked: no GPU memory until its setting changes.
+    // Development test state for the panel, for the current setting. Active: the
+    // latest evaluation used it and RR is still running. Blocked: no GPU memory
+    // until its setting changes.
     enum class TestState { Idle, Active, Blocked };
     TestState SkyEdgeTest() {
         std::lock_guard lock(mutex);
-        return Test(sky_edge_test, rrskyedge::changes.load(std::memory_order_relaxed));
+        return Test(sky_edge_test, rrskyedge::changes.load(std::memory_order_relaxed),
+                    rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
+                                   rrskyedge::strength.load(std::memory_order_relaxed),
+                                   preset.has_effective, preset.effective));
     }
     TestState ColorTest() {
         std::lock_guard lock(mutex);
-        return Test(color_test, rrcolorscale::changes.load(std::memory_order_relaxed));
+        const auto changes = rrcolorscale::changes.load(std::memory_order_relaxed);
+        const float scale =
+            rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
+        if (scale > 1.0f && Test(wide_output, changes, true) == TestState::Blocked)
+            return TestState::Blocked;
+        return Test(color_test, changes, scale != 1.0f);
     }
     TestState DepthFloorTest() {
         std::lock_guard lock(mutex);
-        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed));
+        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed),
+                    rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
+                        rrguidetest::SkySurface);
     }
     bool Running() {
         std::lock_guard lock(mutex);
@@ -756,7 +769,9 @@ class Controller {
 #endif
         return s.raw_corrected && lighting_valid && lighting_valid(s.lighting_device, s.lighting_revision);
     }
-    TestState Test(const DevTest &t, unsigned changes) const {
+    TestState Test(const DevTest &t, unsigned changes, bool wanted) const {
+        if (!wanted)
+            return TestState::Idle;
         if (t.blocked && t.changes == changes)
             return TestState::Blocked;
         return t.active && enabled && !failed && !retired && feature ? TestState::Active
@@ -1271,10 +1286,20 @@ class Controller {
                                     preset.has_effective, preset.effective);
             const float color_scale =
                 rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
+            // Brightened, RR's output needs FP32 too; without it the test stays off.
+            const auto color_changes = rrcolorscale::changes.load(std::memory_order_relaxed);
+            const bool wide_on =
+                UseTest(wide_output, color_scale > 1.0f, color_changes, s->gpu.ow, s->gpu.oh,
+                        DXGI_FORMAT_R32G32B32A32_FLOAT, "Color brightness test output");
             const bool color_on =
-                UseTest(color_test, color_scale != 1.0f,
-                        rrcolorscale::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
-                        DXGI_FORMAT_R32G32B32A32_FLOAT, "Color brightness test");
+                UseTest(color_test, color_scale != 1.0f && (color_scale < 1.0f || wide_on),
+                        color_changes, s->gpu.w, s->gpu.h, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        "Color brightness test");
+            if (!color_on)
+                wide_output.active = false;
+            // The gate's Display reads RR's output from heap slot 9.
+            s->gpu.Reconstructed(pipelines, wide_output.active ? wide_output.texture.Get()
+                                                                : s->gpu.rr_output.Get());
             if (color_on)
                 s->gpu.OutputScale(1.0f / color_scale);
             // RR's history is in the previous scale: start it over when the scale changes.
@@ -1295,7 +1320,8 @@ class Controller {
                                         : s->gpu.use_depth ? s->gpu.depth.Get()
                                                            : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
-                                        s->gpu.rr_output.Get(),
+                                        wide_output.active ? wide_output.texture.Get()
+                                                           : s->gpu.rr_output.Get(),
                                         s->gpu.guides[0].Get(),
                                         s->gpu.guides[1].Get(),
                                         s->gpu.guides[2].Get(),
@@ -1352,6 +1378,9 @@ class Controller {
             if (depth_on)
                 s->gpu.FloorDepth(cl.Get(), pipelines, depth_test.texture.Get(), o.depth_x,
                                   o.depth_y, rrguidetest::DepthFloor);
+            if (wide_output.active)
+                Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1366,11 +1395,17 @@ class Controller {
             for (auto *t : {&sky_edge_test, &color_test, &depth_test})
                 if (t->active)
                     s->gpu.TestFinish(cl.Get(), t->texture.Get());
+            // Readable by the gate's Display (GateEnd), then back to COMMON below.
+            if (wide_output.active)
+                Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)
                 s->gpu.sss.Finish(cl.Get());
             s->gpu.GateEnd(cl.Get(), pipelines, history.Get(), s->inference_ok);
+            if (wide_output.active)
+                s->gpu.TestFinish(cl.Get(), wide_output.texture.Get());
             s->gate_recorded = true;
             s->replaced_sr = replacement && s->inference_ok;
             for (unsigned i = 0; i < 3; ++i)

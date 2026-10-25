@@ -1,7 +1,8 @@
 // Development color scale test: RR's color input, read from the color subrect
-// at Offset, multiplied by Scale (a power of two) into an FP32 copy, so nothing
-// clips. The gate's Display shader multiplies RR's output by 1/Scale, so the
-// picture keeps its brightness. The game's color is only read.
+// at Offset, multiplied by Scale (a power of two) into an FP32 copy. When Scale
+// brightens, RR also writes an FP32 output, so neither clips at FP16's 65504.
+// The gate's Display shader multiplies RR's output by 1/Scale, so the picture
+// keeps its brightness. The game's color is only read.
 cbuffer Control:register(b0){uint Width,Height,OffsetX,OffsetY;float Scale;uint3 Reserved;}
 Texture2D<float4> Color:register(t0);
 RWTexture2D<float4> Scaled:register(u0);

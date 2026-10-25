@@ -689,6 +689,11 @@ struct GpuFrame {
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
     }
+    // RR's output the gate's Display reads (heap slot 9): rr_output, or the color
+    // brightness test's FP32 output. Rewritten for every evaluation.
+    void Reconstructed(Pipelines &p, ID3D12Resource *output) {
+        SRV(p, output, 9);
+    }
     // Factor the gate's Display applies to RR's output (color scale test); 0 = none.
     void OutputScale(float factor) {
         memcpy(&header_map[13], &factor, sizeof(factor));

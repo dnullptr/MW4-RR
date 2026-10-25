@@ -70,20 +70,22 @@ struct ControllerCpuTest {
         t.changes = 3;
         assert(!c.UseTest(t, true, 3, 8, 8, DXGI_FORMAT_R16_FLOAT, "test") && t.blocked &&
                !t.active);
-        assert(c.Test(t, 3) == Controller::TestState::Blocked);
-        assert(c.Test(t, 4) == Controller::TestState::Idle);
+        assert(c.Test(t, 3, true) == Controller::TestState::Blocked);
+        assert(c.Test(t, 3, false) == Controller::TestState::Idle); // setting turned off
+        assert(c.Test(t, 4, true) == Controller::TestState::Idle);
         t.blocked = false;
         t.active = true;
-        assert(c.Test(t, 4) == Controller::TestState::Idle); // RR not running
+        assert(c.Test(t, 4, true) == Controller::TestState::Idle); // RR not running
         // Reconfigure gives back only the reserve the test textures added.
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
-        c.color_test.blocked = c.sky_edge_test.active = true;
+        c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
         assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
-        assert(!c.color_test.blocked && !c.sky_edge_test.active && c.applied_color_scale == 1.0f);
+        assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
+               c.applied_color_scale == 1.0f);
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();
