@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include "feed_fg_identity.h"
@@ -18,10 +19,10 @@
 // it multiplies the target by the composite's transmittance. Built once per
 // native PSO, synchronously at init_pipeline, like rrsss::PipelineRegistry.
 namespace rrblend {
-// The composite whose pixel shader this pipeline has, by FNV-1a64 hash and size
-// (the hash of OnPipeline's shader table). hash is written only on a match.
+// The entry of targets whose pixel shader this pipeline has, by FNV-1a64 hash
+// and size (the hash of OnPipeline's shader table). hash is written only on a match.
 inline const Target *PixelTarget(unsigned n, const reshade::api::pipeline_subobject *objects,
-                                 uint64_t &hash) {
+                                 uint64_t &hash, std::span<const Target> targets = Targets) {
     if (!objects || !n || n > 64)
         return nullptr;
     for (unsigned i = 0; i < n; ++i) {
@@ -31,15 +32,16 @@ inline const Target *PixelTarget(unsigned n, const reshade::api::pipeline_subobj
             continue;
         const auto &s = *static_cast<const reshade::api::shader_desc *>(o.data);
         bool sized = false;
-        for (const auto &target : Targets)
+        for (const auto &target : targets)
             sized = sized || target.bytes == s.code_size;
         if (!s.code || !sized)
             continue;
         const auto h = rrsss::PipelineProof::ByteHash(s.code, s.code_size);
-        if (const auto *target = FindTarget(h, s.code_size)) {
-            hash = h;
-            return target;
-        }
+        for (const auto &target : targets)
+            if (target.hash == h && target.bytes == s.code_size) {
+                hash = h;
+                return &target;
+            }
     }
     return nullptr;
 }

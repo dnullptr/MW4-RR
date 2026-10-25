@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,6 +39,39 @@ static void TestTargetHash() {
     assert(!PixelTarget(0, objects, hash));
     assert(!PixelTarget(1, nullptr, hash));
     assert(!PixelTarget(65, objects, hash));
+
+    // A table whose entry is these bytes: PixelTarget returns that entry and its hash.
+    const auto h = rrsss::PipelineProof::ByteHash(bytes.data(), bytes.size());
+    const Target table[] = {{0x0123456789abcdefull, 100, Kind::Oit},
+                            {h, 4812, Kind::Refraction},
+                            {h ^ 1, 4812, Kind::Oit}};
+    ps = {bytes.data(), bytes.size()};
+    hash = 1;
+    assert(PixelTarget(1, objects, hash, table) == &table[1] && hash == h);
+    // Only the pixel shader is matched, wherever it is among the subobjects.
+    api::shader_desc vs{bytes.data(), bytes.size()}, other{bytes.data(), 100};
+    api::pipeline_subobject many[] = {{T::vertex_shader, 1, &vs},
+                                      {T::compute_shader, 1, &vs},
+                                      {T::pixel_shader, 1, &ps},
+                                      {T::sample_mask, 0, nullptr}};
+    hash = 1;
+    assert(PixelTarget(4, many, hash, table) == &table[1] && hash == h);
+    many[2].data = &other;
+    hash = 1;
+    assert(!PixelTarget(4, many, hash, table) && hash == 1);
+    // Right bytes, wrong size: the prefix of the target is not the target.
+    ps.code_size = 4811;
+    hash = 1;
+    assert(!PixelTarget(1, objects, hash, table) && hash == 1);
+    // Right hash, wrong size: the hash and the size must match the same entry.
+    const auto prefix = rrsss::PipelineProof::ByteHash(bytes.data(), 4811);
+    const Target sized[] = {{prefix, 4812, Kind::Oit}, {0x42, 4811, Kind::Refraction}};
+    hash = 1;
+    assert(!PixelTarget(1, objects, hash, sized) && hash == 1);
+    ps.code_size = 4812;
+    assert(!PixelTarget(1, objects, hash, sized) && hash == 1);
+    // An empty table matches nothing.
+    assert(!PixelTarget(1, objects, hash, std::span<const Target>{}) && hash == 1);
 }
 
 static void TestFactors() {
