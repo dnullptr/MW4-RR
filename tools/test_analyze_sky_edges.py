@@ -408,6 +408,27 @@ class SyntheticCaptureTests(unittest.TestCase):
         manifest['frames'][3]['responsivity_source'] = 'water'
         self.assertEqual(ase.undo_tests(manifest, frames)[1], ['responsivity mask from: sss, water'])
 
+    def test_guide_test_noted(self):
+        # A guide test can't be undone, so the report says which frames had one, and warns when
+        # the mode changed within the capture.
+        manifest, frames = make_capture_with_output()
+        for i, meta in enumerate(manifest['frames']):
+            meta.update(color_scale=1.0, depth_floor=0.0, responsivity_source='none',
+                        guide_test=9 if i >= 6 else 7)
+        notes = ase.undo_tests(manifest, frames)[1]
+        self.assertEqual(notes, [
+            "guide test 7 (sky normals face the camera) on in frames [0, 1, 2, 3, 4, 5]: the guides "
+            "are the test's, not the game's",
+            "guide test 9 (sky roughness 0) on in frames [6, 7]: the guides are the test's, not the "
+            "game's",
+            'the guide test changed within the capture, so its frames mix guide values'])
+        for meta in manifest['frames']:
+            meta['guide_test'] = 7
+        self.assertEqual(len(ase.undo_tests(manifest, frames)[1]), 1)
+        manifest['frames'][0]['guide_test'] = 0   # Off then on: mixed too.
+        self.assertIn('the guide test changed within the capture, so its frames mix guide values',
+                      ase.undo_tests(manifest, frames)[1])
+
     def test_a_consistent_inputs(self):
         m = self.clean
         self.assertEqual(verdict(m, 'H1'), 'supports')
