@@ -13,6 +13,7 @@ static bool &requested_tolerate = preferences.tolerate_isolated;
 static unsigned &requested_lobe = preferences.native_lobe;
 static bool &requested_responsivity = preferences.responsivity;
 static float &requested_strength = preferences.responsivity_strength;
+static bool &requested_hit = preferences.hit;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -24,12 +25,14 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);
     reshade::set_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
+    reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
 }
 static void ApplyEnabled() {
     config_allowed = VrsConfigAllowsRR();
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
+    LiveRR().SetSpecularHitEnabled(requested_hit);
     AlbedoInspector().observe_transitions = requested_glass;
     LiveRR().SetTolerateIsolated(requested_tolerate);
     requested_lobe = rrlighting::Valid(requested_lobe);
@@ -51,6 +54,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
+    reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -103,6 +107,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
+    changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     ImGui::Separator();
     ImGui::TextUnformatted("Subsurface Scattering noise experiments");
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
@@ -172,6 +177,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     StatusRow("RR", status.rr);
     StatusRow("Transparency", status.glass);
     StatusRow("Subsurface Scattering", status.sss);
+    StatusRow("Specular hit distance", status.hit);
     ImGui::Text("Reconstruction path: %s", rrstatus::RouteLabel(status.route));
     ImGui::TextWrapped("Waiting means enabled but not delivered in recent completed frames. A "
                        "guide may be unavailable in some scenes.");

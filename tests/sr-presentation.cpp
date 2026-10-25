@@ -15,6 +15,16 @@ int main() {
     telemetry.Completed(3, 1, 102, true, false, false, false);
     assert(telemetry.Read(flags, 102).route == rrstatus::Route::NativeSR);
     assert(telemetry.Read(flags, 2000).route == rrstatus::Route::Unknown);
+    assert(telemetry.Read(flags, 102).hit == rrstatus::State::Off);
+    flags.hit = true;
+    assert(telemetry.Read(flags, 102).hit == rrstatus::State::Waiting);
+    telemetry.Completed(4, 1, 103, true, false, false, true, true);
+    assert(telemetry.Read(flags, 103).hit == rrstatus::State::Active);
+    telemetry.Completed(5, 1, 104, true, false, false, true, false);
+    assert(telemetry.Read(flags, 104).hit == rrstatus::State::Waiting);
+    flags.rr = false;
+    assert(telemetry.Read(flags, 104).hit == rrstatus::State::ParentOff);
+    flags.rr = true;
 
     rrsr::StateProof p;
     p.known = {true, true, true, true};

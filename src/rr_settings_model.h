@@ -5,6 +5,7 @@ struct Preferences {
     bool rr = true;
     bool sss = true;
     bool glass = true;
+    bool hit = true;
     unsigned preset = 6;
     // SSS noise experiments.
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
