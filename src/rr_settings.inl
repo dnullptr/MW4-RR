@@ -11,6 +11,7 @@
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_contrast_test.h"
+#include "rr_lod_bias_test.h"
 #include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
@@ -39,6 +40,19 @@ static void SaveToggles() {
                               requested_strength);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
+}
+static constexpr const char *LodBiasKey = "TextureLodBiasTest";
+// From RegisterRuntimeCallbacks, before the game creates its samplers; saved by the panel.
+static void LoadLodBias() {
+    unsigned mode = rrlodbias::Off;
+    reshade::get_config_value(nullptr, SettingsSection, LodBiasKey, mode);
+    rrlodbias::mode = rrlodbias::Valid(mode);
+    if (rrlodbias::mode != rrlodbias::Off) {
+        char text[96];
+        snprintf(text, sizeof(text), "LOD bias test: on, %s for samplers created from now",
+                 rrlodbias::labels[rrlodbias::mode]);
+        WriteLog(text);
+    }
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
@@ -369,6 +383,33 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "flicker follows that contrast. Stronger settings can darken noisy, "
                        "bright spots a little. The SSS and transparency guides are left out "
                        "while on.");
+    // Saved, unlike the tests above: the game makes its samplers at load, so a change only
+    // reaches it after a restart.
+    int lod = static_cast<int>(rrlodbias::Valid(rrlodbias::mode));
+    static const unsigned lod_at_start = rrlodbias::Valid(rrlodbias::mode);
+    if (ImGui::Combo("Texture LOD bias test", &lod, rrlodbias::labels, rrlodbias::Count)) {
+        rrlodbias::mode = rrlodbias::Valid(static_cast<unsigned>(lod));
+        reshade::set_config_value(nullptr, SettingsSection, LodBiasKey,
+                                  static_cast<unsigned>(rrlodbias::mode));
+    }
+    const auto &lod_stats = rrlodbias::stats;
+    if (static_cast<unsigned>(lod) != lod_at_start)
+        ImGui::TextUnformatted("Texture LOD bias test: restart the game to apply");
+    else if (lod == 0)
+        ImGui::TextUnformatted("Texture LOD bias test: off");
+    else if (lod_stats.min_bias <= lod_stats.max_bias)
+        ImGui::Text("Texture LOD bias test: %u of %u samplers, %u of %u static; game's bias "
+                    "%.2f to %.2f",
+                    lod_stats.heap_changed.load(), lod_stats.heap_seen.load(),
+                    lod_stats.static_changed.load(), lod_stats.static_seen.load(),
+                    lod_stats.min_bias / 100.0f, lod_stats.max_bias / 100.0f);
+    else
+        ImGui::Text("Texture LOD bias test: no samplers changed yet (%u seen)",
+                    lod_stats.heap_seen.load() + lod_stats.static_seen.load());
+    ImGui::TextWrapped("Saved test, off by default. Makes the game's textures use blurrier mip "
+                       "levels, so tree needles cover pixels more evenly from frame to frame. "
+                       "Shows whether the tree noise is texture aliasing. Takes effect after "
+                       "a game restart; textures look softer while on.");
     ImGui::Separator();
     ImGui::TextUnformatted("Running water experiments (this session only)");
     // Session-only: not saved, so a test mode never sticks across restarts.

@@ -14,6 +14,7 @@
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
 #include "../src/rr_contrast_test.h"
+#include "../src/rr_lod_bias_test.h"
 #include "../src/rr_guide_test.h"
 #include "../src/rr_specular_distance.h"
 #include "../src/rr_trace_model.h"
@@ -465,6 +466,74 @@ int main() {
         previous_ratio = ratio;
     }
     assert(previous_ratio < 4.0f);
+    // Texture LOD bias test: off by default, the offsets grow, and only wrapping
+    // non-comparison samplers change.
+    {
+        using namespace reshade::api;
+        static_assert(rrlodbias::Offset(rrlodbias::Off) == 0.0f &&
+                      rrlodbias::Offset(rrlodbias::Count) == 0.0f);
+        for (unsigned m = 1; m < rrlodbias::Count; ++m)
+            assert(rrlodbias::Offset(m) > rrlodbias::Offset(m - 1));
+        assert(rrlodbias::Biased(-0.8f, 1.0f) == -0.8f + 1.0f &&
+               rrlodbias::Biased(15.5f, 2.0f) == rrlodbias::MaxBias &&
+               rrlodbias::Biased(-17.0f, 0.5f) == rrlodbias::MinBias);
+        rrlodbias::Stats stats;
+        sampler_desc material{};
+        material.filter = filter_mode::anisotropic;
+        material.address_u = material.address_v = texture_address_mode::wrap;
+        material.mip_lod_bias = -0.79f;
+        sampler_desc shadow = material, screen = material, mirrored = material, off = material;
+        shadow.filter = filter_mode::compare_min_mag_mip_linear;
+        screen.address_v = texture_address_mode::clamp;
+        mirrored.address_u = texture_address_mode::mirror;
+        assert(rrlodbias::Apply(material, 1.0f, stats, false) &&
+               material.mip_lod_bias == -0.79f + 1.0f);
+        assert(rrlodbias::Apply(mirrored, 0.5f, stats, false));
+        assert(!rrlodbias::Apply(shadow, 1.0f, stats, false) && shadow.mip_lod_bias == -0.79f);
+        assert(!rrlodbias::Apply(screen, 1.0f, stats, false) && screen.mip_lod_bias == -0.79f);
+        assert(!rrlodbias::Apply(off, 0.0f, stats, false) && off.mip_lod_bias == -0.79f);
+        assert(stats.heap_seen == 5 && stats.heap_changed == 2 && stats.static_seen == 0 &&
+               stats.min_bias == -79 && stats.max_bias == -79);
+        // A root signature: a CBV table, a table with a real sampler range, and the static
+        // samplers (one shadow, one material) in ReShade's trailing pseudo-parameter.
+        descriptor_range_with_flags cbv{};
+        cbv.type = descriptor_type::constant_buffer;
+        cbv.count = 1;
+        descriptor_range_with_flags heap_samplers{};
+        heap_samplers.type = descriptor_type::sampler;
+        heap_samplers.count = 4;
+        const sampler_desc statics[2] = {shadow, off};
+        descriptor_range_with_flags static_range{};
+        static_range.type = descriptor_type::sampler;
+        static_range.count = 2;
+        static_range.static_samplers = statics;
+        pipeline_layout_param params[3] = {pipeline_layout_param(1, &cbv),
+                                           pipeline_layout_param(1, &heap_samplers),
+                                           pipeline_layout_param(static_range)};
+        pipeline_layout_param *p = params;
+        rrlodbias::LayoutCopy copy;
+        assert(!rrlodbias::ApplyLayout(3, p, 0.0f, stats, copy) && p == params);
+        // Only the shadow sampler: nothing changes and the game's layout stays.
+        const sampler_desc shadow_only[1] = {shadow};
+        auto shadow_range = static_range;
+        shadow_range.count = 1;
+        shadow_range.static_samplers = shadow_only;
+        pipeline_layout_param shadow_params[1] = {pipeline_layout_param(shadow_range)};
+        pipeline_layout_param *sp = shadow_params;
+        assert(!rrlodbias::ApplyLayout(1, sp, 1.0f, stats, copy) && sp == shadow_params);
+        assert(rrlodbias::ApplyLayout(3, p, 2.0f, stats, copy) && p != params);
+        assert(p[0].type == params[0].type && p[0].descriptor_table_with_flags.ranges[0].type ==
+                                                  descriptor_type::constant_buffer);
+        assert(p[1].descriptor_table_with_flags.ranges[0].static_samplers == nullptr &&
+               p[1].descriptor_table_with_flags.ranges[0].count == 4);
+        const auto &copied = p[2].descriptor_table_with_flags.ranges[0];
+        assert(p[2].type == pipeline_layout_param_type::push_descriptors_with_ranges_and_flags &&
+               copied.count == 2 && copied.static_samplers != statics);
+        assert(copied.static_samplers[0].mip_lod_bias == -0.79f &&
+               copied.static_samplers[1].mip_lod_bias == -0.79f + 2.0f);
+        assert(statics[1].mip_lod_bias == -0.79f); // the game's own array is only read
+        assert(stats.static_seen == 1 + 2 && stats.static_changed == 1);
+    }
     // Sky distance for the sky surface guide test: the first entry is the earlier test's
     // floor, each later one puts the sky nearer, and an out-of-range entry falls back.
     static_assert(rrguidetest::DepthFloor(rrguidetest::VeryFar) == 1e-7f &&
