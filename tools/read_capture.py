@@ -105,6 +105,20 @@ def range_text(array):
             (f' ({bad} non-finite)' if bad else ''))
 
 
+def input_states(frame):
+    """Where each input's copy state came from, leaving out the addon's own inputs, e.g.
+    'color layouts (0x40), depth contract, motion proven'; '' for manifests without the keys."""
+    parts = []
+    for name, info in (frame.get('inputs') or {}).items():
+        state = info.get('state') if isinstance(info, dict) else None
+        if state is None or state == 'addon':
+            continue
+        before = info.get('state_before')
+        tracked = state == 'layouts' and type(before) is int
+        parts.append(f'{name} {state}' + (f' ({before:#x})' if tracked else ''))
+    return ', '.join(parts)
+
+
 def summary(manifest, frames):
     m = manifest
     lines = [f'{m["frame_count"]} frames, render {m["render_width"]}x{m["render_height"]}, '
@@ -118,6 +132,11 @@ def summary(manifest, frames):
     setups = {tuple(f.get(k) for k in ('lighting_input', *FRAME_TESTS)) for f in m['frames']}
     if len(setups) > 1:
         lines.append('warning: the frames differ in lighting input or test settings')
+    states = [input_states(f) for f in m['frames']]
+    if states and states[0]:
+        lines.append(f'input states: {states[0]}')
+    if len(set(states)) > 1:
+        lines.append('warning: the frames differ in input states')
     for frame, arrays in zip(m['frames'], frames):
         names = [n for bit, n in m['reset_reason_bits'].items() if frame['reset_reasons'] & int(bit)]
         reasons = f'({"|".join(names)})' if names else ''
@@ -245,6 +264,26 @@ def self_test():
                'uniform test settings not warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
+        # Input states: a manifest without them (older builds) prints nothing new.
+        expect('input states' not in text and 'differ in input states' not in text,
+               'no input states line without the keys')
+        stated = json.loads(json.dumps(manifest))
+        for name, (state, before) in {'color': ('layouts', 0x40), 'depth': ('contract', 0x40),
+                                      'motion': ('proven', 0x40), 'status': ('addon', 0x40),
+                                      'rr_output': ('addon', 8)}.items():
+            stated['frames'][0]['inputs'][name].update(state=state, state_before=before)
+        stated['frames'][1]['inputs']['color'].update(state='layouts', state_before=0x80)
+        (folder / 'manifest.json').write_text(json.dumps(stated), encoding='utf-8')
+        expect(load(folder)[0] == stated, 'a manifest with input states loads')
+        lines = summary(stated, frames)
+        expect('input states: color layouts (0x40), depth contract, motion proven' in lines,
+               f'input states of frame 0, addon ones left out: {lines[:4]}')
+        expect('warning: the frames differ in input states' in lines, 'differing states warned')
+        same = {**stated, 'frames': [stated['frames'][0]] * 2}
+        lines = summary(same, frames)
+        expect('input states: color layouts (0x40), depth contract, motion proven' in lines and
+               not any(line.startswith('warning') for line in lines), 'uniform states not warned')
+        (folder / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
         with np.load(folder / 'out.npz') as npz:
             expect(len(npz.files) == 12 and 'frame1_color' in npz.files, 'npz keys')

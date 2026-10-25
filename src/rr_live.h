@@ -68,6 +68,9 @@ class Controller {
         // Held until the slot retires: a replayed SR recording must never copy into freed memory.
         ComPtr<ID3D12Resource> capture_hold;
         unsigned capture_session{}; // The capture session capture_hold was recorded in.
+        // TryReplaceSR's proof when it was not eligible while a capture was active.
+        rrsr::StateProof proof;
+        bool proof_failed{};
     };
     struct Call {
         bool locked{};
@@ -162,6 +165,7 @@ class Controller {
     rrcapture::Session capture;
     std::shared_ptr<rrcapture::Outcome> capture_outcome;
     unsigned capture_lighting{};
+    unsigned capture_logged{}; // The capture session whose route and input states were logged.
     void Log(const char *s) {
         if (logger)
             logger(s);
@@ -620,17 +624,43 @@ class Controller {
         sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
         sources[rrcapture::DisocclusionMask] = {r.disocclusion};
         sources[rrcapture::AnimatedTextureMask] = {r.animated};
-        sources[rrcapture::RrOutput] = {r.output, 0, 0, o.out_width, o.out_height};
+        // RR's output (wide or not) is in UNORDERED_ACCESS where CaptureOutputLocked runs.
+        sources[rrcapture::RrOutput] = {
+            r.output, 0, 0, o.out_width, o.out_height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         return sources;
     }
+    // Once per capture: the route, the state each game input was copied from and where it came
+    // from, and on the native route why replacement was not eligible.
+    void LogCaptureRoute(const Slot &s, const rrcapture::Sources &sources,
+                         const std::array<unsigned, rrcapture::InputCount> &from,
+                         bool replacement) {
+        char inputs[3][64], why[256] = "", line[448];
+        for (unsigned k = rrcapture::Color; k <= rrcapture::Motion; ++k)
+            snprintf(inputs[k], sizeof(inputs[k]), "%s %s 0x%x", rrcapture::names[k],
+                     sources[k].resource ? rrcapture::StateSourceName(from[k]) : "none",
+                     unsigned(sources[k].state));
+        if (!replacement && s.proof_failed)
+            rrsr::Describe(s.proof, why, sizeof(why));
+        snprintf(line, sizeof(line), "RR capture: %s; input states: %s, %s, %s%s%s",
+                 replacement ? "RR replaces SR" : "native SR", inputs[0], inputs[1], inputs[2],
+                 replacement      ? ""
+                 : s.proof_failed ? "; replacement not eligible: "
+                                  : "; replacement not tried",
+                 why);
+        Log(line);
+    }
     // Copies what RR is given this frame, plus the Status guide, before RR reads it: inputs
-    // [0, RrOutput), each in NON_PIXEL_SHADER_RESOURCE here, where Record leaves it. The addon's
-    // own resources always are; the game's inputs only once their states are proven (replacement
-    // path, or barriers seen in the SR call), so only such frames are copied. Returns whether it
-    // recorded this frame; CaptureOutputLocked then adds RR's output.
+    // [0, RrOutput), each from the state it is in here, where Record leaves it. The addon's own
+    // resources are in NON_PIXEL_SHADER_RESOURCE. A game input is in NPSR once its state was
+    // proven (replacement path, or barriers seen in the SR call: AfterSR moved it there); else
+    // nothing moved it, so it is copied from the tracker's state when the tracker (layouts, keyed
+    // by the native list cl) knows it, else from NPSR, the DLSS input contract RR's own evaluate
+    // assumes. Each region records which. Returns whether it recorded this frame;
+    // CaptureOutputLocked then adds RR's output.
     bool CaptureLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
                        const rreval::Options &o, bool reset,
-                       const std::array<float, 16> &projection) {
+                       const std::array<float, 16> &projection, bool replacement,
+                       rrsparsecopy::Layouts *layouts) {
         try {
             const bool armed = capture.state == rrcapture::State::Armed;
             // A frame already past Prepass can still evaluate after RR is turned off or while a
@@ -645,16 +675,7 @@ class Controller {
                 if (!capture.Wants(in_flight))
                     return false;
             }
-            const auto sources = CaptureSources(s, r, o);
-            // An unproven game input is never copied. The attempt counts, so a native SR path
-            // that persists ends the capture instead of holding its buffers.
-            if (!armed)
-                for (unsigned k = rrcapture::Color; k <= rrcapture::Motion; ++k)
-                    if (sources[k].resource == s.gpu.sr[k].Get() && !s.states[k].known) {
-                        if (!capture.Count("RR's input states were unknown (native SR path)"))
-                            LogCaptureFailure();
-                        return false;
-                    }
+            auto sources = CaptureSources(s, r, o);
             ID3D12Device *device = pipelines.device.Get();
             rrcapture::Capture frame;
             if (!rrcapture::Plan(device, o.width, o.height, sources, frame)) {
@@ -696,6 +717,21 @@ class Controller {
                          rrcapture::Frames, mb(frame.bytes));
                 Log(line);
                 return false; // The allocation hitch stays out of the run.
+            }
+            std::array<unsigned, rrcapture::InputCount> from{}; // rrcapture::StateSource
+            for (unsigned k = rrcapture::Color; k <= rrcapture::Motion; ++k) {
+                auto &v = sources[k];
+                if (!v.resource || v.resource != s.gpu.sr[k].Get())
+                    continue; // The addon's own copy or test texture.
+                D3D12_RESOURCE_STATES tracked{};
+                if (s.states[k].known) {
+                    from[k] = rrcapture::Proven;
+                } else if (layouts && layouts->Get(cl, v.resource, tracked)) {
+                    from[k] = rrcapture::Tracked;
+                    v.state = tracked;
+                } else {
+                    from[k] = rrcapture::Contract;
+                }
             }
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
@@ -758,9 +794,16 @@ class Controller {
             if (frequency.QuadPart)
                 m.cpu_time_ms = double(now.QuadPart) * 1000.0 / double(frequency.QuadPart);
             frame.session = capture.session;
+            for (unsigned i = 0; i < rrcapture::InputCount; ++i) {
+                frame.regions[i].state_source = from[i];
+                frame.regions[i].state_before = unsigned(sources[i].state);
+            }
+            if (capture_logged != capture.session) {
+                capture_logged = capture.session;
+                LogCaptureRoute(s, sources, from, replacement);
+            }
             // Nothing below throws: the recorded copies always keep their buffer alive.
-            rrcapture::Record(cl, frame, sources, 0, rrcapture::RrOutput,
-                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            rrcapture::Record(cl, frame, sources, 0, rrcapture::RrOutput);
             s.capture_hold = frame.buffer;
             s.capture_session = frame.session;
             s.captured = std::move(frame);
@@ -773,12 +816,12 @@ class Controller {
         return false;
     }
     // Adds RR's output to the frame CaptureLocked recorded, right after a successful evaluate.
-    // rr_output is in UNORDERED_ACCESS here, where Record leaves it for GateEnd.
+    // rr_output is in UNORDERED_ACCESS here (CaptureSources), where Record leaves it for GateEnd.
     void CaptureOutputLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
                              const rreval::Options &o) {
         try {
             rrcapture::Record(cl, s.captured, CaptureSources(s, r, o), rrcapture::RrOutput,
-                              rrcapture::InputCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                              rrcapture::InputCount);
         } catch (const std::exception &e) {
             CaptureFailed(e.what());
         } catch (...) {
@@ -1788,15 +1831,29 @@ class Controller {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
             proof.known[i] = layouts.Get(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
         }
-        if (!rrsr::Eligible(proof))
+        if (!rrsr::Eligible(proof)) {
+            if (capture.Active()) { // CaptureLocked logs why; never fails replacement's caller.
+                try {
+                    for (unsigned i = 0; i < 4; ++i) {
+                        D3D12_RESOURCE_STATES unaliased{};
+                        proof.aliased[i] =
+                            proof.known[i] &&
+                            !layouts.GetUnaliased(native.Get(), s->gpu.sr[i].Get(), unaliased);
+                    }
+                    s->proof = proof;
+                    s->proof_failed = true;
+                } catch (...) {
+                }
+            }
             return false;
+        }
         for (unsigned i = 0; i < 4; ++i)
             s->states[i] = {proof.states[i], true, true};
         return AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true);
     }
     bool AfterSR(ID3D12GraphicsCommandList *public_cl, const NVSDK_NGX_Parameter *p,
                  rrtrace::SlCall scope, NVSDK_NGX_Result result, HMODULE mod, UINT64 epoch,
-                 bool safe, bool replacement = false) {
+                 bool safe, bool replacement = false, rrsparsecopy::Layouts *layouts = nullptr) {
 
         std::lock_guard lock(mutex);
         Slot *s{};
@@ -2166,8 +2223,9 @@ class Controller {
             // After the test passes, so a capture holds exactly what RR is given.
             bool captured = false;
             if (capture.Active())
-                captured = CaptureLocked(*s, cl.Get(), resources, evaluated,
-                                         reset || color_scale_changed, projection);
+                captured =
+                    CaptureLocked(*s, cl.Get(), resources, evaluated, reset || color_scale_changed,
+                                  projection, replacement, layouts);
             if (captured) {
                 auto &m = s->captured.meta;
                 m.linear_depth = weapon_on;

@@ -19,10 +19,12 @@ using Capture = Frame<ComPtr<ID3D12Resource>>;
 using Session = Sequence<Capture>;
 
 // One per Input; resource == nullptr means not sent this frame. The box at (x, y) is w x h, where
-// 0 means the render size passed to Plan. Only subresource 0 is copied.
+// 0 means the render size passed to Plan. Only subresource 0 is copied. state is the one the
+// resource is in where Record runs, which Record leaves it in.
 struct Source {
     ID3D12Resource *resource{};
     UINT x{}, y{}, w{}, h{};
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 };
 using Sources = std::array<Source, InputCount>;
 
@@ -98,25 +100,31 @@ inline ComPtr<ID3D12Resource> Allocate(ID3D12Device *device, UINT64 bytes) {
         r.Reset();
     return r;
 }
-// Copies inputs [first, end), each moved from state to COPY_SOURCE and back. frame comes from
-// Plan with the same sources; frame.buffer holds at least frame.bytes.
+// Copies inputs [first, end), each moved from its own state to COPY_SOURCE and back (no barrier
+// when it is in COPY_SOURCE already). frame comes from Plan with the same sources; frame.buffer
+// holds at least frame.bytes.
 inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const Sources &sources,
-                   unsigned first, unsigned end, D3D12_RESOURCE_STATES state) {
+                   unsigned first, unsigned end) {
     if (!cl || !frame.buffer)
         return;
     end = std::min(end, unsigned(InputCount));
     std::array<D3D12_RESOURCE_BARRIER, InputCount> barriers{};
-    UINT n = 0;
+    UINT n = 0, copies = 0;
     // Subresource 0 is what RR reads; other mips or slices may be in any state.
     for (unsigned i = first; i < end; ++i)
         if (frame.regions[i].present && sources[i].resource) {
+            ++copies;
+            const auto state = sources[i].state;
+            if (state == D3D12_RESOURCE_STATE_COPY_SOURCE)
+                continue;
             auto &b = barriers[n++];
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition = {sources[i].resource, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
         }
-    if (!n)
+    if (!copies)
         return;
-    cl->ResourceBarrier(n, barriers.data());
+    if (n)
+        cl->ResourceBarrier(n, barriers.data());
     for (unsigned i = first; i < end; ++i) {
         const Region &r = frame.regions[i];
         if (!r.present || !sources[i].resource)
@@ -135,7 +143,8 @@ inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const So
     }
     for (UINT i = 0; i < n; ++i)
         std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
-    cl->ResourceBarrier(n, barriers.data());
+    if (n)
+        cl->ResourceBarrier(n, barriers.data());
 }
 
 struct Outcome {

@@ -861,7 +861,7 @@ static void ManifestOutputSize() {
     h.output_height = 6;
     Frame<int> f = Make(9, 0);
     f.regions[Color] = Region{true, 26, 4, 3, 4, 0, 256, 0, 0, 8, 6};
-    f.regions[RrOutput] = Region{true, 10, 8, 6, 8, 1024, 256, 0, 0, 8, 6};
+    f.regions[RrOutput] = Region{true, 10, 8, 6, 8, 1024, 256, 0, 0, 8, 6, Addon, 8};
     const std::string m = Manifest(h, std::vector<Frame<int>>{f});
     assert(Balanced(m));
     assert(Contains(m, "\"color\": {\"file\": \"frame0_color.bin\", \"format\": "
@@ -870,7 +870,7 @@ static void ManifestOutputSize() {
     assert(Contains(m, "\"rr_output\": {\"file\": \"frame0_rr_output.bin\", \"format\": "
                        "\"R16G16B16A16_FLOAT\", \"dxgi_format\": 10, \"width\": 8, \"height\": 6, "
                        "\"bytes_per_pixel\": 8, \"source_offset\": [0, 0], "
-                       "\"source_size\": [8, 6]}"));
+                       "\"source_size\": [8, 6], \"state\": \"addon\", \"state_before\": 8}"));
     // All 14 inputs in table order, and no others: two present, twelve null.
     std::size_t at = m.find("\"inputs\": {");
     assert(at != std::string::npos);
@@ -879,6 +879,37 @@ static void ManifestOutputSize() {
         assert(at != std::string::npos);
     }
     assert(InputCount == 14 && Count(m, "\": null") == 12 && Count(m, "{\"file\": ") == 2);
+}
+// Each present input says where the state its copy moved it from came from; absent ones are null.
+static void ManifestInputStates() {
+    assert(std::string(StateSourceName(Addon)) == "addon" &&
+           std::string(StateSourceName(Proven)) == "proven" &&
+           std::string(StateSourceName(Tracked)) == "layouts" &&
+           std::string(StateSourceName(Contract)) == "contract" &&
+           std::string(StateSourceName(StateSourceCount)) == "unknown");
+    Header h;
+    Frame<int> f = Make(9, 0);
+    f.regions[Color] = Region{true, 26, 4, 3, 4, 0, 256, 2, 1, 8, 6, Tracked, 0xC0};
+    f.regions[Depth] = Region{true, 41, 4, 3, 4, 1024, 256, 0, 0, 8, 6, Contract, 0x40};
+    f.regions[Motion] = Region{true, 34, 4, 3, 4, 2048, 256, 0, 0, 8, 6, Proven, 0x40};
+    f.regions[Status] = Region{true, 42, 4, 3, 4, 3072, 256, 0, 0, 4, 3, Addon, 0x40};
+    const std::string m = Manifest(h, std::vector<Frame<int>>{f});
+    assert(Balanced(m));
+    // After source_size, keeping the existing keys and their order.
+    assert(Contains(m, "\"color\": {\"file\": \"frame0_color.bin\", \"format\": "
+                       "\"R11G11B10_FLOAT\", \"dxgi_format\": 26, \"width\": 4, \"height\": 3, "
+                       "\"bytes_per_pixel\": 4, \"source_offset\": [2, 1], "
+                       "\"source_size\": [8, 6], \"state\": \"layouts\", \"state_before\": 192}"));
+    assert(Contains(m, "\"depth\": {\"file\": \"frame0_depth.bin\""));
+    assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"contract\", \"state_before\": 64}"));
+    assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"proven\", \"state_before\": 64}"));
+    assert(Contains(m, "\"source_size\": [4, 3], \"state\": \"addon\", \"state_before\": 64}"));
+    assert(Count(m, "\"state\": ") == 4 && Count(m, "\"state_before\": ") == 4);
+    assert(Count(m, "\": null") == InputCount - 4 && Contains(m, "\"sss_guide\": null") &&
+           Contains(m, "\"rr_output\": null"));
+    // An out-of-range source still writes valid JSON.
+    f.regions[Color].state_source = StateSourceCount;
+    assert(Contains(Manifest(h, std::vector<Frame<int>>{f}), "\"state\": \"unknown\""));
 }
 
 // Writes two 4 x 3 frames: color (R11G11B10_FLOAT, every texel R=1 G=0.5 B=2) and status
@@ -935,9 +966,9 @@ static int WriteSample(const char *folder) {
         f.meta.camera.aspect = 1.78f;
         f.meta.camera.depth_inverted = 1;
         Region &c = f.regions[Color];
-        c = Region{true, 26, W, H, 4, 0, Pitch, 0, 0, 8, 6};
+        c = Region{true, 26, W, H, 4, 0, Pitch, 0, 0, 8, 6, Proven, 0x40};
         Region &s = f.regions[Status];
-        s = Region{true, 42, W, H, 4, StatusAt, Pitch, 0, 0, W, H};
+        s = Region{true, 42, W, H, 4, StatusAt, Pitch, 0, 0, W, H, Addon, 0x40};
         for (unsigned in : {unsigned(Color), unsigned(Status)}) {
             std::ofstream out(std::filesystem::path(folder) / FileName(i, in), std::ios::binary);
             PackRows(buffer.data(), f.regions[in], [&](const unsigned char *row, std::uint64_t n) {
@@ -979,6 +1010,7 @@ int main(int argc, char **argv) {
     LocaleIndependent();
     ManifestShape();
     ManifestOutputSize();
+    ManifestInputStates();
     std::puts("capture model tests passed");
     return argc > 1 ? WriteSample(argv[1]) : 0;
 }

@@ -76,11 +76,21 @@ inline std::string FormatName(unsigned dxgi) {
     return f ? f->name : "DXGI_" + std::to_string(dxgi);
 }
 
+// Where the state an input's copy moved it from (and back to) came from: the addon's own resource,
+// a state proven for that frame, the state tracker's, or the DLSS input contract's (NPSR).
+enum StateSource : unsigned { Addon, Proven, Tracked, Contract, StateSourceCount };
+inline constexpr const char *state_sources[StateSourceCount] = {"addon", "proven", "layouts",
+                                                                "contract"};
+inline const char *StateSourceName(unsigned source) {
+    return source < StateSourceCount ? state_sources[source] : "unknown";
+}
 struct Region { // One image inside a readback buffer.
     bool present{};
     unsigned format{}, width{}, height{}, bytes_per_pixel{};
     std::uint64_t offset{}, pitch{}; // Placement inside the buffer.
     unsigned source_x{}, source_y{}, source_width{}, source_height{};
+    // The StateSource of the state the copy moved it from, and that D3D12_RESOURCE_STATES.
+    unsigned state_source{}, state_before{};
 };
 struct Camera {
     float position[3]{}, right[3]{}, up[3]{}, forward[3]{}, jitter[2]{}, motion_scale[2]{},
@@ -273,6 +283,8 @@ inline void JsonRegion(std::string &o, unsigned index, unsigned input, const Reg
     JsonUint(f.Key("bytes_per_pixel"), r.bytes_per_pixel);
     JsonUints(f.Key("source_offset"), offset, 2);
     JsonUints(f.Key("source_size"), size, 2);
+    JsonString(f.Key("state"), StateSourceName(r.state_source));
+    JsonUint(f.Key("state_before"), r.state_before);
     o += '}';
 }
 inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
