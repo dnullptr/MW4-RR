@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include "../src/rr_capture_model.h"
+#include "../src/rr_live_policy.h"
 #include <cassert>
 #include <clocale>
 #include <cmath>
@@ -537,6 +538,10 @@ static Frame<int> Rich(unsigned serial) {
     f.meta.cpu_time_ms = 123456.789;
     f.meta.water_masks = serial % 2 != 0;
     f.meta.water_guide = serial % 4;
+    f.meta.color_scale = serial % 2 ? 0.25f : 1.0f;
+    f.meta.guide_test = serial % 2 ? 8 : 0;
+    f.meta.depth_floor = serial % 2 ? 1e-7f : 0.0f;
+    f.meta.responsivity_source = serial % 4 == 3 ? SkyEdgeMask : NoMask;
     f.meta.camera.far_plane = std::numeric_limits<float>::infinity(); // Not finite: null.
     f.meta.camera.near_plane = 0.1f;
     Region &c = f.regions[Color];
@@ -628,6 +633,9 @@ static void ManifestShape() {
     h.water_discard = true;
     h.water_strength = 0.75f;
     h.water_guide = 2;
+    h.sky_edge_enabled = true;
+    h.sky_edge_strength = -0.25f;
+    h.sky_edge_radius = 3;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
     frames[0].meta.hit_distance_test = 2;
@@ -662,13 +670,22 @@ static void ManifestShape() {
                               "\"sky_depth_test\": false",       "\"water_responsivity\": false",
                               "\"water_strength\": 0.75",        "\"water_discard\": true",
                               "\"water_animated\": false",       "\"water_guide\": 2",
-                              "\"weapon_depth\": false"};
+                              "\"weapon_depth\": false",       "\"sky_edge_enabled\": true",
+                              "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3"};
     for (const char *s : settings)
         assert(Contains(m, s));
     h.weapon_depth = true; // The weapon depth test: depth is linear view depth.
     assert(Contains(Manifest(h, frames), "\"weapon_depth\": true"));
     assert(Contains(m, "\"2\": \"sky\""));
     assert(Contains(m, "\"8\": \"gap\""));
+    assert(Contains(m, "\"16\": \"color_scale\""));
+    // The color scale reset bit is one bit, beyond HistoryPolicy's reasons.
+    using Policy = rrlive::HistoryPolicy;
+    static_assert(ColorScaleReset == 16 && (ColorScaleReset & (ColorScaleReset - 1)) == 0 &&
+                  ColorScaleReset > (Policy::Rejected | Policy::Cut | Policy::Generation | Policy::Gap));
+    assert(std::string(ResponsivitySourceName(SssMask)) == "sss" &&
+           std::string(ResponsivitySourceName(WaterMask)) == "water" &&
+           std::string(ResponsivitySourceName(SourceCount)) == "unknown");
     for (const FormatInfo &f : formats) {
         assert(Contains(m, (std::string("\"") + f.name + "\"").c_str()));
         assert(Contains(m, ("\"dxgi_format\": " + std::to_string(f.dxgi)).c_str()));
@@ -689,6 +706,13 @@ static void ManifestShape() {
                                 "\"water_masks\": false",
                                 "\"water_guide\": 3",
                                 "\"water_guide\": 0",
+                                "\"color_scale\": 0.25",
+                                "\"color_scale\": 1",
+                                "\"guide_test\": 8",
+                                "\"depth_floor\": 1.00000001e-07",
+                                "\"depth_floor\": 0",
+                                "\"responsivity_source\": \"sky_edge\"",
+                                "\"responsivity_source\": \"none\"",
                                 "\"stats\"",
                                 "\"bad_frame\": 0",
                                 "\"copied_frame\": 1",
