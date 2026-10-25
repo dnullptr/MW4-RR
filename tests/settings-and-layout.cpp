@@ -1014,13 +1014,19 @@ static void GateStops() {
     for (unsigned i = 1; i < rb::UnverifiedStop; ++i)
         assert(g.Unverified() == rb::Why::None);
     assert(g.Unverified() == rb::Why::Unverified && g.Stopped() == rb::Why::Unverified);
-    // A raised frame the reader did not count is not verified: it counts like Unverified(), ends
-    // neither count and is not checked (here it would overflow).
+    // A raised frame the reader did not count is not verified: it counts like Unverified() and
+    // ends neither count. The checks that read the rates do not run on it (here its threshold,
+    // unsupported pixels, statistics and extra rays would each stop the test).
     g = Armed(l, plan);
     auto skipped = Raised(l, plan);
     for (unsigned i = 0; i < 2 * rrdensity::Buckets; ++i)
         skipped.rates[i] = 0;
+    skipped.rates[rrdensity::Limits] = std::bit_cast<std::uint32_t>(IntMin);
+    skipped.rates[rrdensity::Unsupported] = 5;
+    skipped.rates[rrdensity::RawRays + 1] = 10;
+    skipped.log[26] = 9;
     skipped.rates[rrdensity::Extra + 1] = 0xFFFFFFFFu;
+    assert(!rb::Counted(skipped.rates));
     for (unsigned i = 1; i < rb::UnverifiedLimit; ++i)
         assert(g.Complete(skipped) == rb::Why::None);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
@@ -1032,6 +1038,47 @@ static void GateStops() {
         assert(g.Complete(skipped) == rb::Why::None);
     assert(g.Complete(skipped) == rb::Why::Unverified && g.Stopped() == rb::Why::Unverified);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Stopped);
+    // The checks that read only the log and the lists still run on it: the executed constants,
+    // the lists armed and the snapshot itself. Only then does it count as unverified.
+    auto uncounted = [&](auto edit) {
+        rb::Plan armed;
+        auto gate = Armed(l, armed);
+        auto frame = Raised(l, armed);
+        frame.rates = {};
+        edit(frame);
+        const auto why = gate.Complete(frame);
+        assert(gate.Stopped() == why);
+        if (why == rb::Why::None) { // counted as unverified: 8 in a row make Decide wait
+            for (unsigned i = 2; i < rb::UnverifiedLimit; ++i)
+                gate.Unverified();
+            assert(gate.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+            gate.Unverified();
+            assert(gate.Decide(rb::Times2, now, nullptr).why == rb::Why::Unverified);
+        }
+        return why;
+    };
+    assert(uncounted([](rb::Completed &) {}) == rb::Why::None);
+    assert(uncounted([](rb::Completed &f) { f.log[5] ^= 1; }) == rb::Why::PatchMismatch);
+    assert(uncounted([](rb::Completed &f) { f.logged &= ~rb::LogExecuted; }) ==
+           rb::Why::PatchMismatch);
+    assert(uncounted([](rb::Completed &f) { f.lists.v[2].bytes -= 1; }) == after);
+    assert(uncounted([](rb::Completed &f) { f.lists.why = rb::Why::ListsRoot; }) == after);
+    assert(uncounted([](rb::Completed &f) { f.log[28] = 2188959; }) == after);
+    assert(uncounted([](rb::Completed &f) { f.armed = rb::Armed{}; }) == after);
+    assert(uncounted([](rb::Completed &f) {
+               f.patched = 0; // a raised Budget only: no executed constants to compare
+               f.budget = 2;
+               f.log[5] ^= 1;
+           }) == rb::Why::None);
+    // An uncounted frame that raised nothing is not checked at all.
+    g = Armed(l, plan);
+    auto native = Measured(l);
+    native.rates = {};
+    native.lists = rb::Lists{};
+    assert(g.Complete(native) == rb::Why::None && g.Stopped() == rb::Why::None);
+    for (unsigned i = 1; i < rb::UnverifiedLimit; ++i)
+        g.Unverified();
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None); // nor counted as unverified
     // The reader could not model some requested pixels of a raised frame (only then).
     assert(changed([](rb::Completed &f) { f.rates[rrdensity::Unsupported] = 1; }) ==
            rb::Why::Unsupported);

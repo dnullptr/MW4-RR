@@ -411,9 +411,10 @@ class Gate {
     }
     // The controller calls this when a raised recording (patched, or its apply read a raised
     // Budget) retires without reader stats, so no Complete covers it; Complete counts a raised
-    // frame the reader did not count the same way. From UnverifiedLimit in a row Decide waits,
-    // until the next measured frame. The UnverifiedStop-th since the last measured raised frame
-    // stops the test: returns Why::Unverified when this call newly stops it, else Why::None.
+    // frame the reader did not count the same way (after its log and lists checks). From
+    // UnverifiedLimit in a row Decide waits, until the next measured frame. The UnverifiedStop-th
+    // since the last measured raised frame stops the test: returns Why::Unverified when this call
+    // newly stops it, else Why::None.
     Why Unverified() noexcept {
         if (unverified < UnverifiedLimit)
             ++unverified;
@@ -429,20 +430,24 @@ class Gate {
         const auto &f = c.rates;
         const unsigned raised = RaisedLobes(c);
         // A frame the reader did not count measures nothing: it changes no evidence, streak or
-        // count, and a raised one is not verified.
-        if (!Counted(f))
-            return raised ? Unverified() : Why::None;
-        unverified = 0;
+        // count. A raised one still gets the checks that read only the log and the lists, then
+        // counts as unverified.
+        const bool counted = Counted(f);
+        if (!counted && !raised)
+            return Why::None;
         auto fail = [&](Why w) { return Stop(w) ? w : Why::None; };
         for (unsigned l = 0; l < 2; ++l) {
-            if ((c.budget >> l & 1) && !SafeThreshold(int(f[Limits + 2 * l])))
+            if (counted && (c.budget >> l & 1) && !SafeThreshold(int(f[Limits + 2 * l])))
                 return fail(Why::Governor);
             if ((c.patched >> l & 1) && !Executed(c, l))
                 return fail(Why::PatchMismatch);
         }
+        if (raised && ChangedAfterArming(c, raised))
+            return fail(Why::ListsAfterArming);
+        if (!counted)
+            return Unverified();
+        unverified = 0;
         if (raised) {
-            if (ChangedAfterArming(c, raised))
-                return fail(Why::ListsAfterArming);
             if (f[Unsupported])
                 return fail(Why::Unsupported);
             for (unsigned l = 0; l < 2; ++l)
