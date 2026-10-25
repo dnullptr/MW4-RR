@@ -489,6 +489,7 @@ class Controller {
         weapon_logged = {};
         DropoutReconfigured();
         FxReconfigured();
+        SheetReconfigured();
         const UINT64 reserved =
             test_reserve > UINT64_MAX - ray_reserve ? UINT64_MAX : test_reserve + ray_reserve;
         budget.limit = (std::max)(
@@ -978,6 +979,7 @@ class Controller {
 #include "rr_live_coverage.inl"
 #include "rr_live_dropout.inl"
 #include "rr_live_effects.inl"
+#include "rr_live_sheet.inl"
 
     bool SssEnabled() {
         std::lock_guard lock(mutex);
@@ -2448,6 +2450,15 @@ class Controller {
                 resources.color = dropout_test.texture.Get();
                 evaluated.color_x = evaluated.color_y = 0;
             }
+            // Sheet motion test (rr_live_sheet.inl): RR reads a copy of its motion, read
+            // at its own origin.
+            const auto sheet = rrsheet::Read();
+            const bool sheet_on =
+                SheetUse(*s, sheet, weapon_on, reset, s->gpu.sr[2]->GetDesc().Format);
+            if (sheet_on) {
+                resources.motion = sheet_test.texture.Get();
+                evaluated.motion_x = evaluated.motion_y = 0;
+            }
             // Transparent effects test (rr_live_effects.inl): RR reads its own mask, which
             // carries the water or SSS one along.
             const auto fx = rrfx::Read();
@@ -2508,6 +2519,8 @@ class Controller {
                 FxRecord(*s, cl.Get(), o, fx, fx_existing);
             if (dropout_on)
                 DropoutRecord(*s, cl.Get(), o, dropout);
+            if (sheet_on)
+                SheetRecord(*s, cl.Get(), o, sheet, weapon_test.texture.Get());
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2557,6 +2570,8 @@ class Controller {
                     s->gpu.TestFinish(cl.Get(), t->texture.Get());
             if (dropout_test.active)
                 s->gpu.TestFinish(cl.Get(), dropout_test.texture.Get());
+            if (sheet_test.active)
+                s->gpu.TestFinish(cl.Get(), sheet_test.texture.Get());
             if (fx_test.active)
                 s->gpu.TestFinish(cl.Get(), fx_test.texture.Get());
             // Readable by the gate's Display (GateEnd), then back to COMMON below.

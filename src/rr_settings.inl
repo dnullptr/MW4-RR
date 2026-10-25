@@ -11,6 +11,7 @@
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_refraction_dropout.h"
+#include "rr_sheet_motion.h"
 #include "rr_transparent_effects.h"
 #include "rr_contrast_test.h"
 #include "rr_lod_bias_test.h"
@@ -530,6 +531,33 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "water flag and its override, plus the water lighting marker and special pixels the "
         "add-on could not convert: if special stays near 0%% while you look at water, the "
         "game does not mark that water.");
+    ImGui::Separator();
+    bool sheet = rrsheet::enabled;
+    if (ImGui::Checkbox("Plastic sheets: assumed depth and motion", &sheet)) {
+        rrsheet::enabled = sheet;
+        ++rrsheet::changes;
+    }
+    float sheet_distance = rrsheet::ClampDistance(rrsheet::distance);
+    if (ImGui::SliderFloat("Sheet distance", &sheet_distance, rrsheet::MinDistance,
+                           rrsheet::MaxDistance, "%.0f",
+                           ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic)) {
+        rrsheet::distance = rrsheet::ClampDistance(sheet_distance);
+        ++rrsheet::changes;
+    }
+    float sheet_threshold = rrsheet::ClampThreshold(rrsheet::threshold);
+    if (ImGui::SliderFloat("Sheet opacity threshold", &sheet_threshold, rrsheet::MinThreshold,
+                           rrsheet::MaxThreshold, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        rrsheet::threshold = rrsheet::ClampThreshold(sheet_threshold);
+        ++rrsheet::changes;
+    }
+    ImGui::Text("Plastic sheets: %s", rrsheet::Label(LiveRR().SheetStatus()));
+    ImGui::TextWrapped("Session-only test for smear on plastic sheets. The game draws them as "
+                       "transparency after its depth and motion, so RR gets the background's "
+                       "motion there. Where the transparency is at least the threshold opaque, "
+                       "this gives RR the depth and camera motion of a surface at the sheet "
+                       "distance (game units, about inches) instead. Strafe past the sheets and "
+                       "move the distance until the smear is least. Needs Weapon depth and the "
+                       "transparency albedo blend on.");
     ImGui::Separator();
     bool dropout = rrdropout::enabled;
     if (ImGui::Checkbox("Refraction dropout (window glass)", &dropout)) {

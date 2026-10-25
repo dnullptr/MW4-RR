@@ -38,6 +38,7 @@
 #include "rr_gate_stats.h"
 #include "rr_refraction_dropout_gpu.h"
 #include "rr_transparent_effects_gpu.h"
+#include "rr_sheet_motion_gpu.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -474,6 +475,8 @@ struct GpuFrame {
     rrdropout::Gpu dropout;
     // Transparent effects mask test descriptors (rr_live_effects.inl).
     rrfx::Gpu fx;
+    // Sheet motion test descriptors (rr_live_sheet.inl).
+    rrsheet::Gpu sheet;
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT,
                                     const D3D12_CLEAR_VALUE *clear = nullptr) {

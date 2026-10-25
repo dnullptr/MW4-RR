@@ -102,6 +102,9 @@ def main():
     # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.
     header(out / 'rr_refraction_dropout.generated.h', [
         ('RRRefractionDropout', compile_hlsl('rr_refraction_dropout.hlsl', 'rr_refraction_dropout'), False)])
+    # Sheet motion test (src/rr_sheet_motion.h).
+    header(out / 'rr_sheet_motion.generated.h', [
+        ('RRSheetMotion', compile_hlsl('rr_sheet_motion.hlsl', 'rr_sheet_motion'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
