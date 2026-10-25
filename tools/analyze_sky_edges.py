@@ -2068,8 +2068,9 @@ def jsonable(value):
 
 def undo_tests(manifest, frames):
     """Frames captured with a tree-noise test on, brought back to the game's values: color and
-    rr_output divided by the frame's color_scale, and sky depth lifted to depth_floor put back to
-    0. Returns (frames, notes); unchanged frames are the same objects."""
+    rr_output RGB divided by the frame's color_scale (the color copy's constant alpha dropped), and
+    sky depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged
+    frames are the same objects."""
     entries = manifest.get('frames') or []
     out, scaled, floored, sources = [], [], [], set()
     for i, frame in enumerate(frames):
@@ -2083,11 +2084,14 @@ def undo_tests(manifest, frames):
             scaled.append(i)
             for name in ('color', 'rr_output'):
                 if name in frame:
-                    frame[name] = (frame[name].astype(np.float32) / np.float32(scale))
+                    a = frame[name].astype(np.float32, copy=True)
+                    a[..., :3] /= np.float32(scale)
+                    # The scaled copy is RGBA32F with alpha 1; the game's color has no alpha.
+                    frame[name] = a[..., :3] if name == 'color' else a
         if floor > 0:
             floored.append(i)
             depth = frame['depth'].astype(np.float32, copy=True)
-            depth[depth <= floor] = 0
+            depth[depth == np.float32(floor)] = 0   # The floor replaced only depth == 0.
             frame['depth'] = depth
         out.append(frame)
     notes = []
@@ -2095,9 +2099,10 @@ def undo_tests(manifest, frames):
         notes.append(f'color brightness test on in frames {scaled}: color and rr_output divided by '
                      'their color_scale (the SSS and transparency guides were withheld)')
     if floored:
-        notes.append(f'sky depth floor on in frames {floored}: depth <= depth_floor treated as sky (0)')
-    if sources - {'unknown'}:
-        notes.append('responsivity mask from: ' + ', '.join(sorted(sources - {'unknown'})))
+        notes.append(f'sky depth floor on in frames {floored}: depth == depth_floor put back to sky (0)')
+    shown = sources - {'unknown'}
+    if shown & {'sky_edge', 'water'}:   # Only a test mask is worth a note.
+        notes.append('responsivity mask from: ' + ', '.join(sorted(shown)))
     return out, notes
 
 

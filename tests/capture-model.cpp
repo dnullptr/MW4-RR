@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include "../src/rr_capture_model.h"
+#include "../src/rr_live_policy.h"
 #include <cassert>
 #include <clocale>
 #include <cmath>
@@ -677,8 +678,10 @@ static void ManifestShape() {
     assert(Contains(m, "\"2\": \"sky\""));
     assert(Contains(m, "\"8\": \"gap\""));
     assert(Contains(m, "\"16\": \"color_scale\""));
-    // The color scale reset bit is beyond HistoryPolicy's reasons and one bit.
-    static_assert(ColorScaleReset == 16 && (ColorScaleReset & (ColorScaleReset - 1)) == 0);
+    // The color scale reset bit is one bit, beyond HistoryPolicy's reasons.
+    using Policy = rrlive::HistoryPolicy;
+    static_assert(ColorScaleReset == 16 && (ColorScaleReset & (ColorScaleReset - 1)) == 0 &&
+                  ColorScaleReset > (Policy::Rejected | Policy::Cut | Policy::Generation | Policy::Gap));
     assert(std::string(ResponsivitySourceName(SssMask)) == "sss" &&
            std::string(ResponsivitySourceName(WaterMask)) == "water" &&
            std::string(ResponsivitySourceName(SourceCount)) == "unknown");
