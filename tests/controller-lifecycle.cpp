@@ -629,6 +629,20 @@ struct ControllerCpuTest {
         Controller::RayStopDetails(Why::ListsAfterArming, f, details, sizeof(details));
         const std::string text = details;
         assert(text.size() > 13 && text.compare(text.size() - 11, 11, " scene253=5") == 0);
+        // The widest details fit the controller's buffer: the longest reason, every field at its
+        // maximum.
+        f.lists.why = Why::Governor;
+        f.lists.w = f.lists.h = f.armed.w = f.armed.h = UINT_MAX;
+        for (auto &v : f.lists.v)
+            v.bytes = UINT64_MAX;
+        f.armed.capacity = {UINT64_MAX, UINT64_MAX};
+        f.armed.pixels = f.armed.counter = UINT64_MAX;
+        f.log[rrraybudget::LogWordScene253] = UINT_MAX;
+        char widest[Controller::RayDetailsBytes];
+        Controller::RayStopDetails(Why::ListsAfterArming, f, widest, sizeof(widest));
+        const std::string wide = widest;
+        assert(wide.size() + 1 < sizeof(widest) &&
+               wide.compare(wide.size() - 20, 20, " scene253=4294967295") == 0);
         // The active line names both governor thresholds and the clamp.
         Controller a;
         logged.clear();

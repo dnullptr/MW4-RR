@@ -21,6 +21,9 @@ struct RayMark {
     rrraybudget::Armed armed;
 };
 static constexpr UINT RayMarkLife = 8;
+// A stop's details buffer: the widest, ListsAfterArming with every field at its maximum and
+// register 253, fits.
+static constexpr std::size_t RayDetailsBytes = 384;
 static constexpr UINT64 RayActiveMs = 1000; // Status reports the last resolve's outcome this long
 rrraybudget::Gate ray_gate;
 rrraybudget::Summary ray_summary;
@@ -350,7 +353,7 @@ void RayUnverified(Slot &s) noexcept {
     if ((s.ray_patched | s.ray_budget) && !s.ray_done) {
         const auto why = ray_gate.Unverified();
         if (why != RayWhy::None) {
-            char details[128];
+            char details[RayDetailsBytes];
             RayStopDetails(why, {}, details, sizeof(details));
             RayStopLog(why, details);
         }
@@ -408,7 +411,7 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
                 for (unsigned l = 0; l < 2; ++l)
                     if ((s.ray_patched >> l & 1) && !rrraybudget::Executed(c, l)) {
                         s.ray_done = true;
-                        char details[128];
+                        char details[RayDetailsBytes];
                         RayStopDetails(RayWhy::PatchMismatch, c, details, sizeof(details));
                         RayStop(RayWhy::PatchMismatch, details);
                         return;
@@ -420,7 +423,7 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
         const auto why = ray_gate.Complete(c);
         s.ray_done = true;
         if (why != RayWhy::None) {
-            char details[320];
+            char details[RayDetailsBytes];
             RayStopDetails(why, c, details, sizeof(details));
             RayStopLog(why, details);
         }
