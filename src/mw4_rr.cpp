@@ -826,8 +826,9 @@ static rrhitcond::Diagnostics &ConditionStats() {
 // VRRT reader. PackedSurface is not bound here: it was proven at the earlier hit
 // distance blur and the game reads it again after this pass, so its tracked
 // state is used as for the bound inputs. An aliasing barrier on the list since
-// its last transition (one naming no resource marks every tracked resource) is
-// only counted in the log, so the tests cannot go quiet on an unproven concern.
+// its last transition (one with a null side marks every tracked resource) is
+// only counted in the log, split by whether it named PackedSurface, so the
+// tests cannot go quiet on an unproven concern.
 // Dispatches with nothing to condition skip the capture.
 static void ConditionSpecularDistance(reshade::api::command_list *list,
                                       ID3D12GraphicsCommandList *native, uint64_t effective,
@@ -845,19 +846,16 @@ static void ConditionSpecularDistance(reshade::api::command_list *list,
     if (!restore.valid || !restore.complete || !restore.heap_restore_valid ||
         UINT64(restore.root.Get()) != state->tracker.CurrentLayout(list->get_native()))
         return stats.Observe(rrhitcond::Outcome::Context);
-    bool aliased{};
+    using Alias = rrsparsecopy::Layouts::Alias;
+    auto alias = Alias::None;
     const auto outcome = LiveRR().ConditionSpecularDistance(
         native, input.r[1].Get(), input.state[1], restore,
         [&](ID3D12Resource *r, D3D12_RESOURCE_STATES &s) {
-            if (!SparseLayouts().Get(native, r, s))
-                return false;
-            D3D12_RESOURCE_STATES unaliased{};
-            aliased = !SparseLayouts().GetUnaliased(native, r, unaliased);
-            return true;
+            return SparseLayouts().Get(native, r, s, alias);
         });
     stats.Observe(outcome);
-    if (outcome == rrhitcond::Outcome::Conditioned && aliased)
-        stats.SurfaceAliased();
+    if (outcome == rrhitcond::Outcome::Conditioned && alias != Alias::None)
+        stats.SurfaceAliased(alias == Alias::Named);
 }
 static void RestoreLightingPipeline(reshade::api::command_list *list) {
     const auto b = ShaderDispatches().Get(list->get_native());

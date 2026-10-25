@@ -26,6 +26,11 @@ inline unsigned Mode() {
 inline bool NormalsReplaced(unsigned guide_test) {
     return guide_test == rrguidetest::FaceCamera || guide_test == rrguidetest::AllFlat;
 }
+// The tests a guide recording runs: the fill is left out while a guide test
+// replaces the normals it compares.
+inline unsigned Mode(unsigned guide_test) {
+    return Mode() & (NormalsReplaced(guide_test) ? ~FillHoles : ~0u);
+}
 // Why a frame's distance was or was not conditioned at the native temporal pass.
 enum class Outcome : unsigned {
     Off,         // no test on, or RR or the hit distance off
@@ -51,8 +56,10 @@ class Diagnostics {
     std::mutex mutex;
     std::array<uint64_t, unsigned(Outcome::Count)> counts{};
     // Conditioned frames whose PackedSurface had an aliasing barrier on its list
-    // since its last transition (see mw4_rr.cpp ConditionSpecularDistance).
-    uint64_t aliased{};
+    // since its last transition (see mw4_rr.cpp ConditionSpecularDistance), and
+    // of those, frames where that barrier named PackedSurface itself rather than
+    // having a null side, which covers every resource.
+    uint64_t aliased{}, named{};
     Outcome last = Outcome::Count;
 
   public:
@@ -64,9 +71,10 @@ class Diagnostics {
         if (o != Outcome::Conditioned)
             last = o;
     }
-    void SurfaceAliased() {
+    void SurfaceAliased(bool naming_surface) {
         std::lock_guard lock(mutex);
         ++aliased;
+        named += naming_surface ? 1 : 0;
     }
     // Returns false when nothing happened in the window.
     bool Summary(char *text, size_t size) {
@@ -77,14 +85,14 @@ class Diagnostics {
         auto n = [&](Outcome o) { return static_cast<unsigned long long>(counts[unsigned(o)]); };
         snprintf(text, size,
                  "Specular hit distance tests (10s): conditioned=%llu surfaceAliased=%llu "
-                 "lastSkip=%s [no-slot=%llu no-copy=%llu weights=%llu surface=%llu "
-                 "context=%llu memory=%llu failed=%llu]",
+                 "(named=%llu) lastSkip=%s [no-slot=%llu no-copy=%llu weights=%llu "
+                 "surface=%llu context=%llu memory=%llu failed=%llu]",
                  n(Outcome::Conditioned), static_cast<unsigned long long>(aliased),
-                 OutcomeName(last), n(Outcome::NoSlot),
+                 static_cast<unsigned long long>(named), OutcomeName(last), n(Outcome::NoSlot),
                  n(Outcome::NoCopy), n(Outcome::Weights), n(Outcome::Surface),
                  n(Outcome::Context), n(Outcome::Memory), n(Outcome::Failed));
         counts = {};
-        aliased = 0;
+        aliased = named = 0;
         last = Outcome::Count;
         return total != 0;
     }
@@ -96,6 +104,7 @@ class Tracker {
     uint64_t other{};      // pixels in none of the GPU's categories
     uint64_t fill_holes{}; // holes in frames that ran the fill
     unsigned frames{}, sky_frames{}, fill_frames{};
+    unsigned raw_frames{}; // RR frames that got the raw distance while a test was on
     uint64_t since{};
     bool started{};
     static double Percent(uint64_t part, uint64_t total) {
@@ -118,6 +127,9 @@ class Tracker {
                                  f[CountNoRtSpecular] + f[CountHit] + f[CountMiss] + f[CountHole];
         other += frame_pixels > counted ? frame_pixels - counted : 0;
     }
+    void Raw() {
+        ++raw_frames;
+    }
     uint64_t Pixels(unsigned i) const {
         return i < StatCount ? pixels[i] : 0;
     }
@@ -129,8 +141,15 @@ class Tracker {
         }
         if (now < since || now - since < Interval)
             return false;
-        const bool active = frames != 0;
-        if (active) {
+        const bool active = frames != 0 || raw_frames != 0;
+        if (!frames && raw_frames) {
+            char text[160];
+            snprintf(text, sizeof(text),
+                     "Specular hit distance pixels (%llus): frames=0 rawFrames=%u (no frame "
+                     "conditioned)",
+                     static_cast<unsigned long long>((now - since) / 1000), raw_frames);
+            out = text;
+        } else if (active) {
             const auto &p = pixels;
             // Surfaces the tests may change: a hit, a miss or no ray this frame.
             const uint64_t surfaces = p[CountHit] + p[CountMiss] + p[CountHole];
@@ -138,16 +157,16 @@ class Tracker {
                                  p[CountNoRtSpecular] + other;
             char text[700];
             snprintf(text, sizeof(text),
-                     "Specular hit distance pixels (%llus): frames=%u skyMissFrames=%u "
-                     "fillFrames=%u | sky=%.1f%% viewmodel=%.1f%% noRtSpecular=%.1f%% "
-                     "other=%.1f%% surfaces=%.1f%% | of surfaces: hit=%.1f%% miss=%.1f%% "
-                     "noRay=%.1f%% | of noRay in fill frames: filledFromHits=%.1f%% "
-                     "filledAsMiss=%.1f%% | checks: hitWithoutLobe1Ray=%.2f%% "
-                     "hitWithoutLobe2Ray=%.2f%% noRtSpecularHits=%llu",
-                     static_cast<unsigned long long>((now - since) / 1000), frames, sky_frames,
-                     fill_frames, Percent(p[CountSky], all), Percent(p[CountViewmodel], all),
-                     Percent(p[CountNoRtSpecular], all), Percent(other, all),
-                     Percent(surfaces, all), Percent(p[CountHit], surfaces),
+                     "Specular hit distance pixels (%llus): frames=%u rawFrames=%u "
+                     "skyMissFrames=%u fillFrames=%u | sky=%.1f%% viewmodel=%.1f%% "
+                     "noRtSpecular=%.1f%% other=%.1f%% surfaces=%.1f%% | of surfaces: "
+                     "hit=%.1f%% miss=%.1f%% noRay=%.1f%% | of noRay in fill frames: "
+                     "filledFromHits=%.1f%% filledAsMiss=%.1f%% | checks: "
+                     "hitWithoutLobe1Ray=%.2f%% hitWithoutLobe2Ray=%.2f%% noRtSpecularHits=%llu",
+                     static_cast<unsigned long long>((now - since) / 1000), frames, raw_frames,
+                     sky_frames, fill_frames, Percent(p[CountSky], all),
+                     Percent(p[CountViewmodel], all), Percent(p[CountNoRtSpecular], all),
+                     Percent(other, all), Percent(surfaces, all), Percent(p[CountHit], surfaces),
                      Percent(p[CountMiss], surfaces), Percent(p[CountHole], surfaces),
                      Percent(p[CountFilledHit], fill_holes),
                      Percent(p[CountFilledMiss], fill_holes),
