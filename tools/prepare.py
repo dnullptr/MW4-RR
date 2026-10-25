@@ -73,6 +73,12 @@ def main():
                                                 ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
+    # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and
+    # R32_FLOAT lighting weights.
+    header(out / 'rr_hit_condition.generated.h', [
+        ('RRHitCondition', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition'), False),
+        ('RRHitConditionFloat', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition_float',
+                                             flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [

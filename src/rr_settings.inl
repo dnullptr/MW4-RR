@@ -9,6 +9,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -124,6 +125,8 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         if (LiveRR().Enabled() && LiveRR().SpecularHitEnabled() &&
             (active || idle_reports++ < 3))
             WriteLog(line);
+        if (ConditionStats().Summary(line, sizeof(line)))
+            WriteLog(line);
     }
 }
 static void StatusRow(const char *name, rrstatus::State value) {
@@ -137,6 +140,44 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
+    {
+        // Session-only A/B tests of what RR is told; not saved.
+        ImGui::Indent();
+        bool sky_miss = rrhitcond::sky_miss;
+        if (ImGui::Checkbox("Hit distance test: sky and misses far (65504)", &sky_miss)) {
+            rrhitcond::sky_miss = sky_miss;
+            ++rrhitcond::changes;
+        }
+        bool fill = rrhitcond::fill;
+        if (ImGui::Checkbox("Hit distance test: fill pixels with no ray", &fill)) {
+            rrhitcond::fill = fill;
+            ++rrhitcond::changes;
+        }
+        using TestState = rrlive::Controller::TestState;
+        const auto hit_test = LiveRR().HitDistanceTest();
+        // The fill is left out while a guide test replaces the normals it compares.
+        const bool no_fill = fill && rrhitcond::NormalsReplaced(rrguidetest::Valid(
+                                         rrguidetest::mode.load(std::memory_order_relaxed)));
+        ImGui::Text("Hit distance tests: %s%s",
+                    !sky_miss && !fill                  ? "off"
+                    : !requested_hit                    ? "off (needs Specular hit distance)"
+                    : LiveRR().HitDistanceTestFailed()  ? "off: shader setup failed (see log)"
+                    : hit_test == TestState::Blocked    ? "off: not enough GPU memory (change a "
+                                                          "test to retry)"
+                    : hit_test == TestState::Active     ? "active"
+                    : !LiveRR().Running()               ? "waiting for RR"
+                                                        : "waiting",
+                    no_fill ? "; fill off while the guide test replaces normals" : "");
+        ImGui::TextWrapped("Session-only tests. The game gives RR 0 at sky, where a reflection "
+                           "ray missed, and wherever no reflection ray was traced this frame "
+                           "(about 60%% of pixels). Sky and misses: RR gets 65504 there, as "
+                           "NVIDIA asks for sky. Fill: pixels with no ray take nearby hits on "
+                           "the same surface. The weapon and surfaces the game never traces "
+                           "reflections for stay as they are. Judge while strafing or walking "
+                           "(turning alone cannot show it), with frame generation off; "
+                           "ReShade.log shows the shares every 10 s.");
+        ImGui::Unindent();
+    }
     ImGui::Separator();
     ImGui::TextUnformatted("Subsurface Scattering noise experiments");
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);

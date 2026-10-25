@@ -22,6 +22,7 @@
 #include "../build/rr_live_display.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
 #include "../build/rr_sky_edge_mask.generated.h"
+#include "../build/rr_hit_condition.generated.h"
 #include "../build/rr_water_masks.generated.h"
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
@@ -29,6 +30,7 @@
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
 #include "rr_specular_distance.h"
+#include "rr_hit_condition.h"
 #include "rr_ray_density.h"
 #include "rr_water.h"
 namespace rrlive {
@@ -119,9 +121,11 @@ struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
-        test_root, water_root;
+        test_root, water_root, hit_root;
     ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale,
         water, weapon_depth;
+    // Hit distance conditioning for R32_UINT and R32_FLOAT lighting weights.
+    std::array<ComPtr<ID3D12PipelineState>, 2> hit_condition;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
@@ -226,6 +230,29 @@ struct Pipelines {
         Root(desc, probability_root);
         Pipeline(probability_root.Get(), RRVrrtProbability, sizeof(RRVrrtProbability), probability);
     }
+    // Hit distance conditioning: SRV table t0-t4, target UAV table, 4 root
+    // constants, statistics root UAV u1. Created on first use.
+    void HitConditionPipeline() {
+        if (hit_condition[1])
+            return;
+        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0},
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
+        D3D12_ROOT_PARAMETER p[4]{};
+        for (unsigned i = 0; i < 2; ++i) {
+            p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p[i].DescriptorTable = {1, &ranges[i]};
+        }
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[2].Constants = {0, 0, 4};
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[3].Descriptor.ShaderRegister = 1;
+        D3D12_ROOT_SIGNATURE_DESC desc{4, p};
+        if (!hit_root)
+            Root(desc, hit_root);
+        Pipeline(hit_root.Get(), RRHitCondition, sizeof(RRHitCondition), hit_condition[0]);
+        Pipeline(hit_root.Get(), RRHitConditionFloat, sizeof(RRHitConditionFloat),
+                 hit_condition[1]);
+    }
     void WaterPipeline() {
         if (water)
             return;
@@ -273,9 +300,8 @@ struct GpuFrame {
                 return 0;
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R32_UINT)))
             return 0;
-        auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
-        distance.Flags = D3D12_RESOURCE_FLAG_NONE;
-        if (!add(distance))
+        // The hit distance copy is also the conditioning target (a UAV).
+        if (!add(TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)))
             return 0;
         auto buffer = rrprivate::Buffer(256);
         if (!add(buffer))
@@ -308,9 +334,10 @@ struct GpuFrame {
     rrvrrt::Inputs probability_inputs;
     std::array<ComPtr<ID3D12Resource>, 4> sr;
     ComPtr<ID3D12Resource> rr_output, depth, depth_buffer, header, stats, readback;
-    // Owned copy of the native specular hit distance; hit_source is retained
-    // until the recording that copied it retires.
-    ComPtr<ID3D12Resource> specular_hit, hit_source;
+    // Owned copy of the native specular hit distance, conditioned in place when a
+    // hit distance test is on; hit_source and hit_weights (the lighting weights
+    // the conditioning read) are retained until that recording retires.
+    ComPtr<ID3D12Resource> specular_hit, hit_source, hit_weights;
     // Heap slots for the development tests (TestPass): the source of the depth
     // tests, then one target per test, so tests in the same frame never share one.
     static constexpr UINT DepthSource = 12, SkyEdgeTarget = 13, ColorTarget = 14,
@@ -319,6 +346,8 @@ struct GpuFrame {
     static constexpr UINT WaterSlot = 16;
     // The weapon depth test's target, after the water slot.
     static constexpr UINT WeaponTarget = 17;
+    // Hit distance conditioning: five sources (ConditionDistance), then its target.
+    static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
     // Water guide mode Convert used for this frame (rrwater::Guide).
@@ -391,6 +420,7 @@ struct GpuFrame {
                  const std::array<UINT64, 2> &off) {
         hit_ready = false;
         hit_source.Reset();
+        hit_weights.Reset();
         if (heap) {
             Require(w == in[3]->GetDesc().Width && h == in[3]->GetDesc().Height,
                     "live guide generation was not retired before size change");
@@ -406,7 +436,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, WeaponTarget + 1,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, HeapSize,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -418,9 +448,7 @@ struct GpuFrame {
             UAV(p, guides[i].Get(), 4 + i);
         }
         SRV(p, guides[3].Get(), 8);
-        auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
-        distance.Flags = D3D12_RESOURCE_FLAG_NONE;
-        specular_hit = Allocate(p, b, distance);
+        specular_hit = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
         header = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RANGE empty{};
         void *m{};
@@ -521,6 +549,58 @@ struct GpuFrame {
         Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, source, D3D12_RESOURCE_STATE_COPY_SOURCE, source_state);
         return true;
+    }
+    // Hit distance conditioning (rrhitcond) on the guide recording, before the
+    // native temporal pass: the copy moves to scratch (w x h R16_FLOAT, COMMON) and
+    // the pass writes the result back. weights is that pass's t5 and the
+    // PackedSurface (sources[3]) is readable; the caller proved both states,
+    // created the pipelines and restores the native compute state afterwards.
+    void ConditionDistance(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *scratch,
+                           ID3D12Resource *weights, unsigned mode) {
+        hit_weights = weights;
+        SRV(p, scratch, HitSources);
+        SRV(p, weights, HitSources + 1);
+        SRV(p, guides[3].Get(), HitSources + 2);
+        SRV(p, guides[0].Get(), HitSources + 3);
+        SRV(p, sources[3].Get(), HitSources + 4);
+        UAV(p, specular_hit.Get(), HitTarget);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Change(cl, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(scratch, specular_hit.Get());
+        Change(cl, scratch, D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        for (unsigned i : {0u, 3u})
+            Change(cl, guides[i].Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        // Zero the pass's statistics from the header's never-written tail.
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(stats.Get(), rrhitcond::StatsOffset, header.Get(), 64,
+                             rrhitcond::StatCount * 4);
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.hit_root.Get());
+        cl->SetPipelineState(
+            p.hit_condition[weights->GetDesc().Format == DXGI_FORMAT_R32_FLOAT].Get());
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, HitSources));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, HitTarget));
+        const UINT c[] = {w, h, mode, 0};
+        cl->SetComputeRoot32BitConstants(2, 4, c, 0);
+        cl->SetComputeRootUnorderedAccessView(3, stats->GetGPUVirtualAddress());
+        cl->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COMMON);
+        Change(cl, scratch, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+        for (unsigned i : {0u, 3u})
+            Change(cl, guides[i].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COMMON);
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COMMON);
     }
     // guide: rrwater::Guide for water pixels.
     void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p, unsigned guide = 0) {
@@ -922,12 +1002,24 @@ struct GpuFrame {
         readback->Unmap(0, &r);
         return v;
     }
+    // Valid only for a frame whose hit distance was conditioned (ConditionDistance).
+    rrhitcond::Frame ReadHitStats() {
+        rrhitcond::Frame v{};
+        void *m{};
+        D3D12_RANGE r{rrhitcond::StatsOffset, rrhitcond::StatsOffset + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live hit distance statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + rrhitcond::StatsOffset, sizeof(v));
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
     void Retire() {
         sources = {};
         constants = {};
         sr = {};
         probability_inputs = {};
         hit_source.Reset();
+        hit_weights.Reset();
         hit_ready = false;
         water_written = false;
     }

@@ -100,6 +100,9 @@ inline const char *ResponsivitySourceName(unsigned source) {
 inline constexpr unsigned ColorScaleReset = 16;
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
+    // Specular hit distance tests applied to the sent distance (rrhitcond mode bits:
+    // 1 sky and misses far, 2 fill); 0 when it is the game's raw value.
+    unsigned hit_distance_test{};
     bool delivered{}, reset{}, replaced_sr{};
     // Water tests (rr_water.h): whether this frame computed the water masks (the settings say
     // which ones RR took), and the water guide mode its guides were converted with.
@@ -282,6 +285,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("reset"), m.reset);
     JsonUint(f.Key("reset_reasons"), m.reset_reasons);
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
+    JsonUint(f.Key("hit_distance_test"), m.hit_distance_test);
     JsonBool(f.Key("water_masks"), m.water_masks);
     JsonUint(f.Key("water_guide"), m.water_guide);
     JsonNumber(f.Key("color_scale"), m.color_scale);
