@@ -54,13 +54,15 @@ bool FxUse(Slot &s, const rrfx::Tuning &t, bool sky_edge, bool preset_known, uns
                    "Transparent effects mask");
 }
 // After the transparency Resolve and the water and SSS passes, so the color
-// before transparency and the mask it carries along are written. existing: the
+// before transparency and the mask it carries along are written, and before the
+// refraction dropout, which may change the color before transparency in place.
+// A frame whose transparency is not admitted at submission keeps the existing mask. existing: the
 // mask RR would otherwise get (NON_PIXEL_SHADER_RESOURCE), or null.
 void FxRecord(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Options &o,
               const rrfx::Tuning &t, ID3D12Resource *existing) {
     s.gpu.fx.Record(cl, fx_pipeline,
                     {s.gpu.sr[0].Get(), s.gpu.transparency.guide.Get(), existing,
-                     fx_test.texture.Get()},
+                     fx_test.texture.Get(), s.gpu.header->GetGPUVirtualAddress()},
                     rrfx::Make(t, s.gpu.w, s.gpu.h, o.color_x, o.color_y, existing != nullptr));
     ++fx_frames;
     fx_merged += existing != nullptr;

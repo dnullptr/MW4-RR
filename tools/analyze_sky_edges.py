@@ -2371,7 +2371,7 @@ def undo_tests(manifest, frames):
     if floored:
         notes.append(f'sky depth floor on in frames {floored}: depth == depth_floor put back to sky (0)')
     shown = sources - {'unknown'}
-    if shown & {'sky_edge', 'water'}:   # Only a test mask is worth a note.
+    if shown & {'sky_edge', 'water', 'transparent'}:   # Only a test mask is worth a note.
         notes.append('responsivity mask from: ' + ', '.join(sorted(shown)))
     for mode, at in sorted((k, v) for k, v in guides.items() if k):
         notes.append(f"guide test {mode} ({GUIDE_TESTS.get(mode, 'unknown')}) on in frames {at}: "

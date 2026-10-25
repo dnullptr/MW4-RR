@@ -2504,10 +2504,10 @@ class Controller {
             if (weapon_on)
                 s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
                                    o.depth_y, weapon_map);
-            if (dropout_on)
-                DropoutRecord(*s, cl.Get(), o, dropout);
             if (fx_on)
                 FxRecord(*s, cl.Get(), o, fx, fx_existing);
+            if (dropout_on)
+                DropoutRecord(*s, cl.Get(), o, dropout);
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

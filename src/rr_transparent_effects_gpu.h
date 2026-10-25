@@ -7,7 +7,8 @@ using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
 using rrprivate::Require;
 // Root: SRV table (t0 color, t1 color before transparency, t2 the mask RR would
-// otherwise get), UAV table (u0 the mask RR reads), 8 root constants (b0).
+// otherwise get), UAV table (u0 the mask RR reads), 8 root constants (b0), root
+// CBV (b1, the live header whose word 6 says the transparency was admitted).
 struct Pipeline {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> root;
@@ -21,14 +22,16 @@ struct Pipeline {
         Require(d, "transparent effects device missing");
         D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
-        D3D12_ROOT_PARAMETER p[3]{};
+        D3D12_ROOT_PARAMETER p[4]{};
         for (UINT i = 0; i < 2; ++i) {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             p[i].DescriptorTable = {1, &ranges[i]};
         }
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[2].Constants = {0, 0, ConstantWords};
-        D3D12_ROOT_SIGNATURE_DESC desc{3, p};
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[3].Descriptor = {1, 0};
+        D3D12_ROOT_SIGNATURE_DESC desc{4, p};
         ComPtr<ID3DBlob> signature, error;
         Check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error),
               "transparent effects root serialization failed");
@@ -50,9 +53,11 @@ struct Pipeline {
 };
 // One frame's resources, all NON_PIXEL_SHADER_RESOURCE on entry except output
 // (COMMON at rest): color, before (RR's color before transparency,
-// R11G11B10_FLOAT), existing (R16_FLOAT, or null).
+// R11G11B10_FLOAT), existing (R16_FLOAT, or null). header: the live header's
+// GPU address (word 6: transparency admitted).
 struct Inputs {
     ID3D12Resource *color{}, *before{}, *existing{}, *output{};
+    D3D12_GPU_VIRTUAL_ADDRESS header{};
 };
 // Per slot: its own descriptors, rewritten only while the slot is not in flight.
 struct Gpu {
@@ -101,6 +106,7 @@ struct Gpu {
         cl->SetComputeRootDescriptorTable(0, gpu);
         cl->SetComputeRootDescriptorTable(1, {gpu.ptr + 3 * UINT64(p.stride)});
         cl->SetComputeRoot32BitConstants(2, ConstantWords, &c, 0);
+        cl->SetComputeRootConstantBufferView(3, in.header);
         cl->Dispatch((c.width + 7) / 8, (c.height + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER order{};
         order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
