@@ -1373,6 +1373,11 @@ struct ControllerCpuTest {
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
         c.hit_scratch.active = true;
+        c.dropout_test.blocked = c.dropout_unavailable = c.dropout_covered = true;
+        c.dropout_source = true;
+        c.dropout_unavailable_changes = 5;
+        c.dropout_report = 1234;
+        c.dropout_frames = 7;
         c.applied_color_scale = 4.0f;
         c.applied_contrast_knee = 0.25f;
         c.QueueReconfigure();
@@ -1381,6 +1386,35 @@ struct ControllerCpuTest {
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
                !c.hit_scratch.active && c.applied_color_scale == 1.0f &&
                c.applied_contrast_knee == 0.0f);
+        assert(!c.dropout_test.blocked && !c.dropout_unavailable && !c.dropout_covered &&
+               !c.dropout_source && !c.dropout_unavailable_changes && !c.dropout_pipeline.state &&
+               !c.dropout_report && !c.dropout_frames);
+        // The refraction dropout test is off by default and reports why it is not active.
+        assert(c.DropoutStatus() == rrdropout::Report::Off);
+        rrdropout::enabled = true;
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting); // RR not running
+        c.color_test.active = true; // stale: RR is not running, so not the reason
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting);
+        c.color_test.active = false;
+        c.dropout_unavailable = true;
+        c.dropout_unavailable_changes = rrdropout::changes;
+        assert(c.DropoutStatus() == rrdropout::Report::Unavailable);
+        ++rrdropout::changes; // a setting change retries
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting);
+        c.dropout_unavailable = false;
+        c.dropout_test.blocked = true;
+        c.dropout_test.changes = rrdropout::changes;
+        assert(c.DropoutStatus() == rrdropout::Report::Blocked);
+        // Wanted but off for the color brightness test: no device is touched.
+        Controller::Slot slot;
+        c.dropout_report = 99;
+        assert(!c.DropoutUse(slot, rrdropout::Read(), true, DXGI_FORMAT_R11G11B10_FLOAT) &&
+               !c.dropout_test.active && !c.dropout_report); // the 10 s window restarts
+        // A slot without this frame's glass capture gives the pass no coverage.
+        const auto coverage = c.DropoutCoverageOf(slot, rreval::Options{});
+        assert(!coverage.target && !coverage.admitted && !coverage.source && !coverage.ready);
+        c.dropout_test = {};
+        rrdropout::enabled = false;
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();
@@ -2070,6 +2104,21 @@ struct ControllerCpuTest {
         c.Options();
         c.Status();
         c.PresetStatus();
+        // The transparency albedo blend row with no driver or device: RR is on and
+        // nothing ran yet. Toggling it restarts history.
+        assert(std::string(rrstatus::Label(c.TransparencyBlendState(true, false))) ==
+               "ON / waiting");
+        assert(std::string(rrstatus::Label(c.TransparencyBlendState(false, false))) ==
+               "unavailable");
+        c.policy.Next(20, c.generation, false);
+        assert(!c.policy.Next(21, c.generation, false));
+        c.SetTransparencyBlendEnabled(false);
+        assert(!c.TransparencyBlendEnabled() &&
+               std::string(rrstatus::Label(c.TransparencyBlendState(true, false))) == "OFF");
+        assert(c.policy.Next(22, c.generation, false));
+        c.SetTransparencyBlendEnabled(true);
+        c.SetTransparencyBlendTuning({});
+        assert(c.TransparencyBlendEnabled() && c.policy.Next(23, c.generation, false));
         assert(f->queries == before_queries && releases == 0 &&
                destroys == 0); // UI never calls driver.
         bool *held[] = {&s.pre_live,
@@ -2077,6 +2126,7 @@ struct ControllerCpuTest {
                         &s.sss.live,
                         &s.transparency.prep_live,
                         &s.transparency.anchor_live,
+                        &s.coverage.live,
                         &s.pending_sr,
                         &s.poisoned};
         f->completed = 9;

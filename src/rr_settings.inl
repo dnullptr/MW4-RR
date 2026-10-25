@@ -10,6 +10,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_refraction_dropout.h"
 #include "rr_contrast_test.h"
 #include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
@@ -449,6 +450,39 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "water flag and its override, plus the water lighting marker and special pixels the "
         "add-on could not convert: if special stays near 0%% while you look at water, the "
         "game does not mark that water.");
+    ImGui::Separator();
+    bool dropout = rrdropout::enabled;
+    if (ImGui::Checkbox("Refraction dropout (window glass)", &dropout)) {
+        rrdropout::enabled = dropout;
+        ++rrdropout::changes;
+    }
+    float dropout_strength = rrdropout::ClampStrength(rrdropout::strength);
+    if (ImGui::SliderFloat("Dropout strength", &dropout_strength, 0.0f, rrdropout::MaxStrength,
+                           "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        rrdropout::strength = rrdropout::ClampStrength(dropout_strength);
+        ++rrdropout::changes;
+    }
+    bool dropout_before = rrdropout::before_transparency;
+    if (ImGui::Checkbox("Dropout: also color before transparency", &dropout_before)) {
+        rrdropout::before_transparency = dropout_before;
+        ++rrdropout::changes;
+    }
+    bool dropout_mask = rrdropout::show_mask;
+    if (ImGui::Checkbox("Dropout: show refraction mask (red)", &dropout_mask)) {
+        rrdropout::show_mask = dropout_mask;
+        ++rrdropout::changes;
+    }
+    const auto dropout_report = LiveRR().DropoutStatus();
+    ImGui::Text("Refraction dropout: %s", rrdropout::Label(dropout_report));
+    ImGui::TextWrapped("Session-only test for noise behind window glass. The game's refraction "
+                       "copies a noisy half-resolution image, so RR sees the same grain repeated "
+                       "in neighbouring pixels and keeps it as texture. This drops a random "
+                       "blue-noise share of those pixels every frame (strength = the share where "
+                       "the glass fully refracts) and brightens the rest so the average stays "
+                       "the same. The mask view tints the covered pixels red instead. Judge it "
+                       "with frame generation off. Reads the refraction coverage that the "
+                       "transparency albedo blend captures, so it needs that blend on; the "
+                       "color brightness and contrast tests turn it off.");
     ImGui::Separator();
     auto preset = LiveRR().PresetStatus();
     int selected = 3;

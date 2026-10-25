@@ -13,6 +13,8 @@
 #include "rr_live.h"
 #include "rr_live_proof.h"
 #include "rr_sss_pipeline.h"
+#include "rr_oit_signature.h"
+#include "rr_transparency_coverage_pipeline.h"
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
 #include "rr_game_config.h"
@@ -77,6 +79,14 @@ static rrshader::DispatchTracker &ShaderDispatches() {
 static rrsss::PipelineRegistry &SssPipelines() {
     static auto *p = []() {
         auto *v = new rrsss::PipelineRegistry;
+        v->logger = &WriteLog;
+        return v;
+    }();
+    return *p;
+}
+static rrblend::CoveragePipelineRegistry &CoveragePipelines() {
+    static auto *p = []() {
+        auto *v = new rrblend::CoveragePipelineRegistry;
         v->logger = &WriteLog;
         return v;
     }();
@@ -252,6 +262,13 @@ static void OnDevice(reshade::api::device *d) {
             if (!rrsss::PipelineProof::Attach(reinterpret_cast<ID3D12Device *>(d->get_native())))
                 WriteLog("RR optional native SSS PSO proof hooks unavailable; unproven SSS "
                          "pipelines stay off");
+            // Before the game creates its command signatures: earlier ones read as Unknown.
+            const bool signatures = rrsig::Attach(reinterpret_cast<ID3D12Device *>(d->get_native()),
+                                                  ComputeState(), &WriteLog);
+            CoveragePipelines().SignatureHook(d, signatures);
+            if (!signatures)
+                WriteLog("Transparency albedo blend unavailable: command signature hook not "
+                         "installed");
         }
         Observer().Poll();
     } catch (...) {
@@ -261,6 +278,7 @@ static void OnDevice(reshade::api::device *d) {
 }
 static void OnDestroyDevice(reshade::api::device *d) {
     SssPipelines().ForgetDevice(d);
+    CoveragePipelines().ForgetDevice(d);
     rrbypass::Forget(d);
     if (rrbindings::State(d))
         d->destroy_private_data<rrbindings::DeviceState>();
@@ -343,9 +361,20 @@ static void OnSecondary(reshade::api::command_list *caller, reshade::api::comman
     // secondary-list state, so require fresh caller bindings/pipeline afterwards.
     OnResetList(caller);
 }
+// The command signature hook reads root-constant counts from these layouts, so a
+// recycled root signature address must never keep an earlier one, whatever the
+// binding tracker's health.
+static void ForgetRootLayout(reshade::api::pipeline_layout layout) noexcept {
+    try {
+        ComputeState().ForgetRoot(reinterpret_cast<ID3D12RootSignature *>(layout.handle));
+    } catch (...) {
+        WriteLog("root signature layout could not be forgotten");
+    }
+}
 static void OnLayout(reshade::api::device *d, uint32_t count,
                      const reshade::api::pipeline_layout_param *params,
                      reshade::api::pipeline_layout layout) {
+    ForgetRootLayout(layout);
     WithGraphicsBindings(d, [&](auto &t) { t.Layout(layout.handle, count, params); });
     WithBindings(d, [&](auto &t) {
         t.Layout(layout.handle, count, params);
@@ -410,11 +439,9 @@ static void OnLayout(reshade::api::device *d, uint32_t count,
     });
 }
 static void OnDestroyLayout(reshade::api::device *d, reshade::api::pipeline_layout layout) {
+    ForgetRootLayout(layout);
     WithGraphicsBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
-    WithBindings(d, [&](auto &t) {
-        t.DestroyLayout(layout.handle);
-        ComputeState().ForgetRoot(reinterpret_cast<ID3D12RootSignature *>(layout.handle));
-    });
+    WithBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
 }
 static void OnTables(reshade::api::command_list *list, reshade::api::shader_stage stages,
                      reshade::api::pipeline_layout layout, uint32_t first, uint32_t count,
@@ -513,6 +540,7 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
                        reshade::api::pipeline pipeline) {
     rrtrace::LastError preserve_error;
     SssPipelines().Initialize(device, layout, count, objects, pipeline);
+    CoveragePipelines().Initialize(device, layout, count, objects, pipeline);
     try {
         uint64_t hash = 14695981039346656037ull;
         bool found = false, compute = false;
@@ -543,6 +571,7 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
 }
 static void OnDestroyPipeline(reshade::api::device *, reshade::api::pipeline pipeline) {
     SssPipelines().Forget(pipeline.handle);
+    CoveragePipelines().Forget(pipeline.handle);
     rrbypass::Removed(pipeline);
     std::lock_guard lock(pipeline_mutex);
     shader_hashes.erase(pipeline.handle);

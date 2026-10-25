@@ -54,6 +54,8 @@ def main():
 
     header(out / 'rr_sparse.generated.h', [
         ('RRSpatialPassthrough', compile_hlsl('rr_spatial_passthrough.hlsl', 'rr_spatial_passthrough'), True)])
+    header(out / 'rr_transparency_blend.generated.h', [
+        ('RRTransparencyBlend', compile_hlsl('rr_transparency_blend.hlsl', 'rr_transparency_blend'), False)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
         ('RRVrrtGovernor', compile_hlsl('rr_vrrt_governor.hlsl', 'rr_vrrt_governor', flags=('-Ges',)), False),
@@ -94,6 +96,9 @@ def main():
                                              flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
+    # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.
+    header(out / 'rr_refraction_dropout.generated.h', [
+        ('RRRefractionDropout', compile_hlsl('rr_refraction_dropout.hlsl', 'rr_refraction_dropout'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])

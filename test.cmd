@@ -15,8 +15,17 @@ set "INC=/Isrc /Iexternal\imgui /Iexternal\streamline /Iexternal\reshade\include
 set "FLAGS=/nologo /EHsc /O2 /MD /W3 /std:c++20"
 set "HOOKS=external\minhook\src\buffer.c external\minhook\src\hook.c external\minhook\src\trampoline.c external\minhook\src\hde\hde64.c"
 set "LIBS=kernel32.lib user32.lib psapi.lib d3d12.lib dxgi.lib d3dcompiler.lib"
+rem Refraction dropout tests, in their own loop so sibling branches can extend the main one.
+for %%T in (refraction-dropout) do (
+ cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
+ build\tests\%%T.exe || exit /b 1
+)
 cl %FLAGS% %INC% /c tests\preset-policy.cpp /Fobuild\tests\ || exit /b 1
 for %%T in (runtime-shader sr-replacement sr-presentation sr-layouts settings-and-layout ray-copies ray-budget controller-lifecycle capture-model weapon-depth vrrt-apply-shader release-buffer-cpu release-hooks-cpu release-private-transition-cpu) do (
+ cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
+ build\tests\%%T.exe || exit /b 1
+)
+for %%T in (transparency-blend transparency-blend-hooks-cpu transparency-coverage-pipeline transparency-coverage transparency-blend-controller) do (
  cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
  build\tests\%%T.exe || exit /b 1
 )
