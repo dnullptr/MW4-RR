@@ -21,11 +21,16 @@ groupshared uint counts[rrhitcond::StatCount];
 void Count(uint i){InterlockedAdd(counts[i],1u);}
 uint LoadWeights(int2 q){return asuint(Weights.Load(int3(q,0)));}
 bool Inside(int2 q){return all(q>=0)&&q.x<int(Width)&&q.y<int(Height);}
+// A neighbour sets the slope only if it is a surface of the centre's class.
+bool SlopeSide(int2 q,uint w,out float depth){
+ depth=0;
+ if(!Inside(q))return false;
+ uint4 s=PackedSurface.Load(int3(q,0));depth=asfloat(s.x);
+ return s.w==w&&rrhitcond::SurfaceStatus(Status.Load(int3(q,0)))&&rrhitcond::SurfaceDepth(depth);
+}
 float Slope(int2 p,int2 axis,float centre,uint w){
- float before=0,after=0;bool hasBefore=false,hasAfter=false;
- int2 a=p-axis,b=p+axis;
- if(Inside(a)){uint4 s=PackedSurface.Load(int3(a,0));before=asfloat(s.x);hasBefore=s.w==w&&rrhitcond::SurfaceDepth(before);}
- if(Inside(b)){uint4 s=PackedSurface.Load(int3(b,0));after=asfloat(s.x);hasAfter=s.w==w&&rrhitcond::SurfaceDepth(after);}
+ float before,after;
+ bool hasBefore=SlopeSide(p-axis,w,before),hasAfter=SlopeSide(p+axis,w,after);
  return rrhitcond::Slope(centre,before,hasBefore,after,hasAfter);
 }
 // Accepted neighbours that have a hit (weighted sum of distances) or a fresh ray that missed.
@@ -70,8 +75,8 @@ void Condition(int2 p){
   if((Mode&rrhitcond::FillHoles)!=0&&rrhitcond::FilledAsMiss(hitWeight,missWeight))Count(rrhitcond::CountFilledMiss);
   else if((Mode&rrhitcond::FillHoles)!=0&&hitWeight>0)Count(rrhitcond::CountFilledHit);
  }
- else if((status==1||status==3)&&rrhitcond::SurfaceDepth(depth)&&(surface.w&rrhitcond::Alternate)!=0)Count(rrhitcond::CountViewmodel);
- else if((status==1||status==3)&&rrhitcond::SurfaceDepth(depth)&&(surface.w&rrhitcond::NoRtSpecular)!=0){
+ else if(rrhitcond::SurfaceStatus(status)&&rrhitcond::SurfaceDepth(depth)&&(surface.w&rrhitcond::Alternate)!=0)Count(rrhitcond::CountViewmodel);
+ else if(rrhitcond::SurfaceStatus(status)&&rrhitcond::SurfaceDepth(depth)&&(surface.w&rrhitcond::NoRtSpecular)!=0){
   Count(rrhitcond::CountNoRtSpecular);
   if(raw>0)Count(rrhitcond::CountNoRtSpecularHit);
  }

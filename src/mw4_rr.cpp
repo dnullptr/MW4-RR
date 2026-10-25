@@ -815,8 +815,9 @@ static rrhitcond::Diagnostics &ConditionStats() {
 // Specular hit distance tests (rrhitcond): called at the native temporal pass,
 // whose proven t4/t5 input holds this frame's raw lighting and weights. Its
 // compute state is captured and restored around the private pass, as for the
-// VRRT reader; PackedSurface's state is the one tracked on this recording.
-// Dispatches with nothing to condition skip the capture.
+// VRRT reader. PackedSurface is not bound here, only proven at the earlier hit
+// distance blur, so its tracked state on this recording must also show no
+// aliasing barrier since. Dispatches with nothing to condition skip the capture.
 static void ConditionSpecularDistance(reshade::api::command_list *list,
                                       ID3D12GraphicsCommandList *native, uint64_t effective,
                                       const rrsparsecopy::Pair &input) {
@@ -836,7 +837,7 @@ static void ConditionSpecularDistance(reshade::api::command_list *list,
     stats.Observe(LiveRR().ConditionSpecularDistance(
         native, input.r[1].Get(), input.state[1], restore,
         [&](ID3D12Resource *r, D3D12_RESOURCE_STATES &s) {
-            return SparseLayouts().Get(native, r, s);
+            return SparseLayouts().GetUnaliased(native, r, s);
         }));
 }
 static void RestoreLightingPipeline(reshade::api::command_list *list) {

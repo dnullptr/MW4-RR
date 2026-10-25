@@ -255,11 +255,18 @@ int main() {
         assert(Classify(1, 0, 0.0f, 3.0f, true) == Leave); // sky depth without the sky status
         assert(Classify(1, 0, std::numeric_limits<float>::max(), 3.0f, true) == Leave);
 
-        assert(Slope(0.5f, 0.25f, true, 1.0f, true) == 0.25f);
-        assert(Slope(0.5f, 0.75f, true, 0.375f, true) == -0.125f);
-        assert(Slope(0.5f, 0.25f, true, 1.0f, false) == 0.25f);
-        assert(Slope(0.5f, 0.25f, false, 1.0f, true) == 0.5f);
+        // Slopes: limit 0.04 * 0.5 = 0.02 of device depth.
+        assert(Slope(0.5f, 0.25f, true, 0.75f, true) == 0.25f);        // steep plane
+        assert(Slope(0.5f, 0.25f, true, 0.5078125f, true) == 0.0078125f); // edge before
+        assert(Slope(0.5f, 0.75f, true, 0.4921875f, true) == -0.0078125f); // edge before
+        assert(Slope(0.5f, 0.25f, true, 0.25f, true) == 0.0f);          // 1-px feature
+        assert(Slope(0.5f, 0.25f, true, 1.0f, true) == 0.0f);           // edges both sides
+        assert(Slope(0.5f, 0.4921875f, true, 1.0f, false) == 0.0078125f);
+        assert(Slope(0.5f, 0.25f, true, 1.0f, false) == 0.0f);          // lone edge
+        assert(Slope(0.5f, 0.25f, false, 0.5078125f, true) == 0.0078125f);
         assert(Slope(0.5f, 0.25f, false, 1.0f, false) == 0.0f);
+        assert(SurfaceStatus(1) && SurfaceStatus(3) && !SurfaceStatus(0) && !SurfaceStatus(2) &&
+               !SurfaceStatus(4));
         assert(SameSurface(0, 0, 1, 0.5f, 0.51f, 0.5f, 1.0f));
         assert(SameSurface(4, 4, 3, 0.5f, 0.49f, 0.5f, 0.95f));
         assert(!SameSurface(0, 0, 1, 0.5f, 0.53f, 0.5f, 1.0f)); // off the plane

@@ -851,8 +851,9 @@ class Controller {
     // weights, holds this frame's raw lighting weights, whose lobe-1 bits mark a
     // fresh specular ray. The caller proved that binding and its state and captured
     // restore, the pass's compute state; state_of(resource, state) gives a
-    // resource's tracked state on cl. Nothing is recorded unless it conditions.
-    // The fill is left out while a guide test replaces the normals it compares.
+    // resource's tracked state on cl (PackedSurface's, since this pass does not
+    // bind it). Nothing is recorded unless it conditions. The fill is left out
+    // while a guide test replaces the normals it compares.
     template <class StateOf>
     rrhitcond::Outcome ConditionSpecularDistance(ID3D12GraphicsCommandList *cl,
                                                  ID3D12Resource *weights,
@@ -903,8 +904,14 @@ class Controller {
             Log(line);
             return Outcome::Failed;
         }
-        if (!UseTest(hit_scratch, true, rrhitcond::changes.load(std::memory_order_relaxed),
-                     s.gpu.w, s.gpu.h, DXGI_FORMAT_R16_FLOAT, "Specular hit distance tests"))
+        // The panel's "active" is left to the evaluation (AfterSR), which knows
+        // whether RR got the conditioned copy.
+        const bool shown = hit_scratch.active;
+        const bool ready =
+            UseTest(hit_scratch, true, rrhitcond::changes.load(std::memory_order_relaxed),
+                    s.gpu.w, s.gpu.h, DXGI_FORMAT_R16_FLOAT, "Specular hit distance tests");
+        hit_scratch.active = shown;
+        if (!ready)
             return Outcome::Memory;
         rrinternal::Scope copy_guard;
         rrcompute::Tracker::Internal state_guard;

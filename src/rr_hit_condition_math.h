@@ -45,32 +45,40 @@ inline bool DiffuseRay(UInt weights) {
 inline bool SurfaceDepth(float depth) {
     return depth > 0.0f && depth <= 1.0f;
 }
+// The guide conversion's status for a surface (1 ordinary, 3 special).
+inline bool SurfaceStatus(UInt status) {
+    return status == 1u || status == 3u;
+}
 // status: the guide conversion's (1 ordinary, 2 sky, 3 special). NaN or a
 // negative raw distance has no hit; infinity is clamped by Resolve.
 inline UInt Classify(UInt status, UInt w, float depth, float raw, bool ray) {
     if (status == 2u)
         return Sky;
-    if ((status != 1u && status != 3u) || !SurfaceDepth(depth) ||
-        (w & (Alternate | NoRtSpecular)) != 0u)
+    if (!SurfaceStatus(status) || !SurfaceDepth(depth) || (w & (Alternate | NoRtSpecular)) != 0u)
         return Leave;
     if (raw > 0.0f)
         return Hit;
     return ray ? Miss : Hole;
 }
-// One-sided depth step with the smaller magnitude, so a step across an edge on
-// one side does not tilt the centre's plane.
+// The centre's per-pixel depth step along one axis. Two sides that agree lie on
+// one plane (device depth is affine across it), however steep. Otherwise the
+// smaller step is used only while it is itself within the depth tolerance, so
+// neither an edge on one side nor both edges of a 1-px feature tilt the plane
+// onto the background.
 inline float Slope(float centre, float before, bool has_before, float after, bool has_after) {
-    const float a = centre - before, b = after - centre;
-    if (has_before && has_after)
-        return (a < 0.0f ? -a : a) < (b < 0.0f ? -b : b) ? a : b;
-    return has_before ? a : has_after ? b : 0.0f;
+    const float a = centre - before, b = after - centre, limit = DepthTolerance * centre;
+    const float abs_a = a < 0.0f ? -a : a, abs_b = b < 0.0f ? -b : b, d = a - b;
+    if (has_before && has_after && (d < 0.0f ? -d : d) <= limit)
+        return abs_a < abs_b ? a : b;
+    const float s = has_before && (!has_after || abs_a < abs_b) ? a : has_after ? b : 0.0f;
+    return (s < 0.0f ? -s : s) <= limit ? s : 0.0f;
 }
 // Device depth is affine in screen space across a plane, so predicted is the
 // centre's depth extrapolated with its slopes to the neighbour.
 inline bool SameSurface(UInt centre_w, UInt w, UInt status, float centre_depth, float depth,
                         float predicted, float cosine) {
     const float error = depth - predicted;
-    return w == centre_w && (status == 1u || status == 3u) && SurfaceDepth(depth) &&
+    return w == centre_w && SurfaceStatus(status) && SurfaceDepth(depth) &&
            (error < 0.0f ? -error : error) <= DepthTolerance * centre_depth &&
            cosine >= MinCosine;
 }
