@@ -5,6 +5,7 @@
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
 #include "rr_sky_edge.h"
+#include "rr_color_scale.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -156,6 +157,16 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
                        "steadier over time; moving branches may ghost. While on, it replaces the "
                        "SSS responsivity mask.");
+    int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
+    if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
+                     rrcolorscale::Count))
+        rrcolorscale::mode = rrcolorscale::Valid(static_cast<unsigned>(color_scale));
+    ImGui::Text("Color brightness test: %s", LiveRR().ColorScaleActive() ? "active"
+                                             : color_scale == 0          ? "off"
+                                                                         : "waiting");
+    ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
+                       "output back, so the picture looks the same unless RR treats the levels "
+                       "differently. The SSS and transparency guides are left out while on.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);

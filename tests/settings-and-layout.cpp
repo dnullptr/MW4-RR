@@ -8,6 +8,7 @@
 #include "../src/rr_lighting_source.h"
 #include "../src/rr_responsivity.h"
 #include "../src/rr_sky_edge.h"
+#include "../src/rr_color_scale.h"
 #include "../src/rr_specular_distance.h"
 #include <cassert>
 #include <limits>
@@ -45,6 +46,15 @@ int main() {
     assert(!rrskyedge::Use(true, -0.5f, true, 5));
     assert(rrskyedge::ClampRadius(0) == 1 && rrskyedge::ClampRadius(9) == rrskyedge::MaxRadius &&
            rrskyedge::ClampRadius(2) == 2);
+    // Color brightness test: off is exactly 1, every factor is a power of two
+    // (exact in R11G11B10 and FP16), and an out-of-range mode falls back to off.
+    static_assert(rrcolorscale::Factor(rrcolorscale::Off) == 1.0f);
+    static_assert(rrcolorscale::Factor(rrcolorscale::Count) == 1.0f);
+    static_assert(rrcolorscale::Factor(rrcolorscale::Sixteenth) == 0.0625f);
+    for (unsigned m = 1; m < rrcolorscale::Count; ++m) {
+        int e{};
+        assert(std::frexp(rrcolorscale::Factor(m), &e) == 0.5f && rrcolorscale::Factor(m) != 1.0f);
+    }
     assert(rrvrsconfig::Allowed("VRS@0;123 = true // preserved\n", true, true));
     assert(rrvrsconfig::Allowed("VRS@0;123 = false\n", true, true));
     assert(!rrvrsconfig::Allowed("VRS@0;123 = true\n", false, true));

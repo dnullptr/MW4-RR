@@ -12,6 +12,7 @@
 #include "../build/rr_convert_guides_test7.generated.h"
 #include "../build/rr_convert_guides_test8.generated.h"
 #include "../build/rr_sky_depth_floor.generated.h"
+#include "../build/rr_color_scale.generated.h"
 #include "rr_guide_test.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
@@ -114,7 +115,7 @@ struct Pipelines {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
         depth_floor_root;
-    ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor;
+    ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
@@ -179,6 +180,8 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
+        // Color scale test: same layout (color SRV table, scaled UAV table, 4 constants).
+        Pipeline(sky_edge_root.Get(), RRColorScale, sizeof(RRColorScale), color_scale);
         // Sky depth floor: depth copy UAV table, 4 root constants.
         D3D12_ROOT_PARAMETER f[2]{};
         f[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -285,6 +288,8 @@ struct GpuFrame {
     ComPtr<ID3D12Resource> specular_hit, hit_source;
     // Sky edge responsivity mask (rrskyedge), written just before evaluation.
     ComPtr<ID3D12Resource> sky_edge;
+    // Color scale test (rrcolorscale): RR's scaled color input, created on first use.
+    ComPtr<ID3D12Resource> scaled_color;
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
@@ -359,7 +364,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 14,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 15,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -648,6 +653,42 @@ struct GpuFrame {
         Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_COMMON);
     }
+    // Color scale test. Not reserved in RequiredPrepassBytes: returns false
+    // instead of allocating when the frame pool's reserve has no room left.
+    bool PrepareScaledColor(Pipelines &p, Budget &b) {
+        if (scaled_color)
+            return true;
+        const auto d = TextureDesc(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        if (!n || n > b.limit || b.bytes > b.limit - n)
+            return false;
+        scaled_color = Allocate(p, b, d);
+        UAV(p, scaled_color.Get(), 14);
+        return true;
+    }
+    // Between GateBegin and GateEnd: the color input (sr[0], slot 10) is a shader
+    // resource. Leaves the copy readable by RR; ScaledColorFinish returns it to COMMON.
+    void ScaleColor(ID3D12GraphicsCommandList *cl, Pipelines &p, float scale) {
+        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.sky_edge_root.Get());
+        cl->SetPipelineState(p.color_scale.Get());
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, 10));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, 14));
+        UINT c[] = {w, h, 0, 0};
+        memcpy(&c[2], &scale, sizeof(scale));
+        cl->SetComputeRoot32BitConstants(2, 4, c, 0);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void ScaledColorFinish(ID3D12GraphicsCommandList *cl) {
+        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+    }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {
         if (inference_ok) {
@@ -686,6 +727,10 @@ struct GpuFrame {
     }
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
+    }
+    // Factor the gate's Display applies to RR's output (color scale test); 0 = none.
+    void OutputScale(float factor) {
+        memcpy(&header_map[13], &factor, sizeof(factor));
     }
     // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
     std::array<UINT, 4> ReadStats() {

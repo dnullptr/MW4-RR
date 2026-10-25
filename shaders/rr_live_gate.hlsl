@@ -1,7 +1,7 @@
 #include "../src/rr_spatial_fallback.h"
 // Private full-frame presentation gate. Persistent state is initialized once
 // outside replayable game recordings. A replayed reset must never clear it.
-cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;}
+cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength,OutputScale;uint2 Unused;}
 Texture2D<uint> Status:register(t0);
 Texture2D<float4> Reconstructed:register(t1);
 Texture2D<float4> CurrentColor:register(t2);
@@ -51,6 +51,9 @@ bool Widespread(){return Stats.Load(8)>IsolatedLimit()||Stats.Load(12)>IsolatedL
   GameOutput[id.xy]=float4(lerp(a,b,y.fraction),1);
   return;
  }
- GameOutput[id.xy]=float4(Reconstructed.Load(int3(id.xy,0)).rgb,1);
+ float3 color=Reconstructed.Load(int3(id.xy,0)).rgb;
+ // Color scale test (rr_color_scale.h): undo the scale on RR's input. 0 = off.
+ if(OutputScale>0)color*=OutputScale;
+ GameOutput[id.xy]=float4(color,1);
  if(id.x==0&&id.y==0)Stats.Store(4,1);
 }

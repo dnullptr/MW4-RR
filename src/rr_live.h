@@ -6,6 +6,7 @@
 #include "rr_responsivity.h"
 #include "rr_sky_depth_test.h"
 #include "rr_sky_edge.h"
+#include "rr_color_scale.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -86,7 +87,7 @@ class Controller {
     rrhealth::Tracker health;
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
-    bool responsivity_enabled{}, responsivity_active{}, sky_edge_active{};
+    bool responsivity_enabled{}, responsivity_active{}, sky_edge_active{}, color_scale_active{};
     float responsivity_strength = rrresponsivity::DefaultStrength;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
@@ -343,6 +344,13 @@ class Controller {
                rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
                               rrskyedge::strength.load(std::memory_order_relaxed),
                               preset.has_effective, preset.effective);
+    }
+    // Whether the latest evaluation sent RR a scaled color input.
+    bool ColorScaleActive() {
+        std::lock_guard lock(mutex);
+        return color_scale_active && enabled && !failed && !retired &&
+               rrcolorscale::Valid(rrcolorscale::mode.load(std::memory_order_relaxed)) !=
+                   rrcolorscale::Off;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -1193,16 +1201,41 @@ class Controller {
                 !sky_edge_active &&
                 rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
                                     preset.has_effective, preset.effective);
-            rreval::Resources resources{s->gpu.sr[0].Get(),
+            // Color scale test: needs the color at the subrect origin and room in the reserve.
+            const float color_scale =
+                rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
+            color_scale_active = false;
+            if (color_scale != 1.0f && !o.color_x && !o.color_y) {
+                try {
+                    color_scale_active = s->gpu.PrepareScaledColor(pipelines, budget);
+                } catch (const rrprivate::AllocationDeferred &) {
+                }
+                if (!color_scale_active) {
+                    static bool reported{};
+                    if (!reported) {
+                        reported = true;
+                        Log("Color scale test waiting for GPU memory; RR gets the game's color");
+                    }
+                }
+            }
+            if (color_scale_active)
+                s->gpu.OutputScale(1.0f / color_scale);
+            // The SSS guide and color before transparency are in the game's color
+            // scale, so they are left out while the test scales RR's color.
+            rreval::Resources resources{color_scale_active ? s->gpu.scaled_color.Get()
+                                                           : s->gpu.sr[0].Get(),
                                         s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
                                         s->gpu.rr_output.Get(),
                                         s->gpu.guides[0].Get(),
                                         s->gpu.guides[1].Get(),
                                         s->gpu.guides[2].Get(),
-                                        s->sss_used ? s->gpu.sss.guide.Get() : nullptr,
-                                        s->transparency_used ? s->gpu.transparency.guide.Get()
-                                                             : nullptr,
+                                        s->sss_used && !color_scale_active
+                                            ? s->gpu.sss.guide.Get()
+                                            : nullptr,
+                                        s->transparency_used && !color_scale_active
+                                            ? s->gpu.transparency.guide.Get()
+                                            : nullptr,
                                         sky_edge_active       ? s->gpu.sky_edge.Get()
                                         : responsivity_active ? s->gpu.sss.mask.Get()
                                                               : nullptr,
@@ -1248,6 +1281,8 @@ class Controller {
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             if (sky_edge_active)
                 s->gpu.SkyEdge(cl.Get(), pipelines, sky_edge_strength, sky_edge_radius);
+            if (color_scale_active)
+                s->gpu.ScaleColor(cl.Get(), pipelines, color_scale);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1261,6 +1296,8 @@ class Controller {
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             if (sky_edge_active)
                 s->gpu.SkyEdgeFinish(cl.Get());
+            if (color_scale_active)
+                s->gpu.ScaledColorFinish(cl.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)
