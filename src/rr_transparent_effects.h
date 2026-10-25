@@ -101,7 +101,7 @@ inline const char *Label(Report r) {
     case Report::Preset:
         return "waiting (needs RR preset F)";
     case Report::NoTransparency:
-        return "waiting (needs the Transparency guide, F9)";
+        return "waiting (no color before transparency this frame; needs the Transparency guide, F9)";
     case Report::ColorTest:
         return "off while the color brightness or contrast test is on";
     case Report::Waiting:
