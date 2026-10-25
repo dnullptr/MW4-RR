@@ -416,6 +416,48 @@ struct ControllerCpuTest {
         assert(startup.PresetStatus().pending &&
                !startup.NeedsReconfigure()); // Await creation without blocking producers.
         assert(startup.RequestPreset(0) && startup.Reconfigure());
+        // Running water tests: settings are clamped, and the panel only reports
+        // a mask the latest evaluation sent that would still be sent now.
+        Controller water;
+        rrwater::Settings wet;
+        wet.responsivity = true;
+        wet.strength = 3.0f;
+        wet.guide = 7;
+        water.SetWater(wet);
+        assert(water.water.strength == 1.0f && water.water.guide == rrwater::Mirror);
+        auto wet_status = water.WaterStatus();
+        assert(wet_status.wanted && !wet_status.ready && !wet_status.unavailable &&
+               !wet_status.responsivity && wet_status.coverage < 0);
+        water.water_status.ready = water.water_status.responsivity = true;
+        water.water_status.discard = true;
+        assert(!water.WaterStatus().ready); // RR is off
+        water.SetEnabled(true);
+        assert(water.WaterStatus().ready && !water.WaterStatus().responsivity); // no preset yet
+        water.preset.Created();
+        wet_status = water.WaterStatus();
+        assert(wet_status.ready && wet_status.responsivity && !wet_status.discard);
+        wet.discard = true;
+        water.SetWater(wet);
+        assert(water.WaterStatus().discard);
+        // Water storage waits for a first SR allocation and for the retry
+        // window; a shortage then waits again without failing the tests.
+        GpuFrame dry;
+        assert(!water.PrepareWater(dry, 1000) && water.water_retry_after == 0);
+        dry.rr_output.Attach(new CpuResource);
+        water.water_retry_after = 2000;
+        assert(water.WaterStatus().waiting_memory);
+        assert(!water.PrepareWater(dry, 1999) && water.water_retry_after == 2000);
+        assert(!water.PrepareWater(dry, 2000) && water.water_retry_after == 3000); // no device
+        assert(!water.water_failed && water.WaterStatus().waiting_memory);
+        water.SetEnabled(false);
+        assert(!water.WaterStatus().waiting_memory); // nothing retries while RR is off
+        water.SetEnabled(true);
+        water.SetWater({});
+        assert(water.water_retry_after == 0);
+        water.SetWater(wet);
+        water.water_failed = true;
+        wet_status = water.WaterStatus();
+        assert(wet_status.unavailable && !wet_status.ready);
         Controller c;
         c.SetEnabled(true);
         c.SetSssEnabled(true);

@@ -12,6 +12,21 @@
 #else
 #define RR_RESPONSIVITY_MASK_KEY "DLSSD.ResponsivityMask"
 #endif
+// Optional masks used by the running water tests (rr_water.h).
+#ifdef NVSDK_NGX_Parameter_DLSS_DisocclusionMask
+#define RR_DISOCCLUSION_MASK_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask
+#define RR_DISOCCLUSION_MASK_X_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_X
+#define RR_DISOCCLUSION_MASK_Y_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_Y
+#else
+#define RR_DISOCCLUSION_MASK_KEY "DLSS.DisocclusionMask"
+#define RR_DISOCCLUSION_MASK_X_KEY "DLSS.DisocclusionMask.Subrect.Base.X"
+#define RR_DISOCCLUSION_MASK_Y_KEY "DLSS.DisocclusionMask.Subrect.Base.Y"
+#endif
+#ifdef NVSDK_NGX_Parameter_AnimatedTextureMask
+#define RR_ANIMATED_TEXTURE_MASK_KEY NVSDK_NGX_Parameter_AnimatedTextureMask
+#else
+#define RR_ANIMATED_TEXTURE_MASK_KEY "AnimatedTextureMask"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -73,6 +88,8 @@ struct Resources {
     ID3D12Resource *before_transparency{};
     ID3D12Resource *responsivity{};
     ID3D12Resource *specular_hit{};
+    ID3D12Resource *disocclusion{};
+    ID3D12Resource *animated{};
 };
 inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const Resources &r,
                                float *world_to_view, float *view_to_clip) {
@@ -99,6 +116,10 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_Y, 0u);
 #endif
+    p.Set(RR_DISOCCLUSION_MASK_KEY, r.disocclusion);
+    p.Set(RR_DISOCCLUSION_MASK_X_KEY, 0u);
+    p.Set(RR_DISOCCLUSION_MASK_Y_KEY, 0u);
+    p.Set(RR_ANIMATED_TEXTURE_MASK_KEY, r.animated);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, v.jitter_x);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, v.jitter_y);
     p.Set(NVSDK_NGX_Parameter_Reset, 1);
