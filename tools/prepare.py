@@ -54,8 +54,6 @@ def main():
 
     header(out / 'rr_sparse.generated.h', [
         ('RRSpatialPassthrough', compile_hlsl('rr_spatial_passthrough.hlsl', 'rr_spatial_passthrough'), True)])
-    header(out / 'rr_transparency_blend.generated.h', [
-        ('RRTransparencyBlend', compile_hlsl('rr_transparency_blend.hlsl', 'rr_transparency_blend'), False)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),

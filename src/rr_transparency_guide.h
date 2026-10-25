@@ -205,11 +205,8 @@ struct Ticket {
     ComPtr<ID3D12GraphicsCommandList> preparation, anchor;
     bool prep_live{}, anchor_live{}, prep_submitted{}, anchor_submitted{}, written{}, anchored{},
         at_draw{};
-    // Mirrors the slot's coverage capture ticket (rrblend::Ticket::live), so the
-    // controller's slot-retire check keeps a slot whose capture list is live.
-    bool coverage_live{};
     bool Live() const {
-        return prep_live || anchor_live || coverage_live;
+        return prep_live || anchor_live;
     }
 };
 } // namespace rrtrans

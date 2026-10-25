@@ -9,7 +9,6 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
-#include <utility>
 
 namespace rrcompute {
 using Microsoft::WRL::ComPtr;
@@ -24,22 +23,6 @@ struct OutputBindings {
     UINT64 generation{}, serial{};
     bool known{}, covered{};
 };
-// One native ExecuteIndirect as the tracker forwarded it. replay re-issues it
-// through the same trampoline, so this detour, Update and the observer never see
-// the replay. Replay only the unmodified call, synchronously, from inside the
-// observer, while holding Tracker::Internal (the observer runs under it), and add
-// rrinternal::Scope as for any other add-on command. replay returns false, and
-// records nothing, for any other call, for a second replay or without a trampoline.
-struct IndirectCall {
-    ID3D12GraphicsCommandList *cl{};
-    ID3D12CommandSignature *signature{};
-    UINT max{};
-    ID3D12Resource *args{};
-    UINT64 args_offset{};
-    ID3D12Resource *count{};
-    UINT64 count_offset{};
-    bool (*replay)(const IndirectCall &){};
-};
 enum class Kind { Empty, Table, Constants, CBV, SRV, UAV };
 struct Argument {
     Kind kind{};
@@ -53,12 +36,6 @@ struct Shape {
     bool compute{}, ignored{};
 };
 using CBVPair = rrvrrt::CBVs;
-// One compute root CBV of the current pipeline (RootCBV).
-struct RootCBVProof {
-    UINT parameter{};
-    UINT64 address{};
-    bool valid{};
-};
 struct Snapshot {
     ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12RootSignature> root;
@@ -109,7 +86,6 @@ struct Snapshot {
     }
 };
 class Tracker {
-    friend struct TrackerTestAccess;
     enum Method {
         PSO,
         Root,
@@ -178,11 +154,6 @@ class Tracker {
     std::atomic<bool> write_observers_healthy{true};
     void (*before_write)(ID3D12GraphicsCommandList *, WriteKind){};
     void (*bound_outputs)(const OutputBindings &){};
-    // Both written once, at the first registration, and never changed after. A refused
-    // registration or an observer exception clears the latch for good.
-    std::atomic<void (*)(const IndirectCall &)> after_indirect{};
-    void (*indirect_log)(const char *){};
-    std::atomic<bool> after_indirect_healthy{true};
     bool (*shared_output_context)(ID3D12GraphicsCommandList *){};
     static inline Tracker *active{};
     struct Error {
@@ -210,30 +181,6 @@ class Tracker {
         } catch (...) {
             write_observers_healthy = false;
         }
-    }
-    void AfterIndirect(const IndirectCall &call) noexcept {
-        if (internal || !after_indirect_healthy)
-            return;
-        auto *observer = after_indirect.load(std::memory_order_acquire);
-        if (!observer)
-            return;
-        Error preserve;
-        // Everything the observer records, the replay included, is the add-on's own.
-        Internal recording;
-        const auto *previous = observed;
-        observed = &call;
-        try {
-            observer(call);
-        } catch (...) {
-            // Only the first failure logs, even when two lists throw at once.
-            if (after_indirect_healthy.exchange(false) && indirect_log)
-                try {
-                    indirect_log("RR indirect draw observer exception; observer disabled, "
-                                 "native call already forwarded");
-                } catch (...) {
-                }
-        }
-        observed = previous;
     }
     bool WriteCovered(State &s, const std::array<void *, Count> &current) const {
         bool covered =
@@ -387,17 +334,6 @@ class Tracker {
             }
         });
     }
-    // A hooked layer can forward into another hooked layer (a runtime or debug layer
-    // into the next list). Only the outermost one, the caller's own call, is observed.
-    static inline thread_local unsigned indirect_depth{};
-    struct IndirectDepth {
-        IndirectDepth() {
-            ++indirect_depth;
-        }
-        ~IndirectDepth() {
-            --indirect_depth;
-        }
-    };
     template <size_t N>
     static void STDMETHODCALLTYPE OnIndirect(ID3D12GraphicsCommandList *cl,
                                              ID3D12CommandSignature *sig, UINT n,
@@ -406,38 +342,12 @@ class Tracker {
         // SDK D3D12_INDIRECT_ARGUMENT_TYPE can change draw/dispatch, VB/IB and
         // root arguments, but cannot change PSO/OM/RS/predication/renderpass state.
         active->BeforeWrite(cl, WriteKind::Indirect);
-        const bool outermost = !indirect_depth;
-        {
-            IndirectDepth nested;
-            Forward<Indirect, N>(cl, sig, n, args, offset, count, count_offset);
-        }
+        Forward<Indirect, N>(cl, sig, n, args, offset, count, count_offset);
         active->Update<Indirect>(cl, [](State &s) {
             s.args = {};
             s.sss_cbvs.Invalidate();
             s.uncertain = true;
         });
-        if (outermost)
-            active->AfterIndirect({cl, sig, n, args, offset, count, count_offset, &Replay<N>});
-    }
-    // The call the observer on this thread is handling, until its one replay.
-    static inline thread_local const IndirectCall *observed{};
-    static bool SameCall(const IndirectCall &a, const IndirectCall &b) noexcept {
-        return a.cl == b.cl && a.signature == b.signature && a.max == b.max &&
-               a.args == b.args && a.args_offset == b.args_offset && a.count == b.count &&
-               a.count_offset == b.count_offset && a.replay == b.replay;
-    }
-    template <size_t N> static bool Replay(const IndirectCall &c) {
-        using Fn = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandSignature *,
-                                             UINT, ID3D12Resource *, UINT64, ID3D12Resource *,
-                                             UINT64);
-        auto *self = active;
-        void *original = self ? self->hooks[Indirect][N].original.load() : nullptr;
-        if (!observed || !SameCall(*observed, c) || c.replay != &Replay<N> || !original)
-            return false;
-        observed = nullptr;
-        reinterpret_cast<Fn>(original)(c.cl, c.signature, c.max, c.args, c.args_offset, c.count,
-                                       c.count_offset);
-        return true;
     }
     template <size_t N>
     static void STDMETHODCALLTYPE OnBundle(ID3D12GraphicsCommandList *cl,
@@ -791,49 +701,6 @@ class Tracker {
     bool HookTargets(const std::array<void *, Count> &targets, std::index_sequence<M...>) {
         return ((!targets[M] || Hook<Method(M)>(targets[M])) && ...);
     }
-    // RateCBVs and RootCBV, one register: exactly one compute space-0 CBV shape for `reg`, with
-    // flags 0, 2 or 4, bound as a nonzero 256-aligned root CBV. A passing match stores its
-    // parameter and address before the match count is checked.
-    static bool OneRootCBV(const Layout &layout, const State &s, UINT reg, UINT &parameter,
-                           UINT64 &address) {
-        unsigned matches = 0;
-        for (UINT p = 0; p < layout.count; ++p) {
-            const auto &shape = layout.params[p];
-            if (shape.kind != Kind::CBV || !shape.compute || shape.space ||
-                shape.shader_register != reg)
-                continue;
-            ++matches;
-            const auto &a = s.args[p];
-            if ((shape.flags != 0 && shape.flags != 2 && shape.flags != 4) || a.kind != Kind::CBV ||
-                !a.address || (a.address & 255))
-                return false;
-            parameter = p;
-            address = a.address;
-        }
-        return matches == 1;
-    }
-    // RateCBVs' and RootCBV's shared preamble, under both locks: `cl`'s tracked state and the
-    // layout of `root` when the tracker is healthy, the list's core targets are unchanged (a change
-    // marks coverage lost, which stays) and the tracked root and pipeline are known and are `root`
-    // and `pipeline`; both null otherwise.
-    std::pair<const State *, const Layout *> CurrentCompute(ID3D12GraphicsCommandList *cl,
-                                                            ID3D12PipelineState *pipeline,
-                                                            ID3D12RootSignature *root) {
-        if (!healthy)
-            return {};
-        auto at = states.find(cl);
-        if (at == states.end())
-            return {};
-        auto &s = at->second;
-        if (!CoreTargetsEqual(Targets(cl), s.targets))
-            s.coverage_lost = true;
-        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
-            return {};
-        auto layout = layouts.find(root);
-        if (layout == layouts.end())
-            return {};
-        return {&s, &layout->second};
-    }
 
   public:
     // Optional content observer registration must precede first Attach. Changing it
@@ -855,30 +722,6 @@ class Tracker {
             return write_observers_healthy.load();
         } catch (...) {
             write_observers_healthy = false;
-            return false;
-        }
-    }
-    // Called after each forwarded native ExecuteIndirect that is not Internal, outside
-    // the tracker lock. Same registration rule as above; a refusal or an observer
-    // exception turns off only this observer, for good.
-    bool SetAfterIndirect(void (*observer)(const IndirectCall &),
-                          void (*log)(const char *)) noexcept {
-        try {
-            std::lock_guard install(install_mutex);
-            std::lock_guard lock(mutex);
-            const auto current = after_indirect.load();
-            if (!after_indirect_healthy || !observer || !log || (!current && !states.empty()) ||
-                (current && (current != observer || indirect_log != log))) {
-                after_indirect_healthy = false;
-                return false;
-            }
-            if (!current) {
-                indirect_log = log; // published by the release store below
-                after_indirect.store(observer, std::memory_order_release);
-            }
-            return true;
-        } catch (...) {
-            after_indirect_healthy = false;
             return false;
         }
     }
@@ -1083,20 +926,6 @@ class Tracker {
         std::lock_guard lock(mutex);
         layouts.erase(root);
     }
-    // The 32-bit value count of a root-constants parameter, or -1 when the root
-    // signature or the parameter is not known to hold root constants.
-    int RootConstantWords(ID3D12RootSignature *root, UINT parameter) noexcept {
-        try {
-            std::lock_guard lock(mutex);
-            const auto i = layouts.find(root);
-            if (!root || i == layouts.end() || parameter >= i->second.count)
-                return -1;
-            const auto &shape = i->second.params[parameter];
-            return shape.kind == Kind::Constants && !shape.ignored ? int(shape.words) : -1;
-        } catch (...) {
-            return -1;
-        }
-    }
     bool TableBound(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pipeline,
                     ID3D12RootSignature *root, UINT parameter, UINT64 address) {
         std::lock_guard install_lock(install_mutex);
@@ -1243,26 +1072,39 @@ class Tracker {
         std::lock_guard install_lock(install_mutex);
         std::lock_guard lock(mutex);
         CBVPair result;
-        const auto [s, layout] = CurrentCompute(cl, pipeline, root);
-        if (!s || !layout)
+        if (!healthy)
             return result;
-        for (unsigned k = 0; k < 2; ++k)
-            if (!OneRootCBV(*layout, *s, k ? 3u : 1u, result.parameters[k], result.addresses[k]))
+        auto at = states.find(cl);
+        if (at == states.end())
+            return result;
+        auto &s = at->second;
+        if (!CoreTargetsEqual(Targets(cl), s.targets))
+            s.coverage_lost = true;
+        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
+            return result;
+        auto layout = layouts.find(root);
+        if (layout == layouts.end())
+            return result;
+        for (unsigned k = 0; k < 2; ++k) {
+            unsigned matches = 0;
+            for (UINT p = 0; p < layout->second.count; ++p) {
+                const auto &shape = layout->second.params[p];
+                if (shape.kind != Kind::CBV || !shape.compute || shape.space ||
+                    shape.shader_register != (k ? 3u : 1u))
+                    continue;
+                ++matches;
+                const auto &a = s.args[p];
+                if ((shape.flags != 0 && shape.flags != 2 && shape.flags != 4) ||
+                    a.kind != Kind::CBV || !a.address || (a.address & 255))
+                    return result;
+                result.parameters[k] = p;
+                result.addresses[k] = a.address;
+            }
+            if (matches != 1)
                 return result;
+        }
         result.valid = true;
         return result;
-    }
-    // RateCBVs' proof for the one register `reg` (b1 alone at the ray budget's resolve).
-    RootCBVProof RootCBV(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pipeline,
-                         ID3D12RootSignature *root, UINT reg) {
-        std::lock_guard install_lock(install_mutex);
-        std::lock_guard lock(mutex);
-        const auto [s, layout] = CurrentCompute(cl, pipeline, root);
-        UINT parameter{};
-        UINT64 address{};
-        if (!s || !layout || !OneRootCBV(*layout, *s, reg, parameter, address))
-            return {};
-        return {parameter, address, true};
     }
     Snapshot Capture(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *expected = nullptr) {
         std::lock_guard install_lock(install_mutex);

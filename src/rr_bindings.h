@@ -39,10 +39,6 @@ struct Location {
     bool known{};
     uint64_t table{};
     uint32_t offset{}, parameter{};
-    // The descriptor_range_flags of the range the register was found in, when the layout declared
-    // them (descriptor_table_with_flags or push ranges with flags).
-    uint32_t range_flags{};
-    bool flags_known{};
 };
 struct DescriptorWatch {
     std::shared_ptr<std::atomic<bool>> stable, health;
@@ -51,13 +47,8 @@ struct DescriptorWatch {
     }
 };
 class Tracker {
-    // A layout range; flags only when it arrived with flags (a plain descriptor_table has none).
-    struct Range : descriptor_range {
-        uint32_t flags{};
-        bool flags_known{};
-    };
     struct Param {
-        std::vector<Range> ranges;
+        std::vector<descriptor_range> ranges;
         bool root{};
     };
     struct State {
@@ -173,7 +164,7 @@ class Tracker {
                 n = p.descriptor_table_with_flags.count;
             else if (p.type == pipeline_layout_param_type::push_descriptors) {
                 copy[i].root = true;
-                copy[i].ranges.push_back(Range{p.push_descriptors});
+                copy[i].ranges.push_back(p.push_descriptors);
                 continue;
             } else if (p.type ==
                        pipeline_layout_param_type::push_descriptors_with_ranges_and_flags) {
@@ -192,13 +183,10 @@ class Tracker {
             }
             total += n;
             for (uint32_t j = 0; j < n; ++j)
-                if (p.type == pipeline_layout_param_type::descriptor_table)
-                    copy[i].ranges.push_back(Range{p.descriptor_table.ranges[j]});
-                else {
-                    const auto &r = p.descriptor_table_with_flags.ranges[j];
-                    copy[i].ranges.push_back(
-                        Range{static_cast<const descriptor_range &>(r), uint32_t(r.flags), true});
-                }
+                copy[i].ranges.push_back(p.type == pipeline_layout_param_type::descriptor_table
+                                             ? p.descriptor_table.ranges[j]
+                                             : static_cast<const descriptor_range &>(
+                                                   p.descriptor_table_with_flags.ranges[j]));
         }
         layouts[layout] = std::move(copy);
     }
@@ -339,11 +327,9 @@ class Tracker {
                     return {}; // Count matching ranges, even unsupported/unbound representations.
                 if (root_only) {
                     if (layout->second[param].root && r.count == 1)
-                        result = {true, 0, 0, param, r.flags, r.flags_known};
-                } else if (!layout->second[param].root && s->second.tables[param]) {
-                    const auto offset = uint32_t(relative + r.binding);
-                    result = {true, s->second.tables[param], offset, param, r.flags, r.flags_known};
-                }
+                        result = {true, 0, 0, param};
+                } else if (!layout->second[param].root && s->second.tables[param])
+                    result = {true, s->second.tables[param], uint32_t(relative + r.binding), param};
             }
         }
         return result;
