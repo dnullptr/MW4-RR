@@ -22,13 +22,18 @@ uint PixelCode(uint2 p){
  else{uint i=(byteOffset-65536)/4;word=RateWords1[i/4][i%4];}
  return (word>>((byteOffset&2)*8))&65535;
 }
-// RR_NATIVE_LOBE 1 or 2 takes that lobe from native temporal output (t0, the
-// native spatial input) instead of raw current-frame lighting. One lobe is
-// diffuse and one specular; native diffuse keeps the game's SSS blur from
-// spreading sparse raw samples into blotches. Its weight bits come along too,
-// matching the temporal-only passthrough comparison.
+// RR_NATIVE_LOBE is a lobe mask (1 = first, 2 = second, 3 = both) taken from
+// native temporal output (t0, the native spatial input) instead of raw
+// current-frame lighting. The game's SSS blur spreads sparse, boosted raw
+// diffuse samples into blotches. Its weight bits come along too, matching the
+// temporal-only passthrough comparison.
+// RR_NATIVE_FILL keeps a lobe's fresh sample, without the inverse-probability
+// boost, wherever a ray landed this frame; only unsampled pixels take native.
 #ifndef RR_NATIVE_LOBE
 #define RR_NATIVE_LOBE 0
+#endif
+#ifndef RR_NATIVE_FILL
+#define RR_NATIVE_FILL 0
 #endif
 uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
  float4 v=float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
@@ -36,6 +41,15 @@ uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
  if(!valid)return 0;
  float f=float(inverse);v=min(v*float4(f,f,f,f*f),65504);
  uint4 h=f32tof16(v);return uint2(h.x|(h.y<<16),h.z|(h.w<<16));
+}
+uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
+#if RR_NATIVE_FILL
+ float4 v=float4(f16tof32(raw.x&65535),f16tof32(raw.x>>16),f16tof32(raw.y&65535),f16tof32(raw.y>>16));
+ fresh=sampled&&all(v>=0)&&all(v<=65504);
+#else
+ fresh=false;
+#endif
+ return fresh?raw:native;
 }
 [numthreads(16,16,1)]
 void main(uint3 id:SV_DispatchThreadID){
@@ -59,10 +73,13 @@ void main(uint3 id:SV_DispatchThreadID){
  uint4 nc=nativeLighting.Load(int3(p,0));uint nw=nativeWeights.Load(int3(p,0));
 #endif
  uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
-#if RR_NATIVE_LOBE==1
- ca=nc.xy;outWeights=(outWeights&~0xfff00000u)|(nw&0xfff00000u);
-#elif RR_NATIVE_LOBE==2
- cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);
+#if RR_NATIVE_LOBE&1
+ bool fa;ca=SelectLobe(c.xy,(wt>>20)!=0,nc.xy,fa);
+ outWeights=(outWeights&~0xfff00000u)|((fa?wt:nw)&0xfff00000u);
+#endif
+#if RR_NATIVE_LOBE&2
+ bool fb;cb=SelectLobe(c.zw,((wt>>8)&4095)!=0,nc.zw,fb);
+ outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
 #endif
 #ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));

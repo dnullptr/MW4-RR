@@ -4,12 +4,18 @@
 #include "../src/rr_vrs_config.h"
 #include "../src/rr_live_policy.h"
 #include "../src/rr_guide_health.h"
+#include "../src/rr_lighting_source.h"
 #include <cassert>
 #include <string_view>
 
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.preset == 6);
-static_assert(defaults.tolerate_isolated && defaults.native_lobe == 0);
+static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
+// Stored values 0..2 keep their meaning; unknown values read as raw lighting.
+static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
+static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
+static_assert(rrlighting::Valid(rrlighting::Count) == rrlighting::Raw);
+static_assert(std::string_view(rrlighting::labels[rrlighting::FillLobe2]) == "Lobe 2 fill gaps");
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");

@@ -6,6 +6,7 @@
 #include "rr_vrrt_data.h"
 #include "rr_compute_state.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include "rr_lighting_source.h"
 #include <array>
 #include <mutex>
 #include <unordered_map>
@@ -188,8 +189,8 @@ class Pool {
         ComPtr<ID3D12PipelineState> scale;
         ComPtr<ID3D12Resource> rates;
         ComPtr<ID3D12RootSignature> privateRoot;
-        // Indexed by lobe source: 0 raw, 1 or 2 that lobe from native temporal output.
-        std::array<ComPtr<ID3D12PipelineState>, 3> privateScale;
+        // Indexed by rrlighting::Source.
+        std::array<ComPtr<ID3D12PipelineState>, rrlighting::Count> privateScale;
         unsigned privateLobe{};
         ComPtr<ID3D12DescriptorHeap> privateHeap;
         ID3D12GraphicsCommandList *command{};
@@ -233,20 +234,35 @@ class Pool {
         cl->ResourceBarrier(2, after.data());
     }
     static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe) {
-        if (packed_float)
-            return lobe == 1   ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1Float,
-                                                     sizeof(RRVrrtScaleNative1Float)}
-                   : lobe == 2 ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2Float,
-                                                     sizeof(RRVrrtScaleNative2Float)}
-                               : D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)};
-        return lobe == 1   ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1, sizeof(RRVrrtScaleNative1)}
-               : lobe == 2 ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2, sizeof(RRVrrtScaleNative2)}
-                           : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
+        using rrlighting::Source;
+        switch (rrlighting::Valid(lobe)) {
+        case Source::NativeLobe1:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1Float,
+                                                        sizeof(RRVrrtScaleNative1Float)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleNative1,
+                                                        sizeof(RRVrrtScaleNative1)};
+        case Source::NativeLobe2:
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2Float,
+                                                        sizeof(RRVrrtScaleNative2Float)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleNative2,
+                                                        sizeof(RRVrrtScaleNative2)};
+        case Source::FillLobe2:
+            return packed_float
+                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFill2Float, sizeof(RRVrrtScaleFill2Float)}
+                       : D3D12_SHADER_BYTECODE{RRVrrtScaleFill2, sizeof(RRVrrtScaleFill2)};
+        case Source::FillBoth:
+            return packed_float
+                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFill3Float, sizeof(RRVrrtScaleFill3Float)}
+                       : D3D12_SHADER_BYTECODE{RRVrrtScaleFill3, sizeof(RRVrrtScaleFill3)};
+        default:
+            return packed_float
+                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
+                       : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
+        }
     }
     static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output,
                                     unsigned lobe = 0) {
-        if (lobe > 2)
-            lobe = 0;
+        lobe = rrlighting::Valid(lobe);
         if (!s.privateRoot) {
             D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};

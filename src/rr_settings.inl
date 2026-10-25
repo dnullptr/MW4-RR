@@ -1,5 +1,6 @@
 #pragma once
 #include "rr_settings_model.h"
+#include "rr_lighting_source.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -25,8 +26,7 @@ static void ApplyEnabled() {
     LiveRR().SetTransparencyEnabled(requested_glass);
     AlbedoInspector().observe_transitions = requested_glass;
     LiveRR().SetTolerateIsolated(requested_tolerate);
-    if (requested_lobe > 2)
-        requested_lobe = 0;
+    requested_lobe = rrlighting::Valid(requested_lobe);
     rrbypass::lobe_source = requested_lobe;
 }
 static void LoadSettings() {
@@ -97,16 +97,15 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
     ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
                        "history; they are counted in ReShade.log instead. Off: previous behavior.");
-    const char *lobe_names[] = {"Off (raw lighting)", "Lobe 1 from native temporal",
-                                "Lobe 2 from native temporal"};
-    int lobe = static_cast<int>(requested_lobe);
-    if (ImGui::Combo("Native lighting lobe", &lobe, lobe_names, 3)) {
+    int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
+    if (ImGui::Combo("Native lighting lobe", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
         changed = true;
     }
-    ImGui::TextWrapped("Feeds one lighting lobe from the game's own temporal accumulation instead "
-                       "of raw samples, across the whole frame. One lobe is diffuse and one is "
-                       "specular: the diffuse one should remove blotches on skin. Compare both.");
+    ImGui::TextWrapped("Native temporal replaces a lobe with the game's own accumulation across the "
+                       "whole frame (lobe 2 behaves as diffuse): clean but soft. Fill gaps keeps "
+                       "each fresh ray sample unboosted and uses native accumulation only where no "
+                       "ray landed this frame.");
     ImGui::Separator();
     if (changed) {
         ApplyEnabled();
