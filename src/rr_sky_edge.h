@@ -11,6 +11,9 @@ inline constexpr unsigned DefaultRadius = 2, MaxRadius = 4;
 inline std::atomic<bool> enabled{};
 inline std::atomic<float> strength{DefaultStrength};
 inline std::atomic<unsigned> radius{DefaultRadius};
+// Bumped by the panel on every change; a test blocked for GPU memory retries
+// once this differs from the count it was blocked at.
+inline std::atomic<unsigned> changes{};
 inline unsigned ClampRadius(unsigned value) {
     return value < 1 ? 1 : value > MaxRadius ? MaxRadius : value;
 }

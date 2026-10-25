@@ -131,39 +131,69 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "history; they are counted in ReShade.log instead. Off: previous behavior.");
     // Session-only: not saved, so a test mode never sticks across restarts.
     int guide_test = static_cast<int>(rrguidetest::Valid(rrguidetest::mode));
+    using TestState = rrlive::Controller::TestState;
+    const bool rr_running = LiveRR().Running();
     if (ImGui::Combo("Guide test (thin geometry)", &guide_test, rrguidetest::labels,
-                     rrguidetest::Count))
-        rrguidetest::mode = static_cast<unsigned>(guide_test);
+                     rrguidetest::Count)) {
+        rrguidetest::mode = rrguidetest::Valid(static_cast<unsigned>(guide_test));
+        ++rrguidetest::changes;
+    }
+    if (rrguidetest::Valid(static_cast<unsigned>(guide_test)) == rrguidetest::SkySurface) {
+        const auto floor = LiveRR().DepthFloorTest();
+        ImGui::Text("Sky depth floor: %s",
+                    floor == TestState::Active    ? "active"
+                    : floor == TestState::Blocked ? "off: not enough GPU memory (pick the mode "
+                                                    "again to retry)"
+                    : !rr_running                 ? "waiting for RR"
+                                                  : "waiting");
+    }
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
     bool sky_edge = rrskyedge::enabled;
-    if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge))
+    if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
         rrskyedge::enabled = sky_edge;
+        ++rrskyedge::changes;
+    }
     float edge_strength = rrskyedge::strength;
-    if (ImGui::SliderFloat("Sky edge strength", &edge_strength, -1.0f, 0.0f, "%.2f"))
+    if (ImGui::SliderFloat("Sky edge strength", &edge_strength, -1.0f, 0.0f, "%.2f")) {
         rrskyedge::strength = rrresponsivity::Clamp(edge_strength);
+        ++rrskyedge::changes;
+    }
     int edge_radius = static_cast<int>(rrskyedge::ClampRadius(rrskyedge::radius));
     if (ImGui::SliderInt("Sky edge width (pixels)", &edge_radius, 1,
                          static_cast<int>(rrskyedge::MaxRadius), "%d",
-                         ImGuiSliderFlags_AlwaysClamp))
+                         ImGuiSliderFlags_AlwaysClamp)) {
         rrskyedge::radius =
             edge_radius < 1 ? 1u : rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
-    ImGui::Text("Sky edge mask: %s", LiveRR().SkyEdgeActive() ? "active"
-                                     : !sky_edge                ? "off"
-                                     : rrresponsivity::Clamp(edge_strength) == 0
-                                         ? "off (strength 0)"
-                                         : "waiting (needs preset F and free GPU memory)");
+        ++rrskyedge::changes;
+    }
+    const auto edge = LiveRR().SkyEdgeTest();
+    ImGui::Text("Sky edge mask: %s",
+                edge == TestState::Active    ? "active"
+                : !sky_edge                  ? "off"
+                : edge == TestState::Blocked ? "off: not enough GPU memory (change a sky edge "
+                                               "setting to retry)"
+                : rrresponsivity::Clamp(edge_strength) == 0 ? "off (strength 0)"
+                : !rr_running                               ? "waiting for RR"
+                                                            : "waiting (needs preset F)");
     ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
                        "steadier over time; moving branches may ghost. While on, it replaces the "
                        "SSS responsivity mask.");
     int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
     if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
-                     rrcolorscale::Count))
+                     rrcolorscale::Count)) {
         rrcolorscale::mode = rrcolorscale::Valid(static_cast<unsigned>(color_scale));
-    ImGui::Text("Color brightness test: %s", LiveRR().ColorScaleActive() ? "active"
-                                             : color_scale == 0          ? "off"
-                                                                         : "waiting");
+        ++rrcolorscale::changes;
+    }
+    const auto brightness = LiveRR().ColorTest();
+    ImGui::Text("Color brightness test: %s",
+                brightness == TestState::Active    ? "active"
+                : color_scale == 0                 ? "off"
+                : brightness == TestState::Blocked ? "off: not enough GPU memory (change the "
+                                                     "setting to retry)"
+                : !rr_running                      ? "waiting for RR"
+                                                   : "waiting");
     ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
@@ -189,7 +219,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         changed = true;
     ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive()      ? "active"
                                          : !requested_responsivity            ? "off"
-                                         : LiveRR().SkyEdgeActive() ? "replaced by sky edge mask"
+                                         : edge == TestState::Active ? "replaced by sky edge mask"
                                          : rrresponsivity::Clamp(requested_strength) == 0
                                              ? "off (strength 0)"
                                              : "waiting (needs preset F and the SSS guide)");

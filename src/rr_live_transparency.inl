@@ -63,8 +63,8 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
     }
     // Protect mandatory depth conversion and enabled SSS even while some slots
     // have not yet needed those resources. Exact device allocation sizes only.
-    // Same flags as the private depth copy (PrepareSR).
-    const auto depth_desc = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+    auto depth_desc = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+    depth_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     auto depth_buffer = rrprivate::Buffer(((UINT64(w) * 4 + 255) & ~255ull) * h);
     UINT64 reserve{};
     for (const auto &d : {depth_desc, depth_buffer}) {

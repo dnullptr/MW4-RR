@@ -35,6 +35,8 @@ class Controller {
         bool sss_used{}, awaiting_prepass{}, hit_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
+        // The color brightness test kept the SSS and transparency guides from RR.
+        bool guides_withheld{};
         GpuFrame gpu;
         bool busy{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
@@ -87,11 +89,22 @@ class Controller {
     rrhealth::Tracker health;
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
-    bool responsivity_enabled{}, responsivity_active{}, sky_edge_active{}, color_scale_active{};
-    // Color scale RR's history was built with, and a mode whose scaled copy
-    // could not be allocated (kept off for every slot until the mode changes).
+    bool responsivity_enabled{}, responsivity_active{};
+    // Development tests (sky edge mask, color brightness, sky depth floor): one
+    // texture each, shared by every slot, created on first use and released by
+    // Reconfigure. They sit in the persistent ledger, so pool projections count
+    // each once, and the reserve grows by exactly their size (test_reserve,
+    // given back on release).
+    struct DevTest {
+        ComPtr<ID3D12Resource> texture;
+        bool active{};     // the latest evaluation used it
+        bool blocked{};    // no GPU memory: retried once its setting changes
+        unsigned changes{}; // the setting's change count when it was blocked
+    };
+    DevTest sky_edge_test, color_test, depth_test;
+    UINT64 test_reserve{};
+    // Color scale RR's history was built with (color brightness test).
     float applied_color_scale = 1.0f;
-    unsigned color_scale_blocked = rrcolorscale::Off;
     float responsivity_strength = rrresponsivity::DefaultStrength;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
@@ -111,6 +124,49 @@ class Controller {
     void Log(const char *s) {
         if (logger)
             logger(s);
+    }
+
+    // Whether a development test runs in this evaluation; creates its shared
+    // texture on first use. The reserve first grows by the texture's exact size,
+    // so the texture never takes memory a slot projection counted on, and a
+    // failure only keeps the test off (RR keeps running) until its setting changes.
+    bool UseTest(DevTest &t, bool wanted, unsigned changes, UINT w, UINT h, DXGI_FORMAT format,
+                 const char *name) {
+        t.active = false;
+        if (!wanted)
+            return false;
+        if (t.blocked && t.changes == changes)
+            return false;
+        t.blocked = false;
+        if (!t.texture) {
+            const auto d = TextureDesc(w, h, format);
+            const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            const UINT64 old = budget.limit;
+            bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
+                      budget.Reserve(pipelines.device.Get(), old + n);
+            if (ok) {
+                try {
+                    t.texture = persistent.Allocate(pipelines, budget, d);
+                    test_reserve += n;
+                } catch (const std::exception &) {
+                    budget.limit = old;
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                t.blocked = true;
+                t.changes = changes;
+                char line[160];
+                snprintf(line, sizeof(line),
+                         "%s: not enough GPU memory; test off until its setting changes", name);
+                Log(line);
+                return false;
+            }
+        }
+        const auto d = t.texture->GetDesc();
+        if (d.Width != w || d.Height != h || d.Format != format)
+            return false;
+        return t.active = true;
     }
 
     template <class Prepare>
@@ -227,6 +283,13 @@ class Controller {
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
+        // The test textures were in the persistent ledger; give back the reserve
+        // they added, never below what is still allocated.
+        sky_edge_test = color_test = depth_test = {};
+        budget.limit = (std::max)({Budget::Minimum, budget.bytes,
+                                   budget.limit - (std::min)(test_reserve, budget.limit)});
+        test_reserve = 0;
+        applied_color_scale = 1.0f;
         init_list.Reset();
         init_allocator.Reset();
         fence.Reset();
@@ -287,8 +350,10 @@ class Controller {
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
-                                 s.sss_used && s.sss.admission.accepted,
-                                 s.transparency_used && s.transparency_accepted, s.replaced_sr,
+                                 s.sss_used && !s.guides_withheld && s.sss.admission.accepted,
+                                 s.transparency_used && !s.guides_withheld &&
+                                     s.transparency_accepted,
+                                 s.replaced_sr,
                                  s.hit_used);
                 if (v[0] || !v[1]) {
                     policy.Reject();
@@ -338,20 +403,24 @@ class Controller {
                rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
                                    preset.has_effective, preset.effective);
     }
-    // Whether the latest evaluation sent the sky edge mask and it would still be sent now.
-    bool SkyEdgeActive() {
+    // Development test state for the panel. Active: the latest evaluation used
+    // it and RR is still running. Blocked: no GPU memory until its setting changes.
+    enum class TestState { Idle, Active, Blocked };
+    TestState SkyEdgeTest() {
         std::lock_guard lock(mutex);
-        return sky_edge_active && enabled && !failed && !retired &&
-               rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
-                              rrskyedge::strength.load(std::memory_order_relaxed),
-                              preset.has_effective, preset.effective);
+        return Test(sky_edge_test, rrskyedge::changes.load(std::memory_order_relaxed));
     }
-    // Whether the latest evaluation sent RR a scaled color input.
-    bool ColorScaleActive() {
+    TestState ColorTest() {
         std::lock_guard lock(mutex);
-        return color_scale_active && enabled && !failed && !retired &&
-               rrcolorscale::Valid(rrcolorscale::mode.load(std::memory_order_relaxed)) !=
-                   rrcolorscale::Off;
+        return Test(color_test, rrcolorscale::changes.load(std::memory_order_relaxed));
+    }
+    TestState DepthFloorTest() {
+        std::lock_guard lock(mutex);
+        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed));
+    }
+    bool Running() {
+        std::lock_guard lock(mutex);
+        return enabled && !failed && !retired && feature;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -492,8 +561,8 @@ class Controller {
                 base = (std::max)(base, b - slot.gpu.sss.bytes);
                 depth = (std::max)(depth, d);
             }
-            // Same flags as the private depth copy (PrepareSR).
-            const auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
+            auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
+            texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
             const auto texture_bytes =
                            pipelines.device->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes,
@@ -686,6 +755,12 @@ class Controller {
             return false;
 #endif
         return s.raw_corrected && lighting_valid && lighting_valid(s.lighting_device, s.lighting_revision);
+    }
+    TestState Test(const DevTest &t, unsigned changes) const {
+        if (t.blocked && t.changes == changes)
+            return TestState::Blocked;
+        return t.active && enabled && !failed && !retired && feature ? TestState::Active
+                                                                     : TestState::Idle;
     }
   public:
 
@@ -1177,79 +1252,68 @@ class Controller {
                 Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
                 preset.Created();
             }
-            // Written by the SSS resolve below; null keeps RR's default responsiveness.
+            // Development tests (shared textures, see UseTest). RR takes one mask:
+            // while in use, the sky edge mask replaces the SSS one.
             const float sky_edge_strength =
                 rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
             const UINT sky_edge_radius =
                 rrskyedge::ClampRadius(rrskyedge::radius.load(std::memory_order_relaxed));
-            // RR takes one mask: while in use, the sky edge mask replaces the SSS one.
-            sky_edge_active =
-                rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
-                               sky_edge_strength, preset.has_effective, preset.effective);
-            if (sky_edge_active) {
-                try {
-                    sky_edge_active = s->gpu.PrepareSkyEdge(pipelines, budget);
-                } catch (const rrprivate::AllocationDeferred &) {
-                    sky_edge_active = false;
-                }
-                if (!sky_edge_active) {
-                    static bool reported{};
-                    if (!reported) {
-                        reported = true;
-                        Log("Sky edge mask waiting for GPU memory; RR runs without it");
-                    }
-                }
-            }
+            const bool sky_edge_on =
+                UseTest(sky_edge_test,
+                        rrskyedge::Use(rrskyedge::enabled.load(std::memory_order_relaxed),
+                                       sky_edge_strength, preset.has_effective, preset.effective),
+                        rrskyedge::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R16_FLOAT, "Sky edge mask");
+            // Written by the SSS resolve below; null keeps RR's default responsiveness.
             responsivity_active =
-                !sky_edge_active &&
+                !sky_edge_on &&
                 rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
                                     preset.has_effective, preset.effective);
-            // Color scale test: needs the color at the subrect origin and room in the reserve.
-            const unsigned color_mode =
-                rrcolorscale::Valid(rrcolorscale::mode.load(std::memory_order_relaxed));
-            const float color_scale = rrcolorscale::Factor(color_mode);
-            if (color_mode != color_scale_blocked)
-                color_scale_blocked = rrcolorscale::Off;
-            color_scale_active = false;
-            if (color_scale != 1.0f && color_mode != color_scale_blocked && !o.color_x &&
-                !o.color_y) {
-                try {
-                    color_scale_active = s->gpu.PrepareScaledColor(pipelines, budget);
-                } catch (const rrprivate::AllocationDeferred &) {
-                }
-                if (!color_scale_active) {
-                    // Off for every slot, so frames never alternate between scales.
-                    color_scale_blocked = color_mode;
-                    Log("Color brightness test has no GPU memory for its copy; it stays off "
-                        "until another level is picked");
-                }
-            }
-            if (color_scale_active)
+            const float color_scale =
+                rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
+            const bool color_on =
+                UseTest(color_test, color_scale != 1.0f,
+                        rrcolorscale::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R32G32B32A32_FLOAT, "Color brightness test");
+            if (color_on)
                 s->gpu.OutputScale(1.0f / color_scale);
             // RR's history is in the previous scale: start it over when the scale changes.
-            const float applied = color_scale_active ? color_scale : 1.0f;
+            const float applied = color_on ? color_scale : 1.0f;
             const bool color_scale_changed = applied != applied_color_scale;
             applied_color_scale = applied;
+            // The guide mode this slot's guides were converted with, not the panel's
+            // current one, so normals and depth always come from the same mode.
+            const bool depth_on =
+                UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface,
+                        rrguidetest::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R32_FLOAT, "Sky depth floor");
             // The SSS guide and color before transparency are in the game's color
             // scale, so they are left out while the test scales RR's color.
-            rreval::Resources resources{color_scale_active ? s->gpu.scaled_color.Get()
-                                                           : s->gpu.sr[0].Get(),
-                                        s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
+            s->guides_withheld = color_on;
+            rreval::Resources resources{color_on ? color_test.texture.Get() : s->gpu.sr[0].Get(),
+                                        depth_on           ? depth_test.texture.Get()
+                                        : s->gpu.use_depth ? s->gpu.depth.Get()
+                                                           : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
                                         s->gpu.rr_output.Get(),
                                         s->gpu.guides[0].Get(),
                                         s->gpu.guides[1].Get(),
                                         s->gpu.guides[2].Get(),
-                                        s->sss_used && !color_scale_active
-                                            ? s->gpu.sss.guide.Get()
-                                            : nullptr,
-                                        s->transparency_used && !color_scale_active
+                                        s->sss_used && !color_on ? s->gpu.sss.guide.Get()
+                                                                 : nullptr,
+                                        s->transparency_used && !color_on
                                             ? s->gpu.transparency.guide.Get()
                                             : nullptr,
-                                        sky_edge_active       ? s->gpu.sky_edge.Get()
+                                        sky_edge_on           ? sky_edge_test.texture.Get()
                                         : responsivity_active ? s->gpu.sss.mask.Get()
                                                               : nullptr,
                                         s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+            // The test copies are read at their own origin.
+            auto evaluated = o;
+            if (color_on)
+                evaluated.color_x = evaluated.color_y = 0;
+            if (depth_on)
+                evaluated.depth_x = evaluated.depth_y = 0;
             auto projection = s->projection;
             if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
                 static bool described{};
@@ -1261,20 +1325,10 @@ class Controller {
                 }
                 rrskydepth::Apply(projection);
             }
-            rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
+            rreval::EvaluateParameters(*parameters, evaluated, resources, s->view.data(),
                                        projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset || color_scale_changed ? 1 : 0);
             s->gpu.Depth(cl.Get(), states[1]);
-            if (rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
-                    rrguidetest::SkySurface &&
-                !s->gpu.DepthFloor(cl.Get(), pipelines, rrguidetest::DepthFloor)) {
-                static bool reported{};
-                if (!reported) {
-                    reported = true;
-                    Log("Guide test: sky depth floor unavailable (RR reads the game's depth "
-                        "directly); only sky normals changed");
-                }
-            }
             for (unsigned i = 0; i < 3; ++i)
                 if (i != 1 || !s->gpu.use_depth)
                     Change(cl.Get(), s->gpu.sr[i].Get(), states[i],
@@ -1289,10 +1343,15 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            if (sky_edge_active)
-                s->gpu.SkyEdge(cl.Get(), pipelines, sky_edge_strength, sky_edge_radius);
-            if (color_scale_active)
-                s->gpu.ScaleColor(cl.Get(), pipelines, color_scale);
+            if (sky_edge_on)
+                s->gpu.SkyEdge(cl.Get(), pipelines, sky_edge_test.texture.Get(), sky_edge_strength,
+                               sky_edge_radius);
+            if (color_on)
+                s->gpu.ScaleColor(cl.Get(), pipelines, color_test.texture.Get(), o.color_x,
+                                  o.color_y, color_scale);
+            if (depth_on)
+                s->gpu.FloorDepth(cl.Get(), pipelines, depth_test.texture.Get(), o.depth_x,
+                                  o.depth_y, rrguidetest::DepthFloor);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1304,10 +1363,9 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(),
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-            if (sky_edge_active)
-                s->gpu.SkyEdgeFinish(cl.Get());
-            if (color_scale_active)
-                s->gpu.ScaledColorFinish(cl.Get());
+            for (auto *t : {&sky_edge_test, &color_test, &depth_test})
+                if (t->active)
+                    s->gpu.TestFinish(cl.Get(), t->texture.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)

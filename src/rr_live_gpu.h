@@ -11,6 +11,7 @@
 #include "../build/rr_convert_guides_test6.generated.h"
 #include "../build/rr_convert_guides_test7.generated.h"
 #include "../build/rr_convert_guides_test8.generated.h"
+#include "../build/rr_convert_guides_test9.generated.h"
 #include "../build/rr_sky_depth_floor.generated.h"
 #include "../build/rr_color_scale.generated.h"
 #include "rr_guide_test.h"
@@ -114,7 +115,7 @@ struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
-        depth_floor_root;
+        test_root;
     ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
@@ -152,6 +153,8 @@ struct Pipelines {
                  converter_tests[6]);
         Pipeline(converter_root.Get(), RRGuideShaderTest8, sizeof(RRGuideShaderTest8),
                  converter_tests[7]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest9, sizeof(RRGuideShaderTest9),
+                 converter_tests[8]);
         ranges[0].NumDescriptors = 3;
         ranges[1].NumDescriptors = 1;
         D3D12_ROOT_PARAMETER q[5]{};
@@ -180,17 +183,12 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
-        // Color scale test: same layout (color SRV table, scaled UAV table, 4 constants).
-        Pipeline(sky_edge_root.Get(), RRColorScale, sizeof(RRColorScale), color_scale);
-        // Sky depth floor: depth copy UAV table, 4 root constants.
-        D3D12_ROOT_PARAMETER f[2]{};
-        f[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        f[0].DescriptorTable = {1, &ranges[1]};
-        f[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        f[1].Constants = {0, 0, 4};
-        rd = {2, f};
-        Root(rd, depth_floor_root);
-        Pipeline(depth_floor_root.Get(), RRSkyDepthFloor, sizeof(RRSkyDepthFloor), depth_floor);
+        // Color scale and sky depth floor tests: source SRV table, target UAV
+        // table, 8 root constants.
+        e[2].Constants = {0, 0, 8};
+        Root(rd, test_root);
+        Pipeline(test_root.Get(), RRColorScale, sizeof(RRColorScale), color_scale);
+        Pipeline(test_root.Get(), RRSkyDepthFloor, sizeof(RRSkyDepthFloor), depth_floor);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
@@ -284,10 +282,12 @@ struct GpuFrame {
     // Owned copy of the native specular hit distance; hit_source is retained
     // until the recording that copied it retires.
     ComPtr<ID3D12Resource> specular_hit, hit_source;
-    // Sky edge responsivity mask (rrskyedge), written just before evaluation.
-    ComPtr<ID3D12Resource> sky_edge;
-    // Color scale test (rrcolorscale): RR's scaled color input, created on first use.
-    ComPtr<ID3D12Resource> scaled_color;
+    // Heap slots for the development tests (TestPass): the depth floor's source,
+    // then one target per test, so tests in the same frame never share one.
+    static constexpr UINT DepthSource = 12, SkyEdgeTarget = 13, ColorTarget = 14,
+                          DepthTarget = 15;
+    // Guide test mode Convert used for this frame (rrguidetest::Mode).
+    unsigned guide_test{};
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
@@ -362,7 +362,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 15,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -420,6 +420,7 @@ struct GpuFrame {
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetComputeRootSignature(p.converter_root.Get());
         const auto test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
+        guide_test = test;
         cl->SetPipelineState(test == rrguidetest::Off ? p.converter.Get()
                                                       : p.converter_tests[test - 1].Get());
         cl->SetComputeRootDescriptorTable(0, Gpu(p, 0));
@@ -541,10 +542,9 @@ struct GpuFrame {
                         rows == native.Height && width == native.Width * 4 && size,
                     "live depth plane footprint invalid");
             depth_buffer = Allocate(p, b, rrprivate::Buffer(size));
-            // UAV only for the "non-zero sky depth" guide test (DepthFloor).
-            depth = Allocate(
-                p, b, TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT));
-            UAV(p, depth.Get(), 13);
+            auto d = TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT);
+            d.Flags = D3D12_RESOURCE_FLAG_NONE;
+            depth = Allocate(p, b, d);
         }
     }
     void Depth(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES source_state) {
@@ -572,28 +572,6 @@ struct GpuFrame {
         Change(cl, depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
-    // After Depth(): lifts sky depth in the private copy (guide test SkySurface).
-    // Returns false when RR reads the game's depth directly and nothing can change.
-    bool DepthFloor(ID3D12GraphicsCommandList *cl, Pipelines &p, float floor) {
-        if (!use_depth || !depth)
-            return false;
-        const auto d = depth->GetDesc();
-        Change(cl, depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
-        cl->SetDescriptorHeaps(1, heaps);
-        cl->SetComputeRootSignature(p.depth_floor_root.Get());
-        cl->SetPipelineState(p.depth_floor.Get());
-        cl->SetComputeRootDescriptorTable(0, Gpu(p, 13));
-        UINT c[] = {UINT(d.Width), d.Height, 0, 0};
-        memcpy(&c[2], &floor, sizeof(floor));
-        cl->SetComputeRoot32BitConstants(1, 4, c, 0);
-        cl->Dispatch((c[0] + 7) / 8, (c[1] + 7) / 8, 1);
-        Order(cl);
-        Change(cl, depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        return true;
-    }
     void BindGate(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history) {
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
@@ -620,80 +598,57 @@ struct GpuFrame {
         Change(cl, rr_output.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    // Development tests allocate on first use, before recording, and are not
-    // part of RequiredPrepassBytes. Each one raises the reserve by its own size,
-    // so it never takes room the pool kept for its own lazy allocations; false
-    // (never a throw) when the device has no room, so a test can't stop RR.
-    bool TestRoom(Pipelines &p, Budget &b, const D3D12_RESOURCE_DESC &d) {
-        const UINT64 n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
-        return n && n != UINT64_MAX && b.limit <= UINT64_MAX - n &&
-               b.Reserve(p.device.Get(), b.limit + n);
-    }
-    bool PrepareSkyEdge(Pipelines &p, Budget &b) {
-        if (sky_edge)
-            return true;
-        const auto d = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
-        if (!TestRoom(p, b, d))
-            return false;
-        sky_edge = Allocate(p, b, d);
-        UAV(p, sky_edge.Get(), 12);
-        return true;
-    }
-    // Between GateBegin and GateEnd: Status (guides[3]) is a shader resource.
-    // Leaves the mask readable by RR; SkyEdgeFinish returns it to COMMON.
-    void SkyEdge(ID3D12GraphicsCommandList *cl, Pipelines &p, float strength, UINT radius) {
-        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_COMMON,
-               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // Development tests (rr_live.h): each fills one shared test texture from this
+    // frame's inputs between GateBegin and GateEnd, where Status (slot 8), the
+    // color (slot 10) and RR's depth are shader resources. The descriptors are
+    // written on this slot's own heap before the dispatch that reads them; each
+    // test has its own target slot. Leaves the texture readable by RR;
+    // TestFinish returns it to COMMON.
+    void TestPass(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12RootSignature *root,
+                  ID3D12PipelineState *pso, UINT source, ID3D12Resource *target, UINT slot,
+                  const UINT *constants, UINT count) {
+        UAV(p, target, slot);
+        Change(cl, target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
-        cl->SetComputeRootSignature(p.sky_edge_root.Get());
-        cl->SetPipelineState(p.sky_edge.Get());
-        cl->SetComputeRootDescriptorTable(0, Gpu(p, 8));
-        cl->SetComputeRootDescriptorTable(1, Gpu(p, 12));
+        cl->SetComputeRootSignature(root);
+        cl->SetPipelineState(pso);
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, source));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, slot));
+        cl->SetComputeRoot32BitConstants(2, count, constants, 0);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        Change(cl, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void TestFinish(ID3D12GraphicsCommandList *cl, ID3D12Resource *target) {
+        Change(cl, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+    }
+    // Sky edge responsivity mask (R16_FLOAT, w x h) from Status.
+    void SkyEdge(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *mask,
+                 float strength, UINT radius) {
         UINT c[] = {w, h, radius, 0};
         memcpy(&c[3], &strength, sizeof(strength));
-        cl->SetComputeRoot32BitConstants(2, 4, c, 0);
-        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        Order(cl);
-        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        TestPass(cl, p, p.sky_edge_root.Get(), p.sky_edge.Get(), 8, mask, SkyEdgeTarget, c, 4);
     }
-    void SkyEdgeFinish(ID3D12GraphicsCommandList *cl) {
-        Change(cl, sky_edge.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-               D3D12_RESOURCE_STATE_COMMON);
+    // RR's color scaled by a power of two (R32G32B32A32_FLOAT, w x h), read from
+    // the color subrect at (x, y). RR then reads it at subrect origin 0.
+    void ScaleColor(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *scaled, UINT x,
+                    UINT y, float scale) {
+        UINT c[8] = {w, h, x, y};
+        memcpy(&c[4], &scale, sizeof(scale));
+        TestPass(cl, p, p.test_root.Get(), p.color_scale.Get(), 10, scaled, ColorTarget, c, 8);
     }
-    bool PrepareScaledColor(Pipelines &p, Budget &b) {
-        if (scaled_color)
-            return true;
-        const auto d = TextureDesc(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        if (!TestRoom(p, b, d))
-            return false;
-        scaled_color = Allocate(p, b, d);
-        UAV(p, scaled_color.Get(), 14);
-        return true;
-    }
-    // Between GateBegin and GateEnd: the color input (sr[0], slot 10) is a shader
-    // resource. Leaves the copy readable by RR; ScaledColorFinish returns it to COMMON.
-    void ScaleColor(ID3D12GraphicsCommandList *cl, Pipelines &p, float scale) {
-        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_COMMON,
-               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
-        cl->SetDescriptorHeaps(1, heaps);
-        cl->SetComputeRootSignature(p.sky_edge_root.Get());
-        cl->SetPipelineState(p.color_scale.Get());
-        cl->SetComputeRootDescriptorTable(0, Gpu(p, 10));
-        cl->SetComputeRootDescriptorTable(1, Gpu(p, 14));
-        UINT c[] = {w, h, 0, 0};
-        memcpy(&c[2], &scale, sizeof(scale));
-        cl->SetComputeRoot32BitConstants(2, 4, c, 0);
-        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        Order(cl);
-        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    }
-    void ScaledColorFinish(ID3D12GraphicsCommandList *cl) {
-        Change(cl, scaled_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-               D3D12_RESOURCE_STATE_COMMON);
+    // RR's depth (the private copy, or the game's R32_FLOAT depth) with sky (0)
+    // lifted to floor (R32_FLOAT, w x h), read from the depth subrect at (x, y).
+    void FloorDepth(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *floored, UINT x,
+                    UINT y, float floor) {
+        SRV(p, use_depth ? depth.Get() : sr[1].Get(), DepthSource);
+        UINT c[8] = {w, h, x, y};
+        memcpy(&c[4], &floor, sizeof(floor));
+        TestPass(cl, p, p.test_root.Get(), p.depth_floor.Get(), DepthSource, floored, DepthTarget,
+                 c, 8);
     }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {
@@ -804,8 +759,7 @@ inline bool SlotReservationParts(ID3D12Device *device, const rrlive::GpuFrame &f
     if (texture.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || texture.Width != depth_width ||
         texture.Height != depth_height || texture.DepthOrArraySize != 1 || texture.MipLevels != 1 ||
         texture.SampleDesc.Count != 1 || texture.SampleDesc.Quality ||
-        texture.Format != DXGI_FORMAT_R32_FLOAT ||
-        texture.Flags != D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        texture.Format != DXGI_FORMAT_R32_FLOAT || texture.Flags != D3D12_RESOURCE_FLAG_NONE)
         return false;
     if (buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !buffer.Width ||
         buffer.Height != 1 || buffer.DepthOrArraySize != 1 || buffer.MipLevels != 1 ||

@@ -42,8 +42,9 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
             UINT64 bytes{};
             pipelines.device->GetCopyableFootprints(native_depth, 0, 1, 0, nullptr, nullptr,
                                                     nullptr, &bytes);
-            const auto depth_desc =
+            auto depth_desc =
                 TextureDesc(UINT(native_depth->Width), native_depth->Height, DXGI_FORMAT_R32_FLOAT);
+            depth_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
             const auto texture = allocation(depth_desc);
             const auto buffer = bytes ? allocation(rrprivate::Buffer(bytes)) : 0;
             if (!texture || !buffer || texture == UINT64_MAX || buffer == UINT64_MAX ||

@@ -15,4 +15,6 @@ inline constexpr float Factor(unsigned mode) {
     return factors[Valid(mode)];
 }
 inline std::atomic<unsigned> mode{};
+// Bumped by the panel on every change (retries a test blocked for GPU memory).
+inline std::atomic<unsigned> changes{};
 } // namespace rrcolorscale

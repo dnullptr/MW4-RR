@@ -77,6 +77,9 @@ void main(uint3 id : SV_DispatchThreadID)
         float3 skyRay=Scene[148].xyz*skyClip.x+Scene[149].xyz*skyClip.y+Scene[150].xyz;
         float skyLength2=dot(skyRay,skyRay);
         if(RRFinite(skyLength2) && skyLength2>=1e-20)NormalRoughness[p]=float4(-skyRay*rsqrt(skyLength2),1);
+#elif RR_GUIDE_TEST==9
+        // NVIDIA's sample leaves sky roughness 0; ours is 1.
+        NormalRoughness[p]=0;
 #endif
         return;
     }
