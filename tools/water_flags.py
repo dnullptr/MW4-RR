@@ -3,8 +3,8 @@
 The Status guide is 3 on the game's special surfaces (PackedSurface w&2), which carry either the
 prepass water flag (w&4: lakes, distant water) or the class override (w&8: the river in Andi's
 captures). With a water test on, the disocclusion or animated texture mask is the add-on's water
-classification. Builds before 2026-10-25 took only w&4 as water, so there red (special, not water)
-is override pixels. Later builds take every special pixel, so red only shows on a frame the add-on
+classification. Builds before commit 55f22fd took only w&4 as water, so there red (special, not water)
+is override pixels. 55f22fd and later take every special pixel, so red only shows on a frame the add-on
 rejected whole; a special pixel rejected on its own is status 4, magenta like every invalid pixel.
 Without a water mask every special pixel is red. Untinted pixels are ordinary surfaces.
 

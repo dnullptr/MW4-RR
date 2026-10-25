@@ -60,7 +60,7 @@ void RRWriteEmpty(uint2 p,uint status,float roughness)
 }
 
 // Water is every special surface (w&2): cs_prepass sets it for its water flag
-// (w&4, the tile water's lighting marker) and for the class override (w&8),
+// (w&4, which it derives from the tile water's NormalGloss bit 31 marker) and for the class override (w&8),
 // which never come together. Andi's river captures (2026-10-25) carry the
 // override, mirror material and all, while only distant water has the flag,
 // and no other surface in those scenes is special.
