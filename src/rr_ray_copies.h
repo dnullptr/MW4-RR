@@ -7,8 +7,16 @@
 #include <cstddef>
 #include <cstdint>
 namespace rrraycopy {
-// B1/B3: offset is relative to the CBV start; Stats: relative to the t0 view start.
-enum class Source : unsigned { B1, B3, Stats, Values, Cb };
+// B1/B3: offset is relative to the CBV start; Stats: relative to the t0 view start. The first
+// NativeSources are the game's buffers (GpuFrame keeps one retained slot per site for each).
+enum class Source : unsigned { B1, B3, Stats, Values, Cb, Count };
+inline constexpr unsigned NativeSources = 3;
+static_assert(unsigned(Source::B1) == 0 && unsigned(Source::B3) == 1 &&
+                  unsigned(Source::Stats) == 2 && unsigned(Source::Values) == NativeSources,
+              "native sources first, in this order");
+constexpr bool Native(Source s) noexcept {
+    return unsigned(s) < NativeSources;
+}
 enum class Target : unsigned { Cb, Log };
 // Copy `bytes` from `source` + `from` to `target` + `at`.
 struct Copy {
@@ -35,9 +43,34 @@ inline constexpr std::uint32_t GameBytes = 608, GovernorBytes = 16, CbBytes = 65
 // The recording's serial, copied from ray_values by each half that copies anything: ray_log bytes
 // 96..99 for the resolve's copies and 108..111 for the apply's. A readback whose half serial is not
 // the recording's means that half was predicated away or skipped, so its bits are dropped per half.
+// Serials are nonzero: ray_log and ray_values start zeroed, so 0 would match a half that never ran
+// (GpuFrame records no logging copy until a nonzero serial is written in the recording).
 // Controller-only: the gate never reads either word.
 inline constexpr Copy ResolveSerial{Target::Log, 96, Source::Values, ValuesSerial, 4},
     ApplySerial{Target::Log, 108, Source::Values, ValuesSerial, 4};
+// The ray_values words a plan owns (the serial word is written on its own): register 2 .x/.y as
+// the patch writes it, and the governor's constants it reads after the game's bytes of its b1.
+inline constexpr unsigned ValuesWords = (ValuesGovernor + GovernorBytes) / 4;
+inline constexpr std::uint32_t TargetBytes = 8;
+static_assert(sizeof(rrraybudget::Plan{}.bits) == TargetBytes &&
+                  ValuesTargets + TargetBytes <= ValuesSerial && ValuesSerial + 4 <= ValuesGovernor,
+              "the plan's words and the serial do not overlap");
+struct Range {
+    std::uint32_t at, bytes;
+};
+inline constexpr std::array<Range, 2> PlanRanges{
+    {{ValuesTargets, TargetBytes}, {ValuesGovernor, GovernorBytes}}};
+constexpr std::array<std::uint32_t, ValuesWords>
+ValuesImage(const rrraybudget::Plan &plan) noexcept {
+    std::array<std::uint32_t, ValuesWords> v{};
+    v[ValuesTargets / 4] = plan.bits[0];
+    v[ValuesTargets / 4 + 1] = plan.bits[1];
+    v[ValuesGovernor / 4] = plan.mask;
+    v[ValuesGovernor / 4 + 1] = plan.headroom[0];
+    v[ValuesGovernor / 4 + 2] = plan.headroom[1];
+    v[ValuesGovernor / 4 + 3] = 0;
+    return v;
+}
 // The copies behind each Log bit. A bit is copied only when its source holds every byte its copies
 // read: the stats pair needs both lobes' x (the governor's input, t0 at lobe << 16).
 struct Item {
@@ -59,31 +92,35 @@ inline constexpr std::array<Item, 4> ApplyItems{{
 constexpr bool Fits(const Copy &c, std::uint64_t avail) noexcept {
     return avail >= c.from && avail - c.from >= c.bytes;
 }
-constexpr void Add(List &l, const Copy &c) noexcept {
-    if (l.count < l.copies.size())
-        l.copies[l.count++] = c;
+// False, leaving `l` as it was, when it is full: the caller then returns an empty list, so a plan
+// that outgrew List records nothing rather than a list whose bits claim a dropped copy.
+constexpr bool Add(List &l, const Copy &c) noexcept {
+    if (l.count >= l.copies.size())
+        return false;
+    l.copies[l.count++] = c;
+    return true;
 }
 // The serial first, then the copies of every bit whose source holds all of them; empty when none.
-// `avail` is indexed by Source (B1, B3, Stats).
+// `avail` is indexed by Source (the native ones).
 template <std::size_t N>
 constexpr List Pick(const Copy &serial, const std::array<Item, N> &items,
-                    const std::array<std::uint64_t, 3> &avail) noexcept {
+                    const std::array<std::uint64_t, NativeSources> &avail) noexcept {
     static_assert(N + 1 <= List{}.copies.size(), "a list holds the serial and every item");
     unsigned wanted{}, short_bits{};
     for (const auto &i : items) {
-        const auto s = unsigned(i.copy.source);
         wanted |= i.bit;
-        if (s >= avail.size() || !Fits(i.copy, avail[s]))
+        if (!Native(i.copy.source) || !Fits(i.copy, avail[unsigned(i.copy.source)]))
             short_bits |= i.bit;
     }
     List l;
     l.bits = wanted & ~short_bits;
     if (!l.bits)
         return l;
-    Add(l, serial);
+    if (!Add(l, serial))
+        return {};
     for (const auto &i : items)
-        if (l.bits & i.bit)
-            Add(l, i.copy);
+        if ((l.bits & i.bit) && !Add(l, i.copy))
+            return {};
     return l;
 }
 // At the native resolve: b1/b3 only from an upload heap; stats_avail 0 = t0 not available.
@@ -97,23 +134,41 @@ constexpr List ApplyLog(std::uint64_t b1_avail, bool b1_upload, std::uint64_t b3
                         bool b3_upload) noexcept {
     return Pick(ApplySerial, ApplyItems, {b1_upload ? b1_avail : 0, b3_upload ? b3_avail : 0, 0});
 }
+// Register 2 word of `lobe` in ray_cb: from ray_values when the lobe is raised, else the game's.
+constexpr Copy TargetWord(unsigned mask, std::uint32_t lobe) noexcept {
+    return (mask >> lobe & 1)
+               ? Copy{Target::Cb, 32 + 4 * lobe, Source::Values, ValuesTargets + 4 * lobe, 4}
+               : Copy{Target::Cb, 32 + 4 * lobe, Source::B1, 32 + 4 * lobe, 4};
+}
 // ray_cb contents before the barrier, for raised lobes `mask` (1..3, otherwise an empty list): the
 // game's b1 bytes in place, a raised lobe's register 2 word from ray_values, then the governor's
 // constants after the game's bytes. Nothing reads b1 at or past GameBytes. LogExecuted is set by
 // the caller after recording Executed, not here.
 constexpr List PatchFill(unsigned mask) noexcept {
-    List l;
     if (mask < 1 || mask > 3)
-        return l;
-    Add(l, {Target::Cb, 0, Source::B1, 0, 32});
-    for (std::uint32_t lobe = 0; lobe < 2; ++lobe)
-        Add(l, (mask >> lobe & 1)
-                   ? Copy{Target::Cb, 32 + 4 * lobe, Source::Values, ValuesTargets + 4 * lobe, 4}
-                   : Copy{Target::Cb, 32 + 4 * lobe, Source::B1, 32 + 4 * lobe, 4});
-    Add(l, {Target::Cb, 40, Source::B1, 40, GameBytes - 40});
-    Add(l, {Target::Cb, GameBytes, Source::Values, ValuesGovernor, GovernorBytes});
+        return {};
+    const std::array<Copy, 5> fill{{
+        {Target::Cb, 0, Source::B1, 0, 32},
+        TargetWord(mask, 0),
+        TargetWord(mask, 1),
+        {Target::Cb, 40, Source::B1, 40, GameBytes - 40},
+        {Target::Cb, GameBytes, Source::Values, ValuesGovernor, GovernorBytes},
+    }};
+    List l;
+    for (const auto &c : fill)
+        if (!Add(l, c))
+            return {};
     return l;
 }
 // After the barrier: register 2 as the patched resolve executes it, from ray_cb into the log.
 inline constexpr Copy Executed{Target::Log, 16, Source::Cb, 32, 16};
+// The pool ceiling to reserve before allocating `needed` new ray bytes: on top of the current
+// limit, never out of the headroom below it that an earlier pool projection kept for mandatory
+// allocations. Every later projection counts ray bytes once in its persistent term
+// (Controller::PersistentBytes) and leaves each slot's base unchanged, so it grows by exactly the
+// ray bytes allocated: one that fit under `limit` fits under the result. 0 when nothing is needed
+// or the sum overflows (no reservation).
+constexpr std::uint64_t RayCeiling(std::uint64_t limit, std::uint64_t needed) noexcept {
+    return needed && needed <= UINT64_MAX - limit ? limit + needed : 0;
+}
 } // namespace rrraycopy

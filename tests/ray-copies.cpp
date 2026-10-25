@@ -57,12 +57,14 @@ constexpr const Copy *Writer(const List &l, std::uint32_t at) {
 }
 // Bytes [0, 624) are written exactly once; b1 bytes keep their place and none at or past the game's
 // 608 is read; lobe l's target word comes from ray_values iff l is raised, and the governor's
-// constants follow the game's bytes.
+// constants follow the game's bytes. ray_values supplies nothing else: exactly the raised lobes'
+// words and the governor block.
 constexpr bool PatchFillCovers(unsigned mask) {
     const auto l = PatchFill(mask);
     if (!l.count || l.bits || !Reads(l, {GameBytes, 0, 0}))
         return false;
     std::array<unsigned char, GameBytes + GovernorBytes> writes{};
+    std::uint32_t values{};
     for (unsigned i = 0; i < l.count; ++i) {
         const auto &c = l.copies[i];
         if (c.target != Target::Cb || c.at > writes.size() || c.bytes > writes.size() - c.at ||
@@ -71,7 +73,11 @@ constexpr bool PatchFillCovers(unsigned mask) {
             return false;
         for (std::uint32_t b = 0; b < c.bytes; ++b)
             ++writes[c.at + b];
+        if (c.source == Source::Values)
+            values += c.bytes;
     }
+    if (values != 4 * ((mask & 1) + (mask >> 1 & 1)) + GovernorBytes)
+        return false;
     for (const auto w : writes)
         if (w != 1)
             return false;
@@ -92,6 +98,126 @@ static_assert(!PatchFill(0).count && !PatchFill(4).count && !PatchFill(~0u).coun
               !PatchFill(0).bits && !PatchFill(4).bits);
 // The executed copy reads ray_cb's register 2 after the patch (the fill writes it) into the log.
 static_assert(Same(Executed, {Target::Log, 16, Source::Cb, 32, 16}));
+// A full list takes no ninth copy and says so (Pick and PatchFill then return an empty list).
+constexpr bool AddRefusesWhenFull() {
+    List l;
+    for (std::uint32_t i = 0; i < l.copies.size(); ++i)
+        if (!Add(l, {Target::Log, 4 * i, Source::Values, 0, 4}))
+            return false;
+    const auto full = l;
+    return !Add(l, Executed) && l.count == full.count && Same(l.copies.back(), full.copies.back());
+}
+static_assert(AddRefusesWhenFull());
+// The game's buffers come first: GpuFrame retains one slot per native source and site.
+static_assert(Native(Source::B1) && Native(Source::B3) && Native(Source::Stats) &&
+              !Native(Source::Values) && !Native(Source::Cb) && unsigned(Source::Count) == 5);
+
+// ---- byte images: what the patched resolve and the governor read from ray_cb ----
+template <std::size_t N>
+constexpr std::uint32_t WordAt(const std::array<unsigned char, N> &m, std::size_t at) {
+    return std::uint32_t(m[at]) | std::uint32_t(m[at + 1]) << 8 | std::uint32_t(m[at + 2]) << 16 |
+           std::uint32_t(m[at + 3]) << 24;
+}
+template <std::size_t N>
+constexpr void PutWord(std::array<unsigned char, N> &m, std::size_t at, std::uint32_t v) {
+    for (unsigned b = 0; b < 4; ++b)
+        m[at + b] = static_cast<unsigned char>(v >> (8 * b));
+}
+// The game's b1 from the CBV start (as far as PatchFill reads), ray_values, ray_cb, ray_log.
+struct Images {
+    std::array<unsigned char, GameBytes> b1{};
+    std::array<unsigned char, ValuesBytes> values{};
+    std::array<unsigned char, GameBytes + GovernorBytes> cb{};
+    std::array<unsigned char, LogBytes> log{};
+};
+// Executes copies from b1 / ray_values / ray_cb into ray_cb / ray_log (every copy is in bounds:
+// PatchFillCovers and Reads check that).
+constexpr void Run(const List &l, Images &m) {
+    for (unsigned i = 0; i < l.count; ++i) {
+        const auto &c = l.copies[i];
+        for (std::uint32_t b = 0; b < c.bytes; ++b) {
+            const auto from = c.from + b;
+            const unsigned char v = c.source == Source::B1       ? m.b1[from]
+                                    : c.source == Source::Values ? m.values[from]
+                                                                 : m.cb[from];
+            (c.target == Target::Cb ? m.cb[c.at + b] : m.log[c.at + b]) = v;
+        }
+    }
+}
+// The governor's cbuffer (shaders/rr_vrrt_governor.hlsl): uint4 Game[38], then Mask, Headroom0,
+// Headroom1, Pad.
+constexpr std::uint32_t GovernorMask = 38 * 16, GovernorHeadroom0 = GovernorMask + 4,
+                        GovernorHeadroom1 = GovernorMask + 8, GovernorPad = GovernorMask + 12;
+// ray_values as WriteRayPlan and WriteRaySerial leave it, then the patch: ray_cb has the game's
+// bytes except the raised lobes' register 2 words, which are the plan's bits, and the governor
+// reads the plan's mask and headrooms; the executed copy logs the register 2 the resolve runs with.
+constexpr bool PatchImage(unsigned mask) {
+    rb::Plan plan;
+    plan.mask = mask;
+    plan.bits = {0x3f000000u, 0x3e99999au};
+    plan.headroom = {0x00012345u, 0x00054321u};
+    Images m;
+    for (std::size_t i = 0; i < m.b1.size(); ++i)
+        m.b1[i] = static_cast<unsigned char>(i * 7 + 3);
+    for (auto &v : m.values)
+        v = 0xEE; // whatever an earlier recording left
+    const auto image = ValuesImage(plan);
+    for (const auto &r : PlanRanges) {
+        if (r.at < ValuesSerial + 4 && ValuesSerial < r.at + r.bytes)
+            return false; // the plan never overwrites the serial
+        for (std::uint32_t w = r.at / 4; w < (r.at + r.bytes) / 4; ++w)
+            PutWord(m.values, 4 * w, image[w]);
+    }
+    PutWord(m.values, ValuesSerial, 77);
+    Run(PatchFill(mask), m);
+    List executed;
+    Add(executed, Executed);
+    Run(executed, m);
+    for (std::uint32_t at = 0; at < GameBytes; ++at)
+        if ((at < 32 || at >= 40) && m.cb[at] != m.b1[at])
+            return false;
+    for (unsigned lobe = 0; lobe < 2; ++lobe) {
+        const auto word = WordAt(m.cb, 32 + 4 * lobe);
+        if (word != ((mask >> lobe & 1) ? plan.bits[lobe] : WordAt(m.b1, 32 + 4 * lobe)) ||
+            WordAt(m.log, Executed.at + 4 * lobe) != word)
+            return false;
+    }
+    return WordAt(m.cb, GovernorMask) == mask && WordAt(m.cb, GovernorHeadroom0) == 0x00012345u &&
+           WordAt(m.cb, GovernorHeadroom1) == 0x00054321u && WordAt(m.cb, GovernorPad) == 0 &&
+           WordAt(m.log, Executed.at + 8) == WordAt(m.b1, 40) &&
+           WordAt(m.log, Executed.at + 12) == WordAt(m.b1, 44);
+}
+static_assert(PatchImage(1) && PatchImage(2) && PatchImage(3));
+
+// ---- the pool ceiling for new ray bytes ----
+static_assert(RayCeiling(1u << 30, 3 * 256) == (1u << 30) + 3 * 256 &&
+              RayCeiling(1u << 30, 0) == 0 && RayCeiling(UINT64_MAX - 6, 6) == UINT64_MAX &&
+              RayCeiling(UINT64_MAX - 5, 6) == 0 && RayCeiling(UINT64_MAX, 2) == 0 &&
+              RayCeiling(0, 1) == 1);
+// A model of Budget::Reserve (without its DXGI check) and of the next mandatory projection: the
+// ray bytes enter each projection once (PersistentBytes) and leave every slot's base unchanged.
+// With the limit exactly at the last projection and headroom kept for allocations still to come,
+// the projection after a ray allocation fits under the raised ceiling without growing it.
+constexpr bool CeilingKeepsHeadroom(std::uint64_t projection, std::uint64_t allocated,
+                                    std::uint64_t ray) {
+    std::uint64_t limit = projection, bytes = allocated;
+    const auto reserve = [&](std::uint64_t required) {
+        if (required > limit)
+            limit = required; // the real Reserve asks DXGI for required - bytes here
+    };
+    const auto ceiling = RayCeiling(limit, ray);
+    if (!ceiling)
+        return false;
+    reserve(ceiling);
+    bytes += ray;
+    const auto before = limit, next = projection + ray;
+    reserve(next);
+    return limit == before && next <= limit && bytes <= limit &&
+           limit - bytes == projection - allocated; // the mandatory headroom is untouched
+}
+static_assert(CeilingKeepsHeadroom(1212416000, 1202000000, 131072) &&
+              CeilingKeepsHeadroom(1073741824, 600000000, 196608) &&
+              CeilingKeepsHeadroom(1073741824, 1073741824, 65536));
 
 // ---- ray_log: what the gate reads (the table next to the Log bits in rr_ray_budget.h) ----
 struct Words {
@@ -256,6 +382,10 @@ int main() {
     for (const unsigned mask : {0u, 4u, ~0u})
         assert(!PatchFill(mask).count && !PatchFill(mask).bits);
     assert(Same(Executed, {Target::Log, 16, Source::Cb, 32, 16}));
+    assert(AddRefusesWhenFull());
+    for (unsigned mask = 1; mask < 4; ++mask)
+        assert(PatchImage(mask));
+    assert(CeilingKeepsHeadroom(1212416000, 1202000000, 131072));
     assert(LogLayout());
     assert(Thresholds());
     assert(Uploads());

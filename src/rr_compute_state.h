@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace rrcompute {
 using Microsoft::WRL::ComPtr;
@@ -728,6 +729,28 @@ class Tracker {
         }
         return matches == 1;
     }
+    // RateCBVs' and RootCBV's shared preamble, under both locks: `cl`'s tracked state and the
+    // layout of `root` when the tracker is healthy, the list's core targets are unchanged (a change
+    // marks coverage lost, which stays) and the tracked root and pipeline are known and are `root`
+    // and `pipeline`; both null otherwise.
+    std::pair<const State *, const Layout *> CurrentCompute(ID3D12GraphicsCommandList *cl,
+                                                            ID3D12PipelineState *pipeline,
+                                                            ID3D12RootSignature *root) {
+        if (!healthy)
+            return {};
+        auto at = states.find(cl);
+        if (at == states.end())
+            return {};
+        auto &s = at->second;
+        if (!CoreTargetsEqual(Targets(cl), s.targets))
+            s.coverage_lost = true;
+        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
+            return {};
+        auto layout = layouts.find(root);
+        if (layout == layouts.end())
+            return {};
+        return {&s, &layout->second};
+    }
 
   public:
     // Optional content observer registration must precede first Attach. Changing it
@@ -1099,22 +1122,11 @@ class Tracker {
         std::lock_guard install_lock(install_mutex);
         std::lock_guard lock(mutex);
         CBVPair result;
-        if (!healthy)
-            return result;
-        auto at = states.find(cl);
-        if (at == states.end())
-            return result;
-        auto &s = at->second;
-        if (!CoreTargetsEqual(Targets(cl), s.targets))
-            s.coverage_lost = true;
-        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
-            return result;
-        auto layout = layouts.find(root);
-        if (layout == layouts.end())
+        const auto [s, layout] = CurrentCompute(cl, pipeline, root);
+        if (!s || !layout)
             return result;
         for (unsigned k = 0; k < 2; ++k)
-            if (!OneRootCBV(layout->second, s, k ? 3u : 1u, result.parameters[k],
-                            result.addresses[k]))
+            if (!OneRootCBV(*layout, *s, k ? 3u : 1u, result.parameters[k], result.addresses[k]))
                 return result;
         result.valid = true;
         return result;
@@ -1124,24 +1136,11 @@ class Tracker {
                          ID3D12RootSignature *root, UINT reg) {
         std::lock_guard install_lock(install_mutex);
         std::lock_guard lock(mutex);
-        RootCBVProof result;
-        if (!healthy)
-            return result;
-        auto at = states.find(cl);
-        if (at == states.end())
-            return result;
-        auto &s = at->second;
-        if (!CoreTargetsEqual(Targets(cl), s.targets))
-            s.coverage_lost = true;
-        if (s.coverage_lost || s.root_unknown || s.root != root || s.pipeline != pipeline)
-            return result;
-        auto layout = layouts.find(root);
-        if (layout == layouts.end())
-            return result;
+        const auto [s, layout] = CurrentCompute(cl, pipeline, root);
         UINT parameter{};
         UINT64 address{};
-        if (!OneRootCBV(layout->second, s, reg, parameter, address))
-            return result;
+        if (!s || !layout || !OneRootCBV(*layout, *s, reg, parameter, address))
+            return {};
         return {parameter, address, true};
     }
     Snapshot Capture(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *expected = nullptr) {
