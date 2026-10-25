@@ -27,9 +27,11 @@ inline float Clamp(float strength) {
         return 0;
     return strength < 0 ? 0.0f : strength > 1 ? 1.0f : strength;
 }
-// Session-only panel state: a test mode never sticks across restarts.
+// Session-only panel state: a test mode never sticks across restarts. The
+// responsivity mask is a feature, on by default whenever RR runs preset F; the
+// other water tests start off.
 struct Settings {
-    bool responsivity{}, discard{}, animated{};
+    bool responsivity = true, discard{}, animated{};
     float strength = DefaultStrength;
     // How much RR history the discard drops: 1 sends the full 10000, lower values
     // a smaller disocclusion value (DiscardValue), so RR keeps part of it.
@@ -41,8 +43,11 @@ inline constexpr bool Masks(const Settings &s) {
     return s.responsivity || s.discard || s.animated;
 }
 // The classification is also kept for guide modes, so water coverage is logged.
-inline constexpr bool Wanted(const Settings &s) {
-    return Masks(s) || ValidGuide(s.guide) != Mirror;
+// The responsivity mask alone wants it only on preset F (preset_f), the one
+// preset that reads the mask.
+inline constexpr bool Wanted(const Settings &s, bool preset_f) {
+    return (s.responsivity && preset_f) || s.discard || s.animated ||
+           ValidGuide(s.guide) != Mirror;
 }
 // Like the SSS mask, the responsivity mask is supported on preset F (6) only.
 inline bool UseResponsivity(const Settings &s, bool water_used, bool preset_known,

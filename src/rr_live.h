@@ -1072,14 +1072,20 @@ class Controller {
         water.strength = rrwater::Clamp(value.strength);
         water.discard_strength = rrwater::Clamp(value.discard_strength);
         water.guide = rrwater::ValidGuide(value.guide);
-        if (!rrwater::Wanted(water))
+        if (!WaterWanted())
             water_retry_after = 0;
+    }
+    // The water classification is wanted this frame: the preset RR runs, or the one it
+    // is being recreated with.
+    bool WaterWanted() const {
+        return rrwater::Wanted(water,
+                               (preset.has_effective ? preset.effective : preset.desired) == 6);
     }
     // What the latest evaluation sent, limited to what would still be sent now.
     rrwater::Status WaterStatus() {
         std::lock_guard lock(mutex);
         auto v = water_status;
-        v.wanted = rrwater::Wanted(water);
+        v.wanted = WaterWanted();
         v.unavailable = water_failed;
         const bool live = v.wanted && enabled && !failed && !retired && !water_failed;
         v.waiting_memory = live && water_retry_after != 0;
@@ -1757,7 +1763,7 @@ class Controller {
             s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
             // A null classification view unless a water test wants it this frame.
             // The guide mode follows it, so every water test waits and fails together.
-            s.gpu.WaterTarget(pipelines, rrwater::Wanted(water) && !water_failed &&
+            s.gpu.WaterTarget(pipelines, WaterWanted() && !water_failed &&
                                              PrepareWater(s.gpu, GetTickCount64()));
             s.pre = cl;
             if (ray_early == cl) { // a resolve ran on this list before its guide prepass
@@ -2212,7 +2218,7 @@ class Controller {
             hit_scratch.active = s->hit_used && s->hit_conditioned;
             s->hit_test_on = rrhitcond::Mode(s->gpu.guide_test) && !hit_condition_failed;
             // Water tests read the classification this slot's prepass wrote.
-            s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
+            s->water_used = WaterWanted() && !water_failed && s->gpu.water_written &&
                             !o.color_x && !o.color_y;
 
             auto projection = s->projection;

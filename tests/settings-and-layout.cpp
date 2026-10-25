@@ -40,8 +40,12 @@ static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
 static_assert(!defaults.responsivity &&
               defaults.responsivity_strength == rrresponsivity::DefaultStrength);
-// Water tests start off; unknown guide modes read as the game mirror.
-static_assert(!rrwater::Wanted(rrwater::Settings{}));
+// Only the responsivity mask starts on, and only preset F wants it; unknown guide
+// modes read as the game mirror.
+static_assert(rrwater::Settings{}.responsivity && !rrwater::Settings{}.discard &&
+              !rrwater::Settings{}.animated && rrwater::Settings{}.guide == rrwater::Mirror);
+static_assert(rrwater::Wanted(rrwater::Settings{}, true) &&
+              !rrwater::Wanted(rrwater::Settings{}, false));
 static_assert(rrwater::ValidGuide(rrwater::Physical) == rrwater::Physical);
 static_assert(rrwater::ValidGuide(rrwater::GuideCount) == rrwater::Mirror);
 static_assert(std::string_view(rrwater::guide_labels[rrwater::Mirror]) == "Game mirror (today)");
@@ -858,10 +862,14 @@ int main() {
     assert(rrwater::Clamp(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
     // A guide mode alone still classifies water, so coverage is logged.
     water = {};
+    water.responsivity = false;
     water.guide = rrwater::Material;
-    assert(rrwater::Wanted(water) && !rrwater::Masks(water));
+    assert(rrwater::Wanted(water, false) && !rrwater::Masks(water));
     water.guide = 99;
-    assert(!rrwater::Wanted(water));
+    assert(!rrwater::Wanted(water, true));
+    water.discard = true; // the other masks want it on any preset
+    assert(rrwater::Wanted(water, false));
+    water.discard = false;
 
     // Water coverage reports once per interval, only with frames, then starts over.
     rrwater::Tracker coverage;

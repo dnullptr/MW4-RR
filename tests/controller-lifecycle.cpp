@@ -1986,6 +1986,12 @@ struct ControllerCpuTest {
         assert(startup.RequestPreset(0) && startup.Reconfigure());
         // Running water tests: settings are clamped, and the panel only reports
         // a mask the latest evaluation sent that would still be sent now.
+        {
+            // The default responsivity mask classifies water on preset F only.
+            Controller f;
+            assert(f.WaterWanted() && f.WaterStatus().wanted);
+            assert(f.RequestPreset(5) && !f.WaterWanted() && !f.WaterStatus().wanted);
+        }
         Controller water;
         rrwater::Settings wet;
         wet.responsivity = true;
@@ -2026,7 +2032,11 @@ struct ControllerCpuTest {
         water.SetEnabled(false);
         assert(!water.WaterStatus().waiting_memory); // nothing retries while RR is off
         water.SetEnabled(true);
-        water.SetWater({});
+        rrwater::Settings dry_settings;
+        water.SetWater(dry_settings); // the default responsivity mask still wants water on F
+        assert(water.water_retry_after == 3000);
+        dry_settings.responsivity = false;
+        water.SetWater(dry_settings);
         assert(water.water_retry_after == 0);
         water.SetWater(wet);
         water.water_failed = true;

@@ -373,7 +373,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextUnformatted("Running water experiments (this session only)");
     // Session-only: not saved, so a test mode never sticks across restarts.
     static rrwater::Settings water;
-    bool water_changed = ImGui::Checkbox("Water: responsivity mask", &water.responsivity);
+    bool water_changed =
+        ImGui::Checkbox("Water: responsivity mask (on by default, preset F)", &water.responsivity);
     water_changed |=
         ImGui::SliderFloat("Water mask strength", &water.strength, 0.0f, 1.0f, "%.2f");
     water_changed |= ImGui::Checkbox("Water: discard RR history", &water.discard);
@@ -427,8 +428,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     }
     ImGui::TextWrapped(
         "Water pixels are the game's special surfaces: mirror-like water that its prepass marks "
-        "with its water flag (lakes, distant water) or its override (rivers). Responsivity tells "
-        "RR to lean on the current frame there (preset F only); with the SSS responsivity mask "
+        "with its water flag (lakes, distant water) or its override (rivers). Responsivity, on by "
+        "default, tells RR to lean on the current frame there (preset F only; other presets "
+        "skip it); with the SSS responsivity mask "
         "also on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, "
         "as RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
         "noisier water. Discard strength keeps part of the history instead: 1 drops it all, "
