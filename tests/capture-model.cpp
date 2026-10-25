@@ -804,6 +804,7 @@ static void ManifestShape() {
     h.responsivity_strength = -0.5f;
     h.water_discard = true;
     h.water_strength = 0.75f;
+    h.water_discard_strength = 0.5f;
     h.water_guide = 2;
     h.sky_edge_enabled = true;
     h.sky_edge_strength = -0.25f;
@@ -861,6 +862,7 @@ static void ManifestShape() {
                               "\"responsivity_strength\": -0.5", "\"guide_test\": 0",
                               "\"sky_depth_test\": false",       "\"water_responsivity\": false",
                               "\"water_strength\": 0.75",        "\"water_discard\": true",
+                              "\"water_discard_strength\": 0.5",
                               "\"water_animated\": false",       "\"water_guide\": 2",
                               "\"weapon_depth\": false",       "\"sky_edge_enabled\": true",
                               "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3",

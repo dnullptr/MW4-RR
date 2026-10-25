@@ -33,7 +33,10 @@ void Count(bool value,uint offset){
  if(inside){
   float responsive=(WaterFlags&FlagResponsivity)!=0&&water?clamp(WaterResponsivity,0.0f,1.0f):0;
   ResponsivityOut[id.xy]=sss!=0?clamp(sss,-1.0f,1.0f):responsive;
-  Disocclusion[id.xy]=(WaterFlags&FlagDiscard)!=0&&water?10000.0f:0;
+  // Discard strength (rrwater::DiscardLevel, flag bits 8-15): 10000^(level/255).
+  uint level=(WaterFlags>>8)&255u;
+  float drop=level!=0?pow(10000.0f,level/255.0f):0;
+  Disocclusion[id.xy]=(WaterFlags&FlagDiscard)!=0&&water?drop:0;
   Water[id.xy]=water?1.0f:0.0f;
  }
  Count(water,16);

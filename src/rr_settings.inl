@@ -368,6 +368,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     water_changed |=
         ImGui::SliderFloat("Water mask strength", &water.strength, 0.0f, 1.0f, "%.2f");
     water_changed |= ImGui::Checkbox("Water: discard RR history", &water.discard);
+    water_changed |= ImGui::SliderFloat("Water discard strength", &water.discard_strength, 0.0f,
+                                        1.0f, "%.2f");
     water_changed |= ImGui::Checkbox("Water: animated texture mask", &water.animated);
     int water_guide = static_cast<int>(rrwater::ValidGuide(water.guide));
     if (ImGui::Combo("Water guides", &water_guide, rrwater::guide_labels, rrwater::GuideCount)) {
@@ -406,7 +408,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                         : rrwater::Clamp(water.strength) == 0   ? "off (strength 0)"
                                                                 : "waiting (needs preset F)");
         if (water.discard)
-            ImGui::Text("Water history discard: %s", water_status.discard ? "active" : "waiting");
+            ImGui::Text("Water history discard: %s",
+                        water_status.discard                                 ? "active"
+                        : rrwater::DiscardLevel(water.discard_strength) == 0 ? "off (strength 0)"
+                                                                             : "waiting");
         if (water.animated)
             ImGui::Text("Water animated texture mask: %s",
                         water_status.animated ? "active" : "waiting");
@@ -417,7 +422,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "RR to lean on the current frame there (preset F only); with the SSS responsivity mask "
         "also on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, "
         "as RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
-        "noisier water. The animated texture mask is an RR input NVIDIA does not document; it "
+        "noisier water. Discard strength keeps part of the history instead: 1 drops it all, "
+        "0.5 sends RR 100 instead of 10000 (it reads the mask in log scale), so try 0.5 to 0.8 "
+        "for less blur with calmer reflections. The animated texture mask is an RR input NVIDIA "
+        "does not document; it "
         "is here to see whether it changes anything. Water guides changes the normal and albedo "
         "guides on water only: the game mirror is what RR gets today, smoothed normal averages "
         "the wave normal over 7x7 pixels, water material uses the game's own reflectance and "

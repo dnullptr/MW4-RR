@@ -901,6 +901,7 @@ class Controller {
             h.water_responsivity = water.responsivity;
             h.water_strength = water.strength;
             h.water_discard = water.discard;
+            h.water_discard_strength = water.discard_strength;
             h.water_animated = water.animated;
             h.water_guide = water.guide;
             // One RR history, so one feature and one depth type for the whole run, and Settle
@@ -1029,6 +1030,7 @@ class Controller {
         std::lock_guard lock(mutex);
         water = value;
         water.strength = rrwater::Clamp(value.strength);
+        water.discard_strength = rrwater::Clamp(value.discard_strength);
         water.guide = rrwater::ValidGuide(value.guide);
         if (!rrwater::Wanted(water))
             water_retry_after = 0;
@@ -2241,12 +2243,14 @@ class Controller {
                            !sky_edge_on &&
                            rrwater::UseResponsivity(water, s->water_used, preset.has_effective,
                                                     preset.effective),
-                       water_discard = s->water_used && water.discard,
+                       water_discard = s->water_used && water.discard &&
+                                       rrwater::DiscardLevel(water.discard_strength) != 0,
                        water_animated = s->water_used && water.animated,
                        water_merge = water_responsivity && responsivity_active;
             if (s->water_used)
                 s->gpu.WaterHeader(rrwater::Clamp(water.strength),
-                                   rrwater::Flags(water_responsivity, water_discard, water_merge));
+                                   rrwater::Flags(water_responsivity, water_discard, water_merge,
+                                                  rrwater::DiscardLevel(water.discard_strength)));
             water_status = {};
             water_status.ready = s->water_used;
             water_status.responsivity = water_responsivity;
