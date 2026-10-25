@@ -71,6 +71,14 @@ def main():
                                                 ('WFill', 0, 0, 0, 1, 0), ('WNative', 0, 0, 0, 2, 0),
                                                 ('SssNative2', 2, 0, 0, 0, 1), ('SssFill2', 2, 1, 0, 0, 1),
                                                 ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
+          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
+        # Lobe 2 fill gaps on SSS pixels with history gate and this frame's spatial fallback.
+        *[(f'RRVrrtScale{name}{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
+                        flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
+                               '-D', 'RR_CAP_RATIO=0', '-D', 'RR_W_SOURCE=0', '-D', 'RR_SSS_MASK=1',
+                               '-D', f'RR_FILL_HISTORY={history}', '-D', 'RR_FILL_SPATIAL=1', *extra)), False)
+          for name, history in (('SssFill2Spatial', 1), ('SssSpatial2', 4096), ('SssFill2Settled', 4))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
     # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and

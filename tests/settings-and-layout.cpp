@@ -52,7 +52,8 @@ static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
 // SSS-masked sources are appended; only they read the SSS guide.
 static_assert(rrlighting::SssNative2 == 9 && rrlighting::SssFill2 == 10 &&
               rrlighting::SssNative3 == 11 && rrlighting::SssFill3 == 12 &&
-              rrlighting::Count == 13);
+              rrlighting::SssFill2Spatial == 13 && rrlighting::SssSpatial2 == 14 &&
+              rrlighting::SssFill2Settled == 15 && rrlighting::Count == 16);
 static_assert(rrlighting::Valid(rrlighting::SssFill3) == rrlighting::SssFill3);
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssNative2]) ==
               "SSS pixels: lobe 2 native temporal");
@@ -63,6 +64,15 @@ static_assert(!rrlighting::SssMasked(rrlighting::Raw) &&
               rrlighting::SssMasked(rrlighting::SssNative2) &&
               rrlighting::SssMasked(rrlighting::SssFill3) &&
               !rrlighting::SssMasked(rrlighting::Count));
+static_assert(rrlighting::SssMasked(rrlighting::SssFill2Spatial) &&
+              rrlighting::SssMasked(rrlighting::SssSpatial2) &&
+              rrlighting::SssMasked(rrlighting::SssFill2Settled));
+static_assert(rrlighting::Valid(rrlighting::SssFill2Settled) == rrlighting::SssFill2Settled &&
+              rrlighting::Valid(16) == rrlighting::Raw);
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill2Spatial]) ==
+              "SSS pixels: lobe 2 fill gaps, history + spatial (test)");
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssSpatial2]) ==
+              "SSS pixels: lobe 2 spatial fill only (test)");
 // A guide serves the next few frames of its generation and extent, across wrap.
 constexpr rrsssmask::Record guide{true, 100, 7, 1280, 720};
 static_assert(rrsssmask::Usable(guide, 101, 7, 1280, 720) &&

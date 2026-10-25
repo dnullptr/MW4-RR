@@ -340,7 +340,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "uses the game's everywhere. SSS pixels options apply native temporal or "
                        "fill gaps only where the previous frame's Subsurface Scattering guide is "
                        "nonzero and keep raw lighting everywhere else; they need the SSS guide "
-                       "(F11) and show raw lighting without it.");
+                       "(F11) and show raw lighting without it. The (test) options keep fill gaps' fresh "
+                       "samples unboosted; history + spatial uses the game's accumulation only where "
+                       "it has lobe-2 history and otherwise averages this frame's rays within 2 "
+                       "pixels; spatial fill only never uses the game's accumulation.");
     if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
         ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);

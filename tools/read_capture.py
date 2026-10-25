@@ -20,13 +20,16 @@ import numpy as np
 # 61 (R8_UNORM) is scaled to 0-1.
 FORMATS = {2: ('<f4', 4), 10: ('<f2', 4), 16: ('<f4', 2), 26: ('<u4', 1), 34: ('<f2', 2),
            41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1), 61: ('<u1', 1)}
-# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-12 need the SSS pre-denoise
+# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-15 need the SSS pre-denoise
 # build).
 LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from native temporal',
             'Lobe 2 fill gaps', 'Both lobes fill gaps', 'Raw, cap bright samples (8x)',
             'Raw, cap bright samples (4x)', 'Raw, AO fix A (fill gaps)', 'Raw, AO fix B (native)',
             'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
-            'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
+            'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps',
+            'SSS pixels: lobe 2 fill gaps, history + spatial (test)',
+            'SSS pixels: lobe 2 spatial fill only (test)',
+            'SSS pixels: lobe 2 fill gaps, settled + spatial (test)']
 MIXED_LIGHTING = 0xFFFFFFFF  # A frame's lighting_input when it changed within the frame.
 # Per-frame lighting_masked: whether an SSS-masked lighting input had its SSS guide.
 MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
