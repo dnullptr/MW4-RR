@@ -20,7 +20,7 @@ for %%T in (runtime-shader sr-replacement sr-presentation sr-layouts settings-an
  cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
  build\tests\%%T.exe || exit /b 1
 )
-for %%T in (transparency-blend transparency-blend-hooks-cpu transparency-coverage-pipeline) do (
+for %%T in (transparency-blend transparency-blend-hooks-cpu transparency-coverage-pipeline transparency-coverage) do (
  cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
  build\tests\%%T.exe || exit /b 1
 )

@@ -10,6 +10,7 @@
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
 #include "rr_transparency_guide.h"
+#include "rr_transparency_coverage.h"
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
 #include "rr_specular_distance.h"
@@ -217,6 +218,7 @@ struct GpuFrame {
     }
     rrsss::Gpu sss;
     rrtrans::Gpu transparency;
+    rrblend::Gpu coverage;
     std::array<ComPtr<ID3D12Resource>, 4> sources, guides;
     std::array<ComPtr<ID3D12Resource>, 2> constants;
     std::array<UINT64, 2> offsets{};
@@ -235,7 +237,8 @@ struct GpuFrame {
     UINT *header_map{};
     bool use_depth{}, hit_ready{};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
-                                    D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
+                                    D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT,
+                                    const D3D12_CLEAR_VALUE *clear = nullptr) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
         Require(info.SizeInBytes && info.SizeInBytes <= b.limit &&
                     b.bytes <= b.limit - info.SizeInBytes,
@@ -250,7 +253,7 @@ struct GpuFrame {
                   type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
                   : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                      : D3D12_RESOURCE_STATE_COMMON,
-                  nullptr, IID_PPV_ARGS(&r)),
+                  clear, IID_PPV_ARGS(&r)),
               "live resource allocation failed");
         b.bytes += info.SizeInBytes;
         bytes += info.SizeInBytes;
@@ -578,6 +581,7 @@ struct GpuFrame {
             header->Unmap(0, nullptr);
         Require(b.bytes >= bytes, "live allocation ledger underflow");
         b.bytes -= bytes;
+        coverage.Release();
         *this = {};
     }
 };
