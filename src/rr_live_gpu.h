@@ -13,8 +13,10 @@
 #include "../build/rr_convert_guides_test8.generated.h"
 #include "../build/rr_convert_guides_test9.generated.h"
 #include "../build/rr_sky_depth_floor.generated.h"
+#include "../build/rr_weapon_depth.generated.h"
 #include "../build/rr_color_scale.generated.h"
 #include "rr_guide_test.h"
+#include "rr_weapon_depth.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
 #include "../build/rr_live_display.generated.h"
@@ -119,7 +121,7 @@ struct Pipelines {
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
         test_root, water_root;
     ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale,
-        water;
+        water, weapon_depth;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
     std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
@@ -192,12 +194,13 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
-        // Color scale and sky depth floor tests: source SRV table, target UAV
-        // table, 8 root constants.
+        // Color scale, sky depth floor and weapon depth tests: source SRV table,
+        // target UAV table, 8 root constants.
         e[2].Constants = {0, 0, 8};
         Root(rd, test_root);
         Pipeline(test_root.Get(), RRColorScale, sizeof(RRColorScale), color_scale);
         Pipeline(test_root.Get(), RRSkyDepthFloor, sizeof(RRSkyDepthFloor), depth_floor);
+        Pipeline(test_root.Get(), RRWeaponDepth, sizeof(RRWeaponDepth), weapon_depth);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
@@ -308,12 +311,14 @@ struct GpuFrame {
     // Owned copy of the native specular hit distance; hit_source is retained
     // until the recording that copied it retires.
     ComPtr<ID3D12Resource> specular_hit, hit_source;
-    // Heap slots for the development tests (TestPass): the depth floor's source,
-    // then one target per test, so tests in the same frame never share one.
+    // Heap slots for the development tests (TestPass): the source of the depth
+    // tests, then one target per test, so tests in the same frame never share one.
     static constexpr UINT DepthSource = 12, SkyEdgeTarget = 13, ColorTarget = 14,
                           DepthTarget = 15;
     // The guide shader's u4 water classification (WaterTarget).
     static constexpr UINT WaterSlot = 16;
+    // The weapon depth test's target, after the water slot.
+    static constexpr UINT WeaponTarget = 17;
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
     // Water guide mode Convert used for this frame (rrwater::Guide).
@@ -401,7 +406,7 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 17,
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, WeaponTarget + 1,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -768,6 +773,17 @@ struct GpuFrame {
         memcpy(&c[4], &floor, sizeof(floor));
         TestPass(cl, p, p.test_root.Get(), p.depth_floor.Get(), DepthSource, floored, DepthTarget,
                  c, 8);
+    }
+    // RR's depth (the private copy, or the game's R32_FLOAT depth) as linear view depth
+    // (R32_FLOAT, w x h), read from the depth subrect at (x, y); see rrweapondepth::Map.
+    void WeaponDepth(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *linear, UINT x,
+                     UINT y, const rrweapondepth::Mapping &m) {
+        SRV(p, use_depth ? depth.Get() : sr[1].Get(), DepthSource);
+        UINT c[8] = {w, h, x, y};
+        const float f[] = {m.scale, m.offset, m.sky, rrweapondepth::Knee};
+        memcpy(&c[4], f, sizeof(f));
+        TestPass(cl, p, p.test_root.Get(), p.weapon_depth.Get(), DepthSource, linear,
+                 WeaponTarget, c, 8);
     }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {

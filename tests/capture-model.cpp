@@ -660,9 +660,12 @@ static void ManifestShape() {
                               "\"responsivity_strength\": -0.5", "\"guide_test\": 0",
                               "\"sky_depth_test\": false",       "\"water_responsivity\": false",
                               "\"water_strength\": 0.75",        "\"water_discard\": true",
-                              "\"water_animated\": false",       "\"water_guide\": 2"};
+                              "\"water_animated\": false",       "\"water_guide\": 2",
+                              "\"weapon_depth\": false"};
     for (const char *s : settings)
         assert(Contains(m, s));
+    h.weapon_depth = true; // The weapon depth test: depth is linear view depth.
+    assert(Contains(Manifest(h, frames), "\"weapon_depth\": true"));
     assert(Contains(m, "\"2\": \"sky\""));
     assert(Contains(m, "\"8\": \"gap\""));
     for (const FormatInfo &f : formats) {

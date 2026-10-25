@@ -95,6 +95,7 @@ struct Meta {
     // which ones RR took), and the water guide mode its guides were converted with.
     bool water_masks{};
     unsigned water_guide{};
+    bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
     unsigned color_subrect[2]{}, depth_subrect[2]{}, motion_subrect[2]{};
@@ -108,7 +109,7 @@ struct Header {
         guide_test{}, lighting_input{};
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
-        responsivity_enabled{}, sky_depth_test{};
+        responsivity_enabled{}, sky_depth_test{}, weapon_depth{};
     float responsivity_strength{};
     // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
     bool water_responsivity{}, water_discard{}, water_animated{};
@@ -343,6 +344,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("water_discard"), h.water_discard);
     JsonBool(s.Key("water_animated"), h.water_animated);
     JsonUint(s.Key("water_guide"), h.water_guide);
+    JsonBool(s.Key("weapon_depth"), h.weapon_depth);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";

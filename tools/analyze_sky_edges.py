@@ -2085,6 +2085,9 @@ def analyze(manifest, frames, out_dir, radius=2, crop=None):
         raise ValueError('every frame needs color and depth')
     if radius < 1:
         raise ValueError('radius must be >= 1')
+    if (manifest.get('settings') or {}).get('weapon_depth'):
+        raise ValueError('depth is linear view depth (weapon depth test on), so sky is not '
+                         'depth == 0: take the capture with the test off')
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     shape = frames[0]['depth'].shape

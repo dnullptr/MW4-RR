@@ -88,6 +88,7 @@ def main():
         ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
         ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask'),
         ('rr_sky_depth_floor.hlsl', 'main', 'RRSkyDepthFloor', 'rr_sky_depth_floor'),
+        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth'),
         ('rr_color_scale.hlsl', 'main', 'RRColorScale', 'rr_color_scale')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,

@@ -6,6 +6,7 @@
 #include "rr_responsivity.h"
 #include "rr_water.h"
 #include "rr_sky_depth_test.h"
+#include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_status.h"
@@ -96,8 +97,8 @@ class Controller {
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
     bool responsivity_enabled{}, responsivity_active{};
-    // Development tests (sky edge mask, color brightness, sky depth floor): one
-    // texture each, shared by every slot, created on first use and released by
+    // Development tests (sky edge mask, color brightness, sky depth floor, weapon
+    // depth): one texture each, shared by every slot, created on first use and released by
     // Reconfigure. They sit in the persistent ledger, so pool projections count
     // each once, and the reserve grows by exactly their size (test_reserve,
     // given back on release).
@@ -109,8 +110,18 @@ class Controller {
     };
     // wide_output: RR's output while the color test brightens its input, in FP32
     // so the brightened result does not clip in the FP16 rr_output.
-    DevTest sky_edge_test, color_test, depth_test, wide_output;
+    // weapon_test: the linear depth RR reads while the weapon depth test runs.
+    DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test;
     UINT64 test_reserve{};
+    // Weapon depth test (rrweapondepth): weapon_linear is the depth type the current RR
+    // feature was created with; weapon_hold says why the test stays off until its setting
+    // next changes. The hold outlives Reconfigure, so a test that cannot run restarts RR
+    // once, never over and over.
+    enum class WeaponHold { None, Memory, Projection, Refused };
+    bool weapon_linear{};
+    WeaponHold weapon_hold{};
+    unsigned weapon_hold_changes{};
+    rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
     // Color scale RR's history was built with (color brightness test).
     float applied_color_scale = 1.0f;
     float responsivity_strength = rrresponsivity::DefaultStrength;
@@ -320,7 +331,29 @@ class Controller {
         initialized = true;
     }
     bool NeedsReconfigure() const {
-        return layout_pending || (preset.has_effective && preset.desired != preset.effective);
+        return layout_pending || (preset.has_effective && preset.desired != preset.effective) ||
+               (feature && weapon_linear != WeaponDepthWanted());
+    }
+    // The weapon depth test's setting, unless held off since its last change. RR's depth
+    // type is fixed at creation, so a new feature takes it and a change restarts RR.
+    bool WeaponDepthWanted() const {
+        return rrweapondepth::enabled.load(std::memory_order_relaxed) &&
+               (weapon_hold == WeaponHold::None ||
+                weapon_hold_changes != rrweapondepth::changes.load(std::memory_order_relaxed));
+    }
+    void HoldWeaponDepth(WeaponHold why, unsigned changes) {
+        // Frames already in flight on the same RR repeat the same hold: log it once.
+        if (weapon_hold == why && weapon_hold_changes == changes)
+            return;
+        weapon_hold = why;
+        weapon_hold_changes = changes;
+        // UseTest already logged a memory failure.
+        if (why == WeaponHold::Projection)
+            Log("Weapon depth test: the game's projection does not map to linear depth; test "
+                "off until its setting changes");
+        else if (why == WeaponHold::Refused)
+            Log("Weapon depth test: RR did not accept linear depth; test off until its setting "
+                "changes, RR runs with hardware depth");
     }
     void QueueReconfigure() {
         layout_pending = true;
@@ -379,7 +412,9 @@ class Controller {
         persistent.Release(budget);
         // The test textures were in the persistent ledger; give back the reserve
         // they added, never below what is still allocated.
-        sky_edge_test = color_test = depth_test = wide_output = {};
+        sky_edge_test = color_test = depth_test = wide_output = weapon_test = {};
+        weapon_linear = false;
+        weapon_logged = {};
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
@@ -735,6 +770,8 @@ class Controller {
             h.water_discard = water.discard;
             h.water_animated = water.animated;
             h.water_guide = water.guide;
+            // One RR history, so one feature and one depth type for the whole run.
+            h.weapon_depth = done[0].meta.linear_depth;
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {
@@ -801,9 +838,30 @@ class Controller {
     }
     TestState DepthFloorTest() {
         std::lock_guard lock(mutex);
-        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed),
-                    rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
-                        rrguidetest::SkySurface);
+        const bool wanted = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
+                            rrguidetest::SkySurface;
+        // While the weapon depth test runs, its linear depth carries the floor instead.
+        if (wanted && weapon_linear && weapon_test.active)
+            return Test(weapon_test, weapon_test.changes, true);
+        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed), wanted);
+    }
+    // Weapon depth test state for the panel. Restarting: RR is being recreated with the
+    // depth type the setting asks for (the change takes effect once in-flight frames retire).
+    enum class WeaponState { Off, Active, Waiting, Restarting, NoMemory, Unsupported, Refused };
+    WeaponState WeaponDepthState() {
+        std::lock_guard lock(mutex);
+        const bool running = enabled && !failed && !retired && feature;
+        if (!rrweapondepth::enabled.load(std::memory_order_relaxed))
+            return running && weapon_linear ? WeaponState::Restarting : WeaponState::Off;
+        if (!WeaponDepthWanted())
+            return weapon_hold == WeaponHold::Memory       ? WeaponState::NoMemory
+                   : weapon_hold == WeaponHold::Projection ? WeaponState::Unsupported
+                                                           : WeaponState::Refused;
+        if (!running)
+            return WeaponState::Waiting;
+        if (!weapon_linear)
+            return WeaponState::Restarting;
+        return weapon_test.active ? WeaponState::Active : WeaponState::Waiting;
     }
     bool Running() {
         std::lock_guard lock(mutex);
@@ -1702,6 +1760,47 @@ class Controller {
             s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
                             !o.color_x && !o.color_y;
 
+            auto projection = s->projection;
+            if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
+                static bool described{};
+                if (!described) {
+                    described = true;
+                    char line[200];
+                    rrskydepth::Describe(projection, line, sizeof(line));
+                    Log(line);
+                }
+                rrskydepth::Apply(projection);
+            }
+            // Weapon depth test: RR's depth type is fixed when RR is created, so a frame
+            // follows the feature's type and a new feature takes the setting's. Linear depth
+            // matches the projection RR is given; with the sky guide test, sky stands for
+            // that test's depth floor.
+            const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
+            bool weapon_on = feature ? weapon_linear : WeaponDepthWanted();
+            rrweapondepth::Mapping weapon_map;
+            const bool weapon_mapped =
+                weapon_on &&
+                rrweapondepth::Map(s->projection, projection,
+                                   s->gpu.guide_test == rrguidetest::SkySurface
+                                       ? rrguidetest::DepthFloor
+                                       : 0.0f,
+                                   weapon_map);
+            if (!UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
+                         DXGI_FORMAT_R32_FLOAT, "Weapon depth test") &&
+                weapon_on) {
+                // No GPU memory or an unsupported projection holds the test off. A texture
+                // left at another size is only released: the restart allocates it again.
+                if (!weapon_mapped || weapon_test.blocked)
+                    HoldWeaponDepth(weapon_mapped ? WeaponHold::Memory : WeaponHold::Projection,
+                                    weapon_changes);
+                // A linear-depth RR is never given hardware depth: restart it instead.
+                if (feature) {
+                    QueueReconfigure();
+                    return false;
+                }
+                weapon_on = false;
+            }
+
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
             if (reset)
@@ -1721,13 +1820,33 @@ class Controller {
                 Require(api.Valid(), "live NGX exports missing");
                 Require(NVSDK_NGX_SUCCEED(api.allocate(&parameters)) && parameters,
                         "live NGX parameter allocation failed");
-                rreval::CreateParameters(*parameters, o, preset.desired);
+                rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
                 auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
                                           parameters, &feature);
+                if (weapon_on && (NVSDK_NGX_FAILED(created) || !feature)) {
+                    // RR refused linear depth: hold the test and create RR as before.
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    weapon_on = weapon_test.active = false;
+                    feature = nullptr;
+                    rreval::CreateParameters(*parameters, o, preset.desired);
+                    created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
+                                         parameters, &feature);
+                }
                 Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
                 preset.Created();
+                weapon_linear = weapon_on;
+                if (weapon_on) {
+                    int sent = -1;
+                    parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
+                    char line[160];
+                    snprintf(line, sizeof(line),
+                             "Weapon depth test: RR created with linear depth (game create flags "
+                             "0x%x, sent 0x%x)",
+                             unsigned(o.flags), unsigned(sent));
+                    Log(line);
+                }
             }
             // Development tests (shared textures, see UseTest). RR takes one mask:
             // while in use, the sky edge mask replaces the SSS one.
@@ -1770,8 +1889,9 @@ class Controller {
             applied_color_scale = applied;
             // The guide mode this slot's guides were converted with, not the panel's
             // current one, so normals and depth always come from the same mode.
+            // The weapon depth test's linear depth carries the floor itself.
             const bool depth_on =
-                UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface,
+                UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface && !weapon_on,
                         rrguidetest::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
                         DXGI_FORMAT_R32_FLOAT, "Sky depth floor");
             // The SSS guide and color before transparency are in the game's color
@@ -1796,7 +1916,8 @@ class Controller {
             water_status.discard = water_discard;
             water_status.animated = water_animated;
             rreval::Resources resources{color_on ? color_test.texture.Get() : s->gpu.sr[0].Get(),
-                                        depth_on           ? depth_test.texture.Get()
+                                        weapon_on          ? weapon_test.texture.Get()
+                                        : depth_on         ? depth_test.texture.Get()
                                         : s->gpu.use_depth ? s->gpu.depth.Get()
                                                            : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
@@ -1822,18 +1943,19 @@ class Controller {
             auto evaluated = o;
             if (color_on)
                 evaluated.color_x = evaluated.color_y = 0;
-            if (depth_on)
+            if (depth_on || weapon_on)
                 evaluated.depth_x = evaluated.depth_y = 0;
-            auto projection = s->projection;
-            if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
-                static bool described{};
-                if (!described) {
-                    described = true;
-                    char line[200];
-                    rrskydepth::Describe(projection, line, sizeof(line));
-                    Log(line);
-                }
-                rrskydepth::Apply(projection);
+            if (weapon_on && (weapon_map.scale != weapon_logged.scale ||
+                              weapon_map.offset != weapon_logged.offset ||
+                              weapon_map.sky != weapon_logged.sky)) {
+                weapon_logged = weapon_map;
+                char line[224];
+                snprintf(line, sizeof(line),
+                         "Weapon depth test: world depth %g / (depth + %g), sky %g, weapon "
+                         "slice in front of %g",
+                         weapon_map.scale, weapon_map.offset, weapon_map.sky,
+                         weapon_map.scale / (1 + weapon_map.offset));
+                Log(line);
             }
             rreval::EvaluateParameters(*parameters, evaluated, resources, s->view.data(),
                                        projection.data());
@@ -1865,6 +1987,9 @@ class Controller {
             if (depth_on)
                 s->gpu.FloorDepth(cl.Get(), pipelines, depth_test.texture.Get(), o.depth_x,
                                   o.depth_y, rrguidetest::DepthFloor);
+            if (weapon_on)
+                s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
+                                   o.depth_y, weapon_map);
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1873,6 +1998,8 @@ class Controller {
             if (capture.Active())
                 captured = CaptureLocked(*s, cl.Get(), resources, evaluated,
                                          reset || color_scale_changed, projection);
+            if (captured)
+                s->captured.meta.linear_depth = weapon_on;
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1886,7 +2013,7 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(),
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-            for (auto *t : {&sky_edge_test, &color_test, &depth_test})
+            for (auto *t : {&sky_edge_test, &color_test, &depth_test, &weapon_test})
                 if (t->active)
                     s->gpu.TestFinish(cl.Get(), t->texture.Get());
             // Readable by the gate's Display (GateEnd), then back to COMMON below.
@@ -1909,8 +2036,15 @@ class Controller {
                     Change(cl.Get(), s->gpu.sr[i].Get(),
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
-            if (!s->inference_ok)
-                Failure("RR inference failed; native SR retained");
+            if (!s->inference_ok) {
+                // A linear-depth RR that fails: restart it with hardware depth rather than
+                // turning RR off.
+                if (weapon_on) {
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    QueueReconfigure();
+                } else
+                    Failure("RR inference failed; native SR retained");
+            }
             return s->inference_ok;
         } catch (const std::exception &e) {
             Failure(e.what());
