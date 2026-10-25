@@ -45,13 +45,20 @@ inline Tuning Read() {
 inline constexpr uint32_t Tile = 128, TileMask = Tile - 1, Ranks = Tile * Tile;
 // Shader flags.
 inline constexpr uint32_t CoverageFlag = 1, BeforeTransparencyFlag = 2, MaskFlag = 4;
+// Largest finite value of the copy's format: survivors scaled up to 8x are
+// clamped to it rather than overflowing to infinity. The color before
+// transparency is always R11G11B10.
+inline constexpr float R11G11B10Max = 65024.0f, HalfMax = 65504.0f, FloatMax = 3.4028235e38f;
+inline constexpr float FormatMax(bool r11g11b10, bool half) {
+    return r11g11b10 ? R11G11B10Max : half ? HalfMax : FloatMax;
+}
 // The pass's 8 root constants (b0).
 struct Constants {
     uint32_t width, height, color_x, color_y;
     uint32_t offset; // blue-noise tile shift: x in bits 0-15, y in bits 16-31
     uint32_t flags;
     float strength;
-    uint32_t reserved;
+    float limit; // FormatMax of the copy
 };
 static_assert(sizeof(Constants) == 32);
 inline constexpr unsigned ConstantWords = sizeof(Constants) / 4;
@@ -73,11 +80,15 @@ inline constexpr uint32_t Offset(uint32_t serial) {
 inline bool Wanted(const Tuning &t, bool color_test) {
     return t.enabled && !color_test;
 }
-// The glass capture cleared and wrote its coverage target in this frame, and at
-// least one refraction composite carried its transmittance in alpha. Otherwise
-// the target holds an older frame and the color is copied unchanged.
+// The glass capture cleared and wrote its coverage target in this frame;
+// otherwise the target holds an older frame. Its coverage is ready when at
+// least one refraction composite also carried its transmittance in alpha.
+// Without it the color is copied unchanged.
+inline bool CoverageSource(bool target, bool cleared, bool live) {
+    return target && cleared && live;
+}
 inline bool CoverageReady(bool target, bool cleared, bool live, unsigned refraction_alpha) {
-    return target && cleared && live && refraction_alpha > 0;
+    return CoverageSource(target, cleared, live) && refraction_alpha > 0;
 }
 // The color before transparency is changed only when RR receives it this frame
 // and the GPU can load its R11G11B10 texels through a UAV.
@@ -85,7 +96,8 @@ inline bool DropBeforeTransparency(const Tuning &t, bool transparency_used, bool
     return t.before_transparency && !t.show_mask && transparency_used && typed_load;
 }
 inline Constants Make(const Tuning &t, uint32_t width, uint32_t height, uint32_t color_x,
-                      uint32_t color_y, uint32_t serial, bool coverage, bool before) {
+                      uint32_t color_y, uint32_t serial, bool coverage, bool before,
+                      float limit = FloatMax) {
     Constants c{};
     c.width = width;
     c.height = height;
@@ -95,6 +107,7 @@ inline Constants Make(const Tuning &t, uint32_t width, uint32_t height, uint32_t
     c.flags = (coverage ? CoverageFlag : 0u) | (before ? BeforeTransparencyFlag : 0u) |
               (t.show_mask ? MaskFlag : 0u);
     c.strength = ClampStrength(t.strength);
+    c.limit = limit;
     return c;
 }
 
@@ -133,6 +146,14 @@ inline float Scale(float p, uint32_t rank) {
         return 1;
     return Threshold(rank) >= p ? 1 / (1 - p) : 0.0f;
 }
+// A covered pixel's stored value: 0 when dropped (also for an infinite input),
+// otherwise the scaled value clamped to the format's largest finite value.
+inline float Store(float value, float scale, float limit) {
+    if (!(scale > 0))
+        return 0;
+    const float v = value * scale;
+    return v < limit ? v : limit;
+}
 struct Rgb {
     float r, g, b;
 };
@@ -143,7 +164,7 @@ inline Rgb MaskView(Rgb c, float opacity) {
 }
 
 // Panel line for the test.
-enum class Report { Off, ColorTest, Waiting, Blocked, Unavailable, NoRefraction, Active };
+enum class Report { Off, ColorTest, Waiting, Blocked, Unavailable, NoSource, NoRefraction, Active };
 inline const char *Label(Report r) {
     switch (r) {
     case Report::Off:
@@ -156,6 +177,8 @@ inline const char *Label(Report r) {
         return "off: not enough GPU memory (change a dropout setting to retry)";
     case Report::Unavailable:
         return "unavailable (see ReShade.log)";
+    case Report::NoSource:
+        return "on, waiting for the glass capture (transparency albedo blend)";
     case Report::NoRefraction:
         return "on, no refracting glass in view";
     case Report::Active:

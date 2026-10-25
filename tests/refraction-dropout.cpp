@@ -41,6 +41,8 @@ void Selection() {
     Tuning on{true, 0.5f, false, false}, off{};
     assert(Wanted(on, false) && !Wanted(on, true) && !Wanted(off, false));
     // Coverage only from a target cleared and written this frame with refraction alpha.
+    assert(CoverageSource(true, true, true) && !CoverageSource(false, true, true) &&
+           !CoverageSource(true, false, true) && !CoverageSource(true, true, false));
     assert(CoverageReady(true, true, true, 1));
     assert(!CoverageReady(false, true, true, 1) && !CoverageReady(true, false, true, 1) &&
            !CoverageReady(true, true, false, 1) && !CoverageReady(true, true, true, 0));
@@ -60,7 +62,9 @@ void MakeConstants() {
     auto c = Make(t, 1920, 1088, 3, 5, 42, true, true);
     assert(c.width == 1920 && c.height == 1088 && c.color_x == 3 && c.color_y == 5);
     assert(c.offset == Offset(42) && c.flags == (CoverageFlag | BeforeTransparencyFlag));
-    assert(c.strength == 0.7f && c.reserved == 0);
+    assert(c.strength == 0.7f && c.limit == FloatMax);
+    c = Make(t, 8, 8, 0, 0, 0, true, false, FormatMax(true, false));
+    assert(c.limit == R11G11B10Max);
     t.strength = 3;
     t.show_mask = true;
     c = Make(t, 8, 8, 0, 0, 0, false, false);
@@ -130,6 +134,13 @@ void Math() {
            Probability(1, 4) == MaxStrength && Probability(0.5f, 0.5f) == 0.25f);
     // Kept pixels are divided by 1 - p, dropped ones are 0.
     assert(Near(Scale(0.5f, Ranks - 1), 2) && Scale(0.5f, 0) == 0);
+    // Stored values never overflow the format; a dropped infinite input is 0, not NaN.
+    assert(FormatMax(true, false) == 65024.0f && FormatMax(false, true) == 65504.0f &&
+           FormatMax(false, false) > 1e38f);
+    assert(Store(100, 2, R11G11B10Max) == 200 && Store(40000, 2, R11G11B10Max) == R11G11B10Max);
+    assert(Store(40000, 2, HalfMax) == HalfMax && Store(40000, 2, FloatMax) == 80000);
+    assert(Store(INFINITY, 0, R11G11B10Max) == 0 && Store(INFINITY, 8, HalfMax) == HalfMax);
+    assert(Store(5, 0, FloatMax) == 0);
     // Unbiased: over the tile, the mean factor is 1 within the rank quantization.
     for (float p : {0.01f, 0.1f, 0.25f, 1 / 3.0f, 0.5f, 0.75f, MaxStrength}) {
         double sum = 0;
@@ -203,7 +214,7 @@ void Pairs() {
 
 void Labels() {
     for (auto r : {Report::Off, Report::ColorTest, Report::Waiting, Report::Blocked,
-                   Report::Unavailable, Report::NoRefraction, Report::Active})
+                   Report::Unavailable, Report::NoSource, Report::NoRefraction, Report::Active})
         assert(Label(r) && *Label(r));
 }
 } // namespace

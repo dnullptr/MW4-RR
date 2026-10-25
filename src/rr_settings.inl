@@ -262,8 +262,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test for noise behind window glass. The game's refraction "
                        "copies a noisy half-resolution image, so RR sees the same grain repeated "
                        "in neighbouring pixels and keeps it as texture. This drops a random "
-                       "blue-noise share of those pixels every frame (strength = the share) and "
-                       "brightens the rest so the average stays the same. Judge it with frame "
+                       "blue-noise share of those pixels every frame (strength = the share where "
+                       "the glass fully refracts) and brightens the rest so the average stays "
+                       "the same. The mask view tints the covered pixels red instead. Judge it "
+                       "with frame "
                        "generation off. Needs the transparency albedo blend's refraction "
                        "capture; the color brightness test turns it off.");
     if (ImGui::Button("Capture RR inputs (Pause)"))

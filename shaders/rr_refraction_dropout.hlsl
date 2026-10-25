@@ -5,7 +5,8 @@
 // blue-noise threshold, shifted every frame, picks the survivors. Elsewhere, and
 // whenever the coverage was not admitted, the color is copied unchanged. The
 // game's color is only read.
-cbuffer Control:register(b0){uint Width,Height,ColorX,ColorY,Offset,Flags;float Strength;uint Reserved;}
+// Limit: the copy format's largest finite value; scaled survivors are clamped to it.
+cbuffer Control:register(b0){uint Width,Height,ColorX,ColorY,Offset,Flags;float Strength,Limit;}
 // The glass capture's control buffer: word 0 is 1 only when this frame's
 // coverage was captured in submission order (written at submission).
 cbuffer Coverage:register(b1){uint Admitted;}
@@ -61,7 +62,10 @@ float Opacity(int2 q,uint2 extent){
  uint i=t.y*128+t.x;
  uint rank=(BlueNoise[i>>1]>>((i&1)*16))&0xffff;
  float scale=(float(rank)+0.5)/16384.0>=p?1/(1-p):0;
- Output[id.xy]=float4(c*scale,color.a);
- if((Flags&BeforeTransparencyFlag)!=0)
-  BeforeTransparency[id.xy]=BeforeTransparency[id.xy]*scale;
+ // Dropped: 0 (also for an infinite input). Kept: clamped below overflow.
+ Output[id.xy]=float4(scale>0?min(c*scale,Limit):0,color.a);
+ if((Flags&BeforeTransparencyFlag)!=0){
+  float3 b=BeforeTransparency[id.xy];
+  BeforeTransparency[id.xy]=scale>0?min(b*scale,65024.0):0;
+ }
 }

@@ -137,7 +137,10 @@ struct ControllerCpuTest {
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
         c.dropout_test.blocked = c.dropout_unavailable = c.dropout_covered = true;
+        c.dropout_source = true;
         c.dropout_unavailable_changes = 5;
+        c.dropout_report = 1234;
+        c.dropout_frames = 7;
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
@@ -145,13 +148,14 @@ struct ControllerCpuTest {
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
                c.applied_color_scale == 1.0f);
         assert(!c.dropout_test.blocked && !c.dropout_unavailable && !c.dropout_covered &&
-               !c.dropout_unavailable_changes && !c.dropout_pipeline.state);
+               !c.dropout_source && !c.dropout_unavailable_changes && !c.dropout_pipeline.state &&
+               !c.dropout_report && !c.dropout_frames);
         // The refraction dropout test is off by default and reports why it is not active.
         assert(c.DropoutStatus() == rrdropout::Report::Off);
         rrdropout::enabled = true;
         assert(c.DropoutStatus() == rrdropout::Report::Waiting); // RR not running
-        c.color_test.active = true;
-        assert(c.DropoutStatus() == rrdropout::Report::ColorTest);
+        c.color_test.active = true; // stale: RR is not running, so not the reason
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting);
         c.color_test.active = false;
         c.dropout_unavailable = true;
         c.dropout_unavailable_changes = rrdropout::changes;
@@ -164,8 +168,9 @@ struct ControllerCpuTest {
         assert(c.DropoutStatus() == rrdropout::Report::Blocked);
         // Wanted but off for the color brightness test: no device is touched.
         Controller::Slot slot;
+        c.dropout_report = 99;
         assert(!c.DropoutUse(slot, rrdropout::Read(), true, DXGI_FORMAT_R11G11B10_FLOAT) &&
-               !c.dropout_test.active);
+               !c.dropout_test.active && !c.dropout_report); // the 10 s window restarts
         c.dropout_test = {};
         rrdropout::enabled = false;
         c.budget.limit = Budget::Minimum + 50;
