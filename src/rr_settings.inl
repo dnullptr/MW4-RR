@@ -27,6 +27,7 @@ static void LoadSettings() {
     if (settings_loaded)
         return;
     settings_loaded = true;
+    LoadBlendTuning(SettingsSection);
     unsigned preset = preferences.preset;
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);

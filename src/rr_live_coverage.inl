@@ -369,3 +369,9 @@ void CoverageFailed(CoverageToken &&token, const char *what) {
     if (held)
         BlendFailed(what);
 }
+// The render glue refused an OIT resolve whose command signature is not
+// Replayable (unknown, partial root constants or unsupported): no capture.
+void CoverageSignatureRefused() {
+    std::lock_guard lock(mutex);
+    CoverageRefused(rrblend::Reason::Signature);
+}
