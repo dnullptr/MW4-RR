@@ -257,9 +257,9 @@ struct ControllerCpuTest {
         polled = nullptr;
     }
     static void WeaponDepth() {
-        // The weapon depth test restarts RR only when its setting differs from the depth
-        // type RR was created with. A test that could not run stays off through Reconfigure
-        // until its setting next changes, so it restarts RR once, never over and over.
+        // Weapon depth restarts RR only when its setting differs from the depth type RR was
+        // created with. Linear depth that could not run stays off through Reconfigure until
+        // the setting next changes, so it restarts RR once, never over and over.
         using State = Controller::WeaponState;
         auto *const created = reinterpret_cast<NVSDK_NGX_Handle *>(1);
         Controller c;
@@ -280,9 +280,9 @@ struct ControllerCpuTest {
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, refused.text);
         assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
         assert(c.WeaponDepthState() == State::Refused);
-        const std::string refusal = "Weapon depth test: RR did not accept linear depth (0xBAD00005 "
-                                    "FAIL_InvalidParameter); test off until its setting changes, "
-                                    "RR runs with hardware depth\n";
+        const std::string refusal = "Weapon depth: RR did not accept linear depth (0xBAD00005 "
+                                    "FAIL_InvalidParameter); off until the setting changes, RR "
+                                    "runs with hardware depth\n";
         assert(logged == refusal);
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, "threw");
         assert(logged == refusal); // Frames still in flight repeat the hold; logged once.
@@ -307,7 +307,7 @@ struct ControllerCpuTest {
         assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
         c.weapon_linear = false;
         c.feature = nullptr;
-        // While the weapon test runs, its linear depth carries the sky guide test's floor.
+        // While weapon depth runs, its linear depth carries the sky guide test's floor.
         c.feature = created;
         c.weapon_linear = c.weapon_test.active = true;
         rrguidetest::mode = rrguidetest::SkySurface;

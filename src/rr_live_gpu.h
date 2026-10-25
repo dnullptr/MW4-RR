@@ -199,7 +199,7 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
-        // Color scale, sky depth floor and weapon depth tests: source SRV table,
+        // Color scale and sky depth floor tests, and weapon depth: source SRV table,
         // target UAV table, 8 root constants.
         e[2].Constants = {0, 0, 8};
         Root(rd, test_root);
@@ -346,7 +346,7 @@ struct GpuFrame {
                           DepthTarget = 15;
     // The guide shader's u4 water classification (WaterTarget).
     static constexpr UINT WaterSlot = 16;
-    // The weapon depth test's target, after the water slot.
+    // Weapon depth's target, after the water slot.
     static constexpr UINT WeaponTarget = 17;
     // Hit distance conditioning: five sources (ConditionDistance), then its target.
     static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;

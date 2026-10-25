@@ -284,6 +284,26 @@ def run(fault=None, dither=False):
         return ase.analyze(manifest, frames, tmp)
 
 
+def linear_depth(depth, mapping):
+    """src/rr_weapon_depth.h Linear in float32: the linear view depth RR gets with weapon depth on."""
+    f = np.float32
+    d = np.asarray(depth, np.float32)
+    scale, offset, sky = f(mapping['scale']), f(mapping['offset']), f(mapping['sky'])
+    cut, knee = f(mapping['slice']), f(mapping['knee'])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = np.minimum((d - cut) * f(64), f(1))
+        weapon = scale / (f(1) + offset) / (f(1) + t / knee)
+        world = np.minimum(scale / (d + offset), sky)
+        return np.where(d > 0, np.where(d > cut, weapon, world), sky).astype(np.float32)
+
+
+def weapon_mapping(scale=NEAR, offset=0.0, floor=0.0):
+    """A frame's linear_depth, as src/rr_weapon_depth.h Map makes it."""
+    sky = scale / (floor + offset) if floor or offset else scale * 1e6
+    return {'scale': scale, 'offset': offset, 'sky': float(np.float32(sky)), 'slice': 63 / 64,
+            'knee': 2 ** -11}
+
+
 def verdict(metrics, key):
     return metrics['verdicts'][key]['verdict']
 
@@ -340,10 +360,75 @@ class SyntheticCaptureTests(unittest.TestCase):
         cls.clean = run()
 
     def test_weapon_depth_capture_refused(self):
+        # An older build's capture with weapon depth on has linear depth but no mapping per frame.
         manifest, frames = make_capture(None, False)
         manifest['settings']['weapon_depth'] = True
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
             ase.analyze(manifest, frames, tmp)
+        with self.assertRaises(ValueError):
+            ase.undo_tests(manifest, frames)
+        for meta in manifest['frames'][1:]:
+            meta['linear_depth'] = None
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            ase.analyze(manifest, frames, tmp)
+
+    def test_weapon_depth_undone(self):
+        # Weapon depth: RR got linear view depth, with its mapping in each frame. The analysis reads
+        # it as hardware depth again, so every verdict matches the clean capture; also with the sky
+        # guide test's floor, which linear depth's sky then stands for.
+        for floor in (0.0, 1e-7):
+            with self.subTest(floor=floor):
+                manifest, frames = make_capture_with_output()
+                manifest['settings']['weapon_depth'] = True
+                mapping = weapon_mapping(floor=floor)
+                for meta, frame in zip(manifest['frames'], frames):
+                    meta.update(linear_depth=mapping, depth_floor=floor)
+                    frame['depth'] = linear_depth(frame['depth'], mapping)
+                reference, original = make_capture_with_output()
+                with tempfile.TemporaryDirectory() as tmp:
+                    expected = ase.analyze(reference, original, tmp)
+                    m = ase.analyze(manifest, frames, tmp)
+                    report = (Path(tmp) / 'report.md').read_text()
+                self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                                 {k: verdict(expected, k) for k in expected['verdicts']})
+                self.assertIn('weapon depth on in frames [0, 1, 2, 3, 4, 5, 6, 7]', report)
+                undone = ase.undo_tests(manifest, frames)[0]
+                for frame, game in zip(undone, original):
+                    np.testing.assert_allclose(frame['depth'], game['depth'], rtol=1e-6, atol=0)
+                    self.assertTrue((frame['depth'][game['depth'] == 0] == 0).all())
+                self.assertTrue((frames[0]['depth'] > 1).all())   # The caller's arrays are left alone.
+
+    def test_hardware_depth_exact(self):
+        # hardware_depth undoes linear_depth as src/rr_weapon_depth.h Hardware undoes Linear.
+        cut = np.float32(63 / 64)
+        weapon = cut + (1 - cut) * np.array([1e-5, 1e-4, 0.004, 0.03, 0.5, 1], np.float32)
+        world = np.array([cut, 0.75, 0.5, 1e-3, 1e-5, 2e-6], np.float32)
+        sky = np.array([0, -0.0, np.nan], np.float32)
+        for m in (weapon_mapping(), weapon_mapping(scale=4.0), weapon_mapping(offset=1e-6)):
+            with self.subTest(mapping=m):
+                back = ase.hardware_depth(linear_depth(weapon, m), m)
+                self.assertTrue((back > cut).all())
+                np.testing.assert_allclose(back, weapon, rtol=0, atol=3e-7)
+                np.testing.assert_allclose(ase.hardware_depth(linear_depth(world, m), m), world,
+                                           rtol=1e-5, atol=0)
+                np.testing.assert_array_equal(ase.hardware_depth(linear_depth(sky, m), m), np.zeros(3))
+                # World depth farther than an infinite projection's sky came back as sky.
+                tiny = ase.hardware_depth(linear_depth(np.float32(1e-7), m), m)
+                np.testing.assert_allclose(tiny, 0 if m['offset'] == 0 else 1e-7, rtol=1e-5, atol=0)
+                floor = np.float32(1e-7)
+                np.testing.assert_array_equal(ase.hardware_depth(np.float32([m['sky'], 2e30]), m, floor),
+                                              [floor] * 2)
+                # Depth linear depth never holds stays as it is, so it still counts as bad.
+                bad = np.float32([np.inf, -np.inf, np.nan, 0, -1])
+                np.testing.assert_array_equal(ase.hardware_depth(bad, m), bad)
+                # World depth never comes back as the weapon.
+                self.assertLessEqual(ase.hardware_depth(linear_depth(cut, m), m), cut)
+                # Weapon depth on the near plane, or between it and the nearest world depth, is the
+                # slice's back; nearer than the weapon's front is its front.
+                near = np.float32(m['scale']) / (np.float32(1) + np.float32(m['offset']))
+                gap = np.nextafter(linear_depth(cut, m), np.float32(0))
+                np.testing.assert_array_equal(
+                    ase.hardware_depth(np.float32([near, gap, near / 4096]), m), [cut, cut, 1])
 
     def test_tree_tests_undone(self):
         # Color brightness test (on all frames or every other one) and the sky depth floor on all,
