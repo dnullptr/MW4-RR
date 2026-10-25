@@ -339,7 +339,20 @@ static void TestPatchRefusals() {
         Replace(n, T::render_target_formats, {T::render_target_formats, 2, &n.rt});
     });
     Refused("sample-count", [](Native &n) { n.samples = 1; });
-    Refused("sample-mask", [](Native &n) { n.mask = 0xffff; });
+    Refused("sample-mask",
+            [](Native &n) { Replace(n, T::sample_mask, {T::sample_mask, 2, &n.mask}); });
+    // A partial sample mask is mirrored, not refused.
+    for (uint32_t mask : {0xffffu, 0x5u}) {
+        Native n(Oit,
+                 ReShadeNative(api::blend_factor::one, api::blend_factor::one_minus_source1_color));
+        n.mask = mask;
+        CoveragePatch patch;
+        assert(patch.Prepare(n.Count(), n.objects.data(), Oit,
+                             NativeBlend(D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC1_COLOR),
+                             DepthClass::NoDsv));
+        const auto *kept = n.Find(patch, T::sample_mask);
+        assert(kept->count == 1 && kept->data == &n.mask);
+    }
     Refused("primitive-topology",
             [](Native &n) { n.topology = api::primitive_topology::triangle_strip; });
     Refused("extra-shader-stage",
@@ -387,7 +400,7 @@ static void TestPatchRefusals() {
 struct NativeDesc {
     unsigned char vs[96]{}, ps[128]{}, cached[16]{};
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    NativeDesc(const D3D12_BLEND_DESC &blend, DXGI_FORMAT dsv, bool depth_test) {
+    NativeDesc(const D3D12_BLEND_DESC &blend, DXGI_FORMAT dsv, bool depth_test, UINT mask = ~0u) {
         for (size_t i = 0; i < sizeof(ps); ++i)
             ps[i] = static_cast<unsigned char>(i * 7 + 3);
         vs[0] = 0x44;
@@ -395,7 +408,7 @@ struct NativeDesc {
         desc.VS = {vs, sizeof(vs)};
         desc.PS = {ps, sizeof(ps)};
         desc.BlendState = blend;
-        desc.SampleMask = ~0u;
+        desc.SampleMask = mask;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         desc.RasterizerState.DepthClipEnable = TRUE;
@@ -476,15 +489,18 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC Created(const NativeDesc &native,
         }
         if (o.type == T::depth_stencil_format)
             d.DSVFormat = DXGI_FORMAT(*static_cast<const api::format *>(o.data));
+        if (o.type == T::sample_mask)
+            d.SampleMask = *static_cast<const uint32_t *>(o.data);
     }
     return d;
 }
 
 static void TestExpected(const Target &target, D3D12_BLEND src, D3D12_BLEND dest,
-                         api::blend_factor rs_src, api::blend_factor rs_dest, DepthClass depth) {
+                         api::blend_factor rs_src, api::blend_factor rs_dest, DepthClass depth,
+                         UINT mask = ~0u) {
     using rrsss::PipelineProof;
     const auto blend = NativeBlend(src, dest);
-    const NativeDesc native(blend, DXGI_FORMAT_D32_FLOAT, depth == DepthClass::KeepDsv);
+    const NativeDesc native(blend, DXGI_FORMAT_D32_FLOAT, depth == DepthClass::KeepDsv, mask);
     const auto observed = PipelineProof::ObserveLegacy(&native.desc);
     assert(Classify(observed.blend, observed.rt_count) == BlendClass::Accept);
     assert(DepthStencilReplayable(observed.depth.desc) == depth);
@@ -507,11 +523,13 @@ static void TestExpected(const Target &target, D3D12_BLEND src, D3D12_BLEND dest
            (depth == DepthClass::NoDsv ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_D32_FLOAT));
     assert(!memcmp(&e.depth.desc, &observed.depth.desc, sizeof(e.depth.desc)));
     assert(e.sample.Count == 4 && e.sample.Quality == D3D12_STANDARD_MULTISAMPLE_PATTERN);
+    assert(e.sample_mask == mask && observed.sample_mask == mask);
     assert(e.root_identity == observed.root_identity && e.input_hash == observed.input_hash);
     assert(!memcmp(&e.raster, &observed.raster, sizeof(e.raster)));
     // The variant created from the patched subobjects is Equivalent to it,
     // whichever IndependentBlendEnable ReShade picks for one RT.
     Native n(target, ReShadeNative(rs_src, rs_dest));
+    n.mask = mask;
     if (depth == DepthClass::KeepDsv)
         n.dsv = api::format::d32_float;
     CoveragePatch patch;
@@ -540,6 +558,9 @@ static void TestExpected(const Target &target, D3D12_BLEND src, D3D12_BLEND dest
         assert(!PipelineProof::Equivalent(e, PipelineProof::ObserveLegacy(&other)));
         other = created;
         other.SampleDesc.Quality = 0;
+        assert(!PipelineProof::Equivalent(e, PipelineProof::ObserveLegacy(&other)));
+        other = created;
+        other.SampleMask = mask ^ 1;
         assert(!PipelineProof::Equivalent(e, PipelineProof::ObserveLegacy(&other)));
     }
     // The native PSO itself is not the variant.
@@ -668,6 +689,9 @@ int main() {
                  api::blend_factor::one_minus_source_alpha, DepthClass::NoDsv);
     TestExpected(Refraction, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA, api::blend_factor::one,
                  api::blend_factor::one_minus_source_alpha, DepthClass::KeepDsv);
+    // A partial sample mask is mirrored into the variant and still Equivalent.
+    TestExpected(Oit, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC1_COLOR, api::blend_factor::one,
+                 api::blend_factor::one_minus_source1_color, DepthClass::NoDsv, 0x5);
     TestExpected(Refraction, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_COLOR,
                  api::blend_factor::source_alpha, api::blend_factor::one_minus_source_color,
                  DepthClass::NoDsv);

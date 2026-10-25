@@ -92,7 +92,10 @@ inline rrsss::NativePipelineObservation Expected(const rrsss::NativePipelineObse
     auto o = native;
     o.cached_bytes = 0;
     o.cached_present = false;
-    o.blend = PatchBlend(native.blend, kind); // IndependentBlendEnable FALSE
+    // PatchBlend sets IndependentBlendEnable FALSE. ReShade likely creates the
+    // variant with TRUE, since slots 1-7 differ from RT0; Equivalent compares
+    // only RT0 for one RT, so either matches.
+    o.blend = PatchBlend(native.blend, kind);
     o.rt_count = 1;
     o.rt_formats.fill(DXGI_FORMAT_UNKNOWN);
     o.rt_formats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -194,8 +197,9 @@ struct CoveragePatch {
                 if (o.count != 1 || *static_cast<const unsigned *>(o.data) != 4)
                     return refuse("sample-count", type);
                 break;
+            // Any mask: the variant mirrors it, and Equivalent compares it.
             case T::sample_mask:
-                if (o.count != 1 || *static_cast<const unsigned *>(o.data) != ~0u)
+                if (o.count != 1)
                     return refuse("sample-mask", type);
                 break;
             case T::depth_stencil_state:
@@ -355,8 +359,8 @@ class CoveragePipelineRegistry {
     static std::string Description(ID3D12PipelineState *native) {
         return rrsss::PipelineProof::NativeDescription(native);
     }
-    // One line per native PSO. why is a static string; the description is not
-    // read when the native PSO is unknown.
+    // One line per native PSO. why is a static string; an unknown native PSO is
+    // described as "unobserved".
     void Refused(uint64_t hash, const char *why, unsigned problem,
                  ID3D12PipelineState *native) noexcept {
         try {
