@@ -48,9 +48,12 @@ struct CpuFence final : ID3D12Fence {
         return E_NOTIMPL;
     }
 };
-// CPU-only resource double: only its reference count is observed.
+// CPU-only resource double: its reference count is observed; Map hands out mapped, when set,
+// and records the range read.
 struct CpuResource final : ID3D12Resource {
     ULONG refs = 1;
+    void *mapped{};
+    D3D12_RANGE read{};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override {
         return E_NOINTERFACE;
     }
@@ -78,8 +81,12 @@ struct CpuResource final : ID3D12Resource {
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void **) override {
         return E_NOTIMPL;
     }
-    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *, void **) override {
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *range, void **data) override {
+        if (!mapped)
+            return E_NOTIMPL;
+        read = range ? *range : D3D12_RANGE{};
+        *data = mapped;
+        return S_OK;
     }
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE *) override {}
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
@@ -184,9 +191,27 @@ struct ControllerCpuTest {
         assert(logged == "RR feature retirement failed (export missing); allocations retained\n");
         logged.clear();
     }
+    // Each stats reader maps only its own bytes: the water count (16) and the
+    // non-finite counts (20, 24) never overlap.
+    static void StatsReaders() {
+        UINT words[64];
+        for (UINT i = 0; i < 64; ++i)
+            words[i] = 100 + i; // word i holds 100 + its byte offset / 4
+        GpuFrame g;
+        auto *readback = new CpuResource;
+        readback->mapped = words;
+        g.readback.Attach(readback);
+        assert((g.ReadStats() == std::array<UINT, 4>{100, 101, 102, 103}));
+        assert(readback->read.Begin == 0 && readback->read.End == 16);
+        assert(g.ReadWaterPixels() == 104);
+        assert(readback->read.Begin == 16 && readback->read.End == 20);
+        assert((g.ReadFinite() == std::array<UINT, 2>{105, 106}));
+        assert(readback->read.Begin == 20 && readback->read.End == 28);
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
+        StatsReaders();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);
