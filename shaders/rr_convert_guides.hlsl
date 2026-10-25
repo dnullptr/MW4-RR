@@ -1,5 +1,10 @@
 #include "rr_guide_math.hlsli"
 
+// Development guide tests for thin-geometry noise (rr_guide_test.h). 0 = normal guides.
+#ifndef RR_GUIDE_TEST
+#define RR_GUIDE_TEST 0
+#endif
+
 // Inputs must be private copies from the same validated prepass/SR submission.
 // Caller must establish the current per-pixel parity addressing. This shader does
 // not prove frame association or manage resource states or RR evaluation.
@@ -15,6 +20,12 @@ RWTexture2D<float4> SpecularAlbedo : register(u2);
 // 0=padding, 1=ordinary, 2=sky, 3=special, 4=invalid/unsupported.
 // A runtime consumer must reject a packet containing status4.
 RWTexture2D<uint> Status : register(u3);
+// Water classification for src/rr_water.h, 1 on water pixels. A null view
+// (zero size) when no water test wants it.
+RWTexture2D<float> Water : register(u4);
+// 0..3 = rrwater::Guide: game mirror, mirror with smoothed normal, water
+// material arrays, physical water constants with smoothed normal.
+cbuffer WaterControl : register(b2) { uint WaterGuide; uint3 WaterReserved; }
 
 // FXC's default floating-point optimization can remove isfinite checks on
 // otherwise-unused camera values (e.g. sky). Integer exponent tests retain the
@@ -47,6 +58,29 @@ void RRWriteEmpty(uint2 p,uint status,float roughness)
     DiffuseAlbedo[p]=0;SpecularAlbedo[p]=0;Status[p]=status;
 }
 
+// cs_prepass marks water with w bit2 (value 4), never together with the
+// depth override (value 8); water always carries the special bit as well.
+bool RRWaterSurface(uint w) { return (w&4u)!=0 && (w&8u)==0; }
+
+// Mean wave normal of the water pixels in a 7x7 window, so the guide keeps the
+// surface's broad shape without its per-pixel ripple detail.
+float3 RRWaterSmoothNormal(int2 p,float3 normal)
+{
+    float3 sum=0;
+    int2 extent=int2(Scene[86].xy);
+    [loop]for(int y=-3;y<=3;++y){
+        [loop]for(int x=-3;x<=3;++x){
+            int2 q=p+int2(x,y);
+            if(any(q<0) || any(q>=extent))continue;
+            if(!RRWaterSurface(PackedSurface.Load(int3(q,0)).w))continue;
+            float3 n=RRDecodeNormalGloss(NormalGloss.Load(int4(RRMaterialArrayAddress(uint2(q)),0))).xyz;
+            if(RRFinite3(n))sum+=n;
+        }
+    }
+    float length2=dot(sum,sum);
+    return RRFinite(length2) && length2>1e-6 ? sum*rsqrt(length2) : normal;
+}
+
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -57,13 +91,30 @@ void main(uint3 id : SV_DispatchThreadID)
     // No out-of-bounds UAV writes, even for a malformed caller. The caller must
     // additionally reject unequal output dimensions before dispatch.
     if(p.x>=dw || p.y>=dh || p.x>=sw || p.y>=sh || p.x>=tw || p.y>=th)return;
+    uint ww,wh;Water.GetDimensions(ww,wh);
+    bool waterOut=p.x<ww && p.y<wh; // false for the null view
+    if(waterOut)Water[p]=0;
     RRWriteEmpty(p,4,0);
     if(!RRConversionLayout(size))return;
     if(any(float2(p)>=Scene[86].xy)){RRWriteEmpty(p,0,0);return;}
     uint4 surface=PackedSurface.Load(int3(p,0));float depth=asfloat(surface.x);
     // NVIDIA's RR guide: sky diffuse albedo 0.5, specular albedo and normal 0.
     // Zero sky albedo smears thin foliage and wire edges against the sky.
-    if(depth==0 || surface.x==0x7f7fffffu){RRWriteEmpty(p,2,1);DiffuseAlbedo[p]=float4(0.5,0.5,0.5,1);return;}
+    if(depth==0 || surface.x==0x7f7fffffu){
+        RRWriteEmpty(p,2,1);DiffuseAlbedo[p]=float4(0.5,0.5,0.5,1);
+#if RR_GUIDE_TEST==7 || RR_GUIDE_TEST==8
+        // Sky as a surface: a normal facing the camera instead of 0, so RR cannot
+        // single sky pixels out by their normal. Sky uses the primary camera rows.
+        float2 skyClip=1-2*(float2(p)+0.5)*Scene[86].zw;
+        float3 skyRay=Scene[148].xyz*skyClip.x+Scene[149].xyz*skyClip.y+Scene[150].xyz;
+        float skyLength2=dot(skyRay,skyRay);
+        if(RRFinite(skyLength2) && skyLength2>=1e-20)NormalRoughness[p]=float4(-skyRay*rsqrt(skyLength2),1);
+#elif RR_GUIDE_TEST==9
+        // NVIDIA's sample leaves sky roughness 0; ours is 1.
+        NormalRoughness[p]=0;
+#endif
+        return;
+    }
     if(!RRFinite(depth) || depth<=0 || depth>1)return;
     bool alternate=(surface.w&1u)!=0, special=(surface.w&2u)!=0, depthOverride=(surface.w&8u)!=0;
     if(alternate!=(depth>63.0/64.0) || (depthOverride&&!special))return;
@@ -78,6 +129,10 @@ void main(uint3 id : SV_DispatchThreadID)
         if(Settings[1].x!=0)materialF0=MaterialF0.Load(int4(address,0));
     }
     if(!RRFinite3(diffuse) || !RRFinite3(materialF0) || any(diffuse<0) || any(materialF0<0))return;
+    bool water=RRWaterSurface(surface.w);
+    uint waterGuide=water?WaterGuide:0;
+    if(waterGuide==1 || waterGuide==3)normal=RRWaterSmoothNormal(int2(p),normal);
+    if(waterGuide==3)materialF0=0.02; // water's dielectric F0; no diffuse, roughness stays 0
     float2 clip=1-2*(float2(p)+0.5)*Scene[86].zw;
     float3 rx=alternate?Scene[167].xyz:Scene[148].xyz;
     float3 ry=alternate?Scene[168].xyz:Scene[149].xyz;
@@ -86,10 +141,6 @@ void main(uint3 id : SV_DispatchThreadID)
     float length2=dot(ray,ray);
     if(!RRFinite(length2) || length2<1e-20)return;
     ray*=rsqrt(length2);
-    // Development guide tests for thin-geometry noise (rr_guide_test.h). 0 = normal guides.
-#ifndef RR_GUIDE_TEST
-#define RR_GUIDE_TEST 0
-#endif
 #if RR_GUIDE_TEST==1
     if(dot(normal,ray)>0)normal=-normal; // back faces (e.g. foliage undersides) face the camera
 #elif RR_GUIDE_TEST==3
@@ -102,6 +153,16 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
     float3 specular=RRGameSpecularReflectance(materialF0,roughness,dot(normal,ray));
     if(!RRFinite3(specular))return;
+    if(waterGuide==2){
+        // The game's RT lighting uses MaterialF0 at water as the final,
+        // Fresnel-weighted specular reflectance, so it is already a specular
+        // albedo: no second BRDF fit. Both arrays are read here regardless of
+        // the Settings gates above, which only cover non-special pixels.
+        float3 waterF0=MaterialF0.Load(int4(address,0));
+        float3 waterDiffuse=MaterialDiffuse.Load(int4(address,0));
+        if(RRFinite3(waterF0))specular=saturate(waterF0);
+        if(RRFinite3(waterDiffuse))diffuse=saturate(waterDiffuse);
+    }
 #if RR_GUIDE_TEST==4 || RR_GUIDE_TEST==6
     specular=0;
 #endif
@@ -112,4 +173,5 @@ void main(uint3 id : SV_DispatchThreadID)
     DiffuseAlbedo[p]=float4(diffuse,1);
     SpecularAlbedo[p]=float4(specular,1);
     Status[p]=special?3u:1u;
+    if(waterOut && water)Water[p]=1;
 }

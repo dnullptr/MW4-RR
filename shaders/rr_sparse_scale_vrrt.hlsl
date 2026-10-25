@@ -35,6 +35,15 @@ uint PixelCode(uint2 p){
 #ifndef RR_NATIVE_FILL
 #define RR_NATIVE_FILL 0
 #endif
+// RR_SSS_MASK applies that selection only where the previous frame's SSS guide
+// (t2) is nonzero; every other pixel keeps raw boosted lighting. The game's
+// guide is exactly 0 off SSS pixels. Only the private root binds t2.
+#ifndef RR_SSS_MASK
+#define RR_SSS_MASK 0
+#endif
+#if RR_SSS_MASK
+Texture2D<float> sssGuide:register(t2);
+#endif
 // RR_CAP_RATIO caps a raw sample's luminance, before the inverse-probability
 // boost, at that many times the native temporal luminance of its lobe, so a rare
 // bright sample cannot be boosted into a splat the SSS blur spreads. Pixels with
@@ -109,6 +118,9 @@ void main(uint3 id:SV_DispatchThreadID){
  uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,nc.zw,((nw>>8)&4095)!=0,b);
  ca=KeepW(ca,c.xy,a,nc.xy);cb=KeepW(cb,c.zw,b,nc.zw);
  uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
+#if RR_SSS_MASK
+ uint2 rawA=ca,rawB=cb;uint rawWeights=outWeights;
+#endif
 #if RR_NATIVE_LOBE&1
  bool fa;ca=SelectLobe(c.xy,(wt>>20)!=0,nc.xy,fa);
  outWeights=(outWeights&~0xfff00000u)|((fa?wt:nw)&0xfff00000u);
@@ -116,6 +128,10 @@ void main(uint3 id:SV_DispatchThreadID){
 #if RR_NATIVE_LOBE&2
  bool fb;cb=SelectLobe(c.zw,((wt>>8)&4095)!=0,nc.zw,fb);
  outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
+#endif
+#if RR_SSS_MASK
+ // An out-of-range load returns 0, so a mismatched guide leaves raw lighting.
+ if(sssGuide.Load(int3(p,0))==0){ca=rawA;cb=rawB;outWeights=rawWeights;}
 #endif
 #ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));

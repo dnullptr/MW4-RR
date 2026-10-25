@@ -8,8 +8,13 @@
 #include "../src/rr_ray_budget.h"
 #include "../src/rr_vrrt_rate.h"
 #include "../src/rr_lighting_source.h"
+#include "../src/rr_sss_mask.h"
 #include "../src/rr_responsivity.h"
+#include "../src/rr_sky_edge.h"
+#include "../src/rr_color_scale.h"
 #include "../src/rr_specular_distance.h"
+#include "../src/rr_hit_condition.h"
+#include "../src/rr_water.h"
 #include <algorithm>
 #include <bit>
 #include <cassert>
@@ -27,6 +32,13 @@ static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
 static_assert(!defaults.responsivity &&
               defaults.responsivity_strength == rrresponsivity::DefaultStrength);
+// Water tests start off; unknown guide modes read as the game mirror.
+static_assert(!rrwater::Wanted(rrwater::Settings{}));
+static_assert(rrwater::ValidGuide(rrwater::Physical) == rrwater::Physical);
+static_assert(rrwater::ValidGuide(rrwater::GuideCount) == rrwater::Mirror);
+static_assert(std::string_view(rrwater::guide_labels[rrwater::Mirror]) == "Game mirror (today)");
+static_assert(rrwater::Flags(true, false, false) == 1 && rrwater::Flags(false, true, false) == 2 &&
+              rrwater::Flags(false, false, true) == 4);
 // Stored values 0..2 keep their meaning; unknown values read as raw lighting.
 static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
@@ -40,6 +52,32 @@ static_assert(rrlighting::WFill == 7 && rrlighting::WNative == 8 &&
               rrlighting::Valid(rrlighting::WNative) == rrlighting::WNative);
 static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
               "Raw, AO fix B (native)");
+// SSS-masked sources are appended; only they read the SSS guide.
+static_assert(rrlighting::SssNative2 == 9 && rrlighting::SssFill2 == 10 &&
+              rrlighting::SssNative3 == 11 && rrlighting::SssFill3 == 12 &&
+              rrlighting::Count == 13);
+static_assert(rrlighting::Valid(rrlighting::SssFill3) == rrlighting::SssFill3);
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssNative2]) ==
+              "SSS pixels: lobe 2 native temporal");
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill3]) ==
+              "SSS pixels: both lobes fill gaps");
+static_assert(!rrlighting::SssMasked(rrlighting::Raw) &&
+              !rrlighting::SssMasked(rrlighting::WNative) &&
+              rrlighting::SssMasked(rrlighting::SssNative2) &&
+              rrlighting::SssMasked(rrlighting::SssFill3) &&
+              !rrlighting::SssMasked(rrlighting::Count));
+// A guide serves the next few frames of its generation and extent, across wrap.
+constexpr rrsssmask::Record guide{true, 100, 7, 1280, 720};
+static_assert(rrsssmask::Usable(guide, 101, 7, 1280, 720) &&
+              rrsssmask::Usable(guide, 100 + rrsssmask::MaxAge, 7, 1280, 720));
+static_assert(!rrsssmask::Usable(guide, 100, 7, 1280, 720) &&
+              !rrsssmask::Usable(guide, 101 + rrsssmask::MaxAge, 7, 1280, 720) &&
+              !rrsssmask::Usable(guide, 99, 7, 1280, 720));
+static_assert(!rrsssmask::Usable(guide, 101, 8, 1280, 720) &&
+              !rrsssmask::Usable(guide, 101, 7, 1920, 720) &&
+              !rrsssmask::Usable(guide, 101, 7, 1280, 1080));
+static_assert(!rrsssmask::Usable({}, 1, 0, 0, 0));
+static_assert(rrsssmask::Usable({true, 0xffffffffu, 1, 8, 8}, 1, 1, 8, 8));
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");
@@ -1898,6 +1936,23 @@ static void SummaryTests() {
 }
 
 int main() {
+    // Sky edge mask: preset F only, strength 0 or off sends nothing.
+    assert(rrskyedge::Use(true, -0.5f, true, 6));
+    assert(!rrskyedge::Use(false, -0.5f, true, 6));
+    assert(!rrskyedge::Use(true, 0.0f, true, 6));
+    assert(!rrskyedge::Use(true, -0.5f, false, 6));
+    assert(!rrskyedge::Use(true, -0.5f, true, 5));
+    assert(rrskyedge::ClampRadius(0) == 1 && rrskyedge::ClampRadius(9) == rrskyedge::MaxRadius &&
+           rrskyedge::ClampRadius(2) == 2);
+    // Color brightness test: off is exactly 1, every factor is a power of two
+    // (exact in R11G11B10 and FP16), and an out-of-range mode falls back to off.
+    static_assert(rrcolorscale::Factor(rrcolorscale::Off) == 1.0f);
+    static_assert(rrcolorscale::Factor(rrcolorscale::Count) == 1.0f);
+    static_assert(rrcolorscale::Factor(rrcolorscale::Sixteenth) == 0.0625f);
+    for (unsigned m = 1; m < rrcolorscale::Count; ++m) {
+        int e{};
+        assert(std::frexp(rrcolorscale::Factor(m), &e) == 0.5f && rrcolorscale::Factor(m) != 1.0f);
+    }
     assert(rrvrsconfig::Allowed("VRS@0;123 = true // preserved\n", true, true));
     assert(rrvrsconfig::Allowed("VRS@0;123 = false\n", true, true));
     assert(!rrvrsconfig::Allowed("VRS@0;123 = true\n", false, true));
@@ -1914,6 +1969,31 @@ int main() {
         assert(rrglass::Shape(d, 1));
         assert(!rrglass::Shape(d, 0));
     }
+    // The SSS mask must be the add-on's R16 guide at the lighting extent.
+    D3D12_RESOURCE_DESC lighting{};
+    lighting.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    lighting.Width = 1280;
+    lighting.Height = 720;
+    lighting.DepthOrArraySize = lighting.MipLevels = 1;
+    lighting.SampleDesc.Count = 1;
+    lighting.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    auto mask = lighting;
+    mask.Format = DXGI_FORMAT_R16_FLOAT;
+    assert(rrsssmask::Shape(mask, lighting));
+    assert(!rrsssmask::Shape(lighting, lighting));
+    auto wrong = mask;
+    wrong.Width = 640;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.Height = 360;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.SampleDesc.Count = 4;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.DepthOrArraySize = 4;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    assert(std::string_view(rrsssmask::Label(rrsssmask::State::Active)) == "active");
     // Specular hit distance follows the runtime guide extent, not a fixed resolution.
     D3D12_RESOURCE_DESC h{};
     h.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2145,4 +2225,161 @@ int main() {
     GateTests();
     StatusText();
     SummaryTests();
+
+    // Water responsivity needs preset F, a nonzero strength and this frame's water.
+    rrwater::Settings water;
+    water.responsivity = true;
+    assert(rrwater::UseResponsivity(water, true, true, 6));
+    assert(!rrwater::UseResponsivity(water, false, true, 6));
+    assert(!rrwater::UseResponsivity(water, true, false, 6));
+    for (unsigned preset : {0u, 4u, 5u})
+        assert(!rrwater::UseResponsivity(water, true, true, preset));
+    water.strength = -0.5f; // clamps to 0
+    assert(!rrwater::UseResponsivity(water, true, true, 6));
+    assert(rrwater::Clamp(2.0f) == 1.0f && rrwater::Clamp(0.25f) == 0.25f);
+    assert(rrwater::Clamp(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
+    // A guide mode alone still classifies water, so coverage is logged.
+    water = {};
+    water.guide = rrwater::Material;
+    assert(rrwater::Wanted(water) && !rrwater::Masks(water));
+    water.guide = 99;
+    assert(!rrwater::Wanted(water));
+
+    // Water coverage reports once per interval, only with frames, then starts over.
+    rrwater::Tracker coverage;
+    assert(!coverage.Report(1000, report, water) && coverage.Last() < 0);
+    coverage.Add(25, 100);
+    coverage.Add(0, 100);
+    coverage.Add(5, 0); // no pixels: ignored
+    assert(coverage.Last() == 0.0);
+    water.discard = true;
+    assert(!coverage.Report(1000 + rrwater::Tracker::Interval - 1, report, water));
+    assert(coverage.Report(1000 + rrwater::Tracker::Interval, report, water));
+    assert(report.find("frames=2 waterPixels avg=12.5% max=25.0% framesWithoutWater=1") !=
+           std::string::npos);
+    assert(report.find("responsivity=off(1.00) discard=on animatedMask=off guides=0") !=
+           std::string::npos);
+    report.clear();
+    assert(!coverage.Report(1000 + 2 * rrwater::Tracker::Interval, report, water) &&
+           report.empty() && coverage.Last() == 0.0);
+
+    // Specular hit distance tests: classification, hole filling and the summaries.
+    {
+        using namespace rrhitcond;
+        static_assert(Far == 65504.0f && StatsOffset >= 20 && StatsOffset + 4 * StatCount <= 64);
+        constexpr auto npos = std::string::npos;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        assert(SpecularRay(1u << 20) && !SpecularRay(0xfffffu));
+        assert(DiffuseRay(1u << 8) && !DiffuseRay(0xffu) && !DiffuseRay(0xfff00000u));
+        assert(Classify(2, 0, 0.0f, 0.0f, false) == Sky);
+        assert(Classify(1, 0, 0.5f, 3.0f, false) == Hit);
+        assert(Classify(3, 8, 0.5f, 3.0f, true) == Hit);
+        assert(Classify(1, 0, 0.5f, 0.0f, true) == Miss);
+        assert(Classify(1, 0, 0.5f, nan, true) == Miss);
+        assert(Classify(1, 0, 0.5f, -1.0f, false) == Hole);
+        assert(Classify(1, 0, 0.5f, 0.0f, false) == Hole);
+        assert(Classify(1, Alternate, 0.5f, 3.0f, true) == Leave); // viewmodel
+        assert(Classify(1, NoRtSpecular | 4, 0.5f, 0.0f, true) == Leave);
+        for (unsigned status : {0u, 4u})
+            assert(Classify(status, 0, 0.5f, 3.0f, true) == Leave);
+        assert(Classify(1, 0, 0.0f, 3.0f, true) == Leave); // sky depth without the sky status
+        assert(Classify(1, 0, (std::numeric_limits<float>::max)(), 3.0f, true) == Leave);
+
+        // Slopes: limit 0.04 * 0.5 = 0.02 of device depth.
+        assert(Slope(0.5f, 0.25f, true, 0.75f, true) == 0.25f);        // steep plane
+        assert(Slope(0.5f, 0.25f, true, 0.5078125f, true) == 0.0078125f); // edge before
+        assert(Slope(0.5f, 0.75f, true, 0.4921875f, true) == -0.0078125f); // edge before
+        assert(Slope(0.5f, 0.25f, true, 0.25f, true) == 0.0f);          // 1-px feature
+        assert(Slope(0.5f, 0.25f, true, 1.0f, true) == 0.0f);           // edges both sides
+        assert(Slope(0.5f, 0.4921875f, true, 1.0f, false) == 0.0078125f);
+        assert(Slope(0.5f, 0.25f, true, 1.0f, false) == 0.0f);          // lone edge
+        assert(Slope(0.5f, 0.46875f, true, 1.0f, false) == 0.0f); // steep lone step: not trusted
+        assert(Slope(0.5f, 0.25f, false, 0.5078125f, true) == 0.0078125f);
+        assert(Slope(0.5f, 0.25f, false, 1.0f, false) == 0.0f);
+        assert(SurfaceStatus(1) && SurfaceStatus(3) && !SurfaceStatus(0) && !SurfaceStatus(2) &&
+               !SurfaceStatus(4));
+        assert(SameSurface(0, 0, 1, 0.5f, 0.51f, 0.5f, 1.0f));
+        assert(SameSurface(4, 4, 3, 0.5f, 0.49f, 0.5f, 0.95f));
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.53f, 0.5f, 1.0f)); // off the plane
+        assert(SameSurface(0, 0, 1, 0.5f, 0.53f, 0.52f, 1.0f));  // on a sloped one
+        assert(!SameSurface(0, 4, 1, 0.5f, 0.5f, 0.5f, 1.0f));   // another class
+        assert(!SameSurface(0, 0, 2, 0.5f, 0.5f, 0.5f, 1.0f));   // sky
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.5f, 0.5f, 0.8f));   // bent normal
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.5f, 0.5f, nan));
+        assert(!SameSurface(0, 0, 1, 0.5f, 0.0f, 0.0f, 1.0f));
+        assert(Weight(0, 1) == 0.5f && Weight(1, 1) == 1.0f / 3.0f);
+
+        const unsigned both = SkyMiss | FillHoles;
+        assert(Resolve(Sky, 0.0f, FillHoles, 0, 0, 0) == 0.0f);
+        assert(Resolve(Sky, 0.0f, SkyMiss, 0, 0, 0) == Far);
+        assert(Resolve(Miss, 0.0f, FillHoles, 0, 0, 0) == 0.0f);
+        assert(Resolve(Miss, 0.0f, both, 0, 0, 0) == Far);
+        assert(Resolve(Hit, 12.5f, both, 0, 0, 0) == 12.5f);
+        assert(Resolve(Hit, std::numeric_limits<float>::infinity(), SkyMiss, 0, 0, 0) == Far);
+        assert(Resolve(Hole, 0.0f, SkyMiss, 1.0f, 10.0f, 0.0f) == 0.0f); // fill off
+        assert(Resolve(Hole, 0.0f, FillHoles, 1.0f, 10.0f, 0.5f) == 10.0f);
+        assert(Resolve(Hole, 0.0f, FillHoles, 0.5f, 5.0f, 0.5f) == 10.0f); // ties go to hits
+        assert(FilledAsMiss(0.5f, 1.0f) && !FilledAsMiss(0.5f, 0.5f));
+        assert(Resolve(Hole, 0.0f, FillHoles, 0.5f, 5.0f, 1.0f) == 0.0f);
+        assert(Resolve(Hole, 0.0f, both, 0.5f, 5.0f, 1.0f) == Far);
+        assert(Resolve(Hole, 0.0f, both, 0.0f, 0.0f, 0.0f) == 0.0f); // nothing to fill from
+        assert(Resolve(Leave, 3.0f, both, 1.0f, 10.0f, 0.0f) == 3.0f);
+        assert(Resolve(Leave, 0.0f, both, 0.0f, 0.0f, 1.0f) == 0.0f);
+
+        assert(Mode() == 0);
+        sky_miss = true;
+        assert(Mode() == SkyMiss);
+        fill = true;
+        assert(Mode() == both);
+        sky_miss = false;
+        assert(Mode() == FillHoles);
+        fill = false;
+
+        Diagnostics outcomes;
+        char text[320];
+        outcomes.Observe(Outcome::Off);
+        outcomes.Observe(Outcome::Repeat);
+        assert(!outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(text).find("conditioned=0 surfaceAliased=0 lastSkip=none") !=
+               npos);
+        outcomes.Observe(Outcome::Surface);
+        outcomes.Observe(Outcome::Conditioned);
+        outcomes.Observe(Outcome::Conditioned);
+        outcomes.SurfaceAliased();
+        assert(outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(text).find("conditioned=2 surfaceAliased=1 lastSkip=surface") !=
+               npos);
+        assert(std::string_view(text).find("weights=0 surface=1 context=0") != npos);
+        assert(!outcomes.Summary(text, sizeof(text)));
+        assert(std::string_view(OutcomeName(Outcome::Count)) == "none");
+
+        Tracker pixels;
+        assert(!pixels.Report(1000, report));
+        Frame f{};
+        f[CountSky] = 100;
+        f[CountViewmodel] = f[CountNoRtSpecular] = 50;
+        f[CountHit] = 200;
+        f[CountMiss] = 100;
+        f[CountHole] = 500;
+        f[CountFilledHit] = 250;
+        f[CountFilledMiss] = 50;
+        f[CountHitNoLobe1] = 2;
+        f[CountHitNoLobe2] = 20;
+        f[CountNoRtSpecularHit] = 3;
+        pixels.Add(f, FillHoles, 1000);
+        Frame g = f; // no fill
+        g[CountFilledHit] = g[CountFilledMiss] = 0;
+        pixels.Add(g, SkyMiss, 1100); // 100 more pixels in none of the categories
+        assert(pixels.Pixels(CountHit) == 400 && pixels.Pixels(StatCount) == 0);
+        assert(!pixels.Report(1000 + Tracker::Interval - 1, report));
+        assert(pixels.Report(1000 + Tracker::Interval, report));
+        assert(report.find("(10s): frames=2 skyMissFrames=1 fillFrames=1 | sky=9.5% "
+                           "viewmodel=4.8% noRtSpecular=4.8% other=4.8% surfaces=76.2% | of "
+                           "surfaces: hit=25.0% miss=12.5% noRay=62.5% | of noRay in fill "
+                           "frames: filledFromHits=50.0% "
+                           "filledAsMiss=10.0% | checks: hitWithoutLobe1Ray=1.00% "
+                           "hitWithoutLobe2Ray=10.00% noRtSpecularHits=6") != npos);
+        report.clear();
+        assert(!pixels.Report(1000 + 2 * Tracker::Interval, report) && report.empty());
+    }
 }

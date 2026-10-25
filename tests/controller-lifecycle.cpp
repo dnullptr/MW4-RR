@@ -48,7 +48,63 @@ struct CpuFence final : ID3D12Fence {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{};
+// CPU-only resource double: only its reference count is observed.
+struct CpuResource final : ID3D12Resource {
+    ULONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override {
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++refs;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto n = --refs;
+        if (!n)
+            delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT *, void *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void **) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *, void **) override {
+        return E_NOTIMPL;
+    }
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE *) override {}
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
+        return {};
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        return 0;
+    }
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX *, const void *, UINT,
+                                                 UINT) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void *, UINT, UINT, UINT,
+                                                  const D3D12_BOX *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES *,
+                                                D3D12_HEAP_FLAGS *) override {
+        return E_NOTIMPL;
+    }
+};
+static unsigned releases{}, destroys{}, log_lines{};
+static void CountLog(const char *) {
+    ++log_lines;
+}
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -620,7 +676,153 @@ struct ControllerCpuTest {
             assert(own.ray_gate.Stopped() == Why::StatsMismatch);
         }
     }
+    static void DevTests() {
+        // Off and blocked development tests never touch the device; a blocked
+        // test is reported until its setting changes.
+        Controller c;
+        Controller::DevTest t;
+        assert(!c.UseTest(t, false, 0, 8, 8, DXGI_FORMAT_R16_FLOAT, "test") && !t.active);
+        t.blocked = true;
+        t.changes = 3;
+        assert(!c.UseTest(t, true, 3, 8, 8, DXGI_FORMAT_R16_FLOAT, "test") && t.blocked &&
+               !t.active);
+        assert(c.Test(t, 3, true) == Controller::TestState::Blocked);
+        assert(c.Test(t, 3, false) == Controller::TestState::Idle); // setting turned off
+        assert(c.Test(t, 4, true) == Controller::TestState::Idle);
+        t.blocked = false;
+        t.active = true;
+        assert(c.Test(t, 4, true) == Controller::TestState::Idle); // RR not running
+        // Reconfigure gives back only the reserve the test textures added.
+        c.budget.limit = Budget::Minimum + 300;
+        c.test_reserve = 200;
+        c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
+        c.hit_scratch.active = true;
+        c.applied_color_scale = 4.0f;
+        c.QueueReconfigure();
+        assert(c.Reconfigure());
+        assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
+        assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
+               !c.hit_scratch.active && c.applied_color_scale == 1.0f);
+        c.budget.limit = Budget::Minimum + 50;
+        c.test_reserve = 200;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
+    }
+    static void WeaponDepth() {
+        // The weapon depth test restarts RR only when its setting differs from the depth
+        // type RR was created with. A test that could not run stays off through Reconfigure
+        // until its setting next changes, so it restarts RR once, never over and over.
+        using State = Controller::WeaponState;
+        auto *const created = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        Controller c;
+        rrweapondepth::enabled = true;
+        ++rrweapondepth::changes;
+        assert(c.WeaponDepthWanted() && !c.NeedsReconfigure()); // The next RR takes it.
+        assert(c.WeaponDepthState() == State::Waiting);
+        c.enabled = true;
+        c.feature = created; // Created with hardware depth.
+        assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
+        c.weapon_linear = true;
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Waiting);
+        c.weapon_test.active = true;
+        assert(c.WeaponDepthState() == State::Active);
+        c.logger = CountLog;
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
+        assert(c.WeaponDepthState() == State::Refused && log_lines == 1);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        assert(log_lines == 1); // Frames still in flight repeat the hold; logged once.
+        c.logger = nullptr;
+        c.feature = nullptr; // Released by Reconfigure in the game; no NGX here.
+        c.QueueReconfigure();
+        assert(c.Reconfigure());
+        assert(!c.weapon_linear && !c.weapon_test.active && !c.WeaponDepthWanted());
+        c.feature = created; // Recreated with hardware depth: no second restart.
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Refused);
+        ++rrweapondepth::changes; // Turned off and on again: tried again.
+        assert(c.WeaponDepthWanted() && c.NeedsReconfigure());
+        c.HoldWeaponDepth(Controller::WeaponHold::Memory, rrweapondepth::changes);
+        assert(c.WeaponDepthState() == State::NoMemory && !c.NeedsReconfigure());
+        c.HoldWeaponDepth(Controller::WeaponHold::Projection, rrweapondepth::changes);
+        assert(c.WeaponDepthState() == State::Unsupported);
+        rrweapondepth::enabled = false;
+        ++rrweapondepth::changes;
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Off);
+        c.weapon_linear = true; // Turned off while RR has linear depth: back to hardware depth.
+        assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
+        c.weapon_linear = false;
+        c.feature = nullptr;
+        // While the weapon test runs, its linear depth carries the sky guide test's floor.
+        c.feature = created;
+        c.weapon_linear = c.weapon_test.active = true;
+        rrguidetest::mode = rrguidetest::SkySurface;
+        assert(c.DepthFloorTest() == Controller::TestState::Active);
+        c.weapon_linear = c.weapon_test.active = false;
+        assert(c.DepthFloorTest() == Controller::TestState::Idle);
+        rrguidetest::mode = 0;
+        c.feature = nullptr;
+    }
+    static void HitDistanceTests() {
+        // The hit distance tests record nothing while off and act once on the
+        // single guide recording of a list.
+        using rrhitcond::Outcome;
+        Controller c;
+        rrcompute::Snapshot restore;
+        auto state_of = [](ID3D12Resource *, D3D12_RESOURCE_STATES &) { return false; };
+        auto *weights = new CpuResource;
+        // Never called: slots only compare it with their recording.
+        auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(weights);
+        auto run = [&](ID3D12GraphicsCommandList *cl) {
+            return c.ConditionSpecularDistance(
+                cl, weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, restore, state_of);
+        };
+        auto pending = [&](Outcome expected) {
+            Outcome why{};
+            return !c.HitDistancePending(list, why) && why == expected;
+        };
+        assert(run(list) == Outcome::Off && pending(Outcome::Off)); // no test on
+        rrhitcond::fill = true;
+        assert(run(list) == Outcome::Off); // RR off
+        c.SetEnabled(true);
+        assert(run(list) == Outcome::Off); // hit distance off
+        c.SetSpecularHitEnabled(true);
+        assert(run(nullptr) == Outcome::Off);
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot));
+        auto &s = c.slots[0], &other = c.slots[1];
+        s.generation = other.generation = c.generation;
+        s.pre_live = true;
+        s.pre.Attach(list);
+        Outcome why{};
+        assert(c.HitDistancePending(list, why));
+        assert(run(list) == Outcome::NoCopy);
+        // A guide test that replaces normals leaves the fill out.
+        s.gpu.guide_test = rrguidetest::FaceCamera;
+        assert(run(list) == Outcome::Off);
+        rrhitcond::sky_miss = true;
+        assert(run(list) == Outcome::NoCopy);
+        rrhitcond::sky_miss = false;
+        s.gpu.guide_test = rrguidetest::FlipBackFaces;
+        assert(run(list) == Outcome::NoCopy);
+        s.gpu.hit_ready = true;
+        s.gpu.specular_hit = weights;
+        assert(run(list) == Outcome::Weights); // not a 2D texture
+        other.pre_live = true;
+        other.pre.Attach(list);
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot)); // two on one list
+        other.pre.Detach();
+        other.pre_live = false;
+        s.hit_conditioned = true;
+        assert(run(list) == Outcome::Repeat && pending(Outcome::Repeat));
+        c.hit_condition_failed = true;
+        assert(run(list) == Outcome::Off);
+        s.pre.Detach();
+        rrhitcond::fill = false;
+        weights->Release();
+    }
     static void Run() {
+        DevTests();
+        WeaponDepth();
+        HitDistanceTests();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);
@@ -891,6 +1093,48 @@ struct ControllerCpuTest {
         assert(startup.PresetStatus().pending &&
                !startup.NeedsReconfigure()); // Await creation without blocking producers.
         assert(startup.RequestPreset(0) && startup.Reconfigure());
+        // Running water tests: settings are clamped, and the panel only reports
+        // a mask the latest evaluation sent that would still be sent now.
+        Controller water;
+        rrwater::Settings wet;
+        wet.responsivity = true;
+        wet.strength = 3.0f;
+        wet.guide = 7;
+        water.SetWater(wet);
+        assert(water.water.strength == 1.0f && water.water.guide == rrwater::Mirror);
+        auto wet_status = water.WaterStatus();
+        assert(wet_status.wanted && !wet_status.ready && !wet_status.unavailable &&
+               !wet_status.responsivity && wet_status.coverage < 0);
+        water.water_status.ready = water.water_status.responsivity = true;
+        water.water_status.discard = true;
+        assert(!water.WaterStatus().ready); // RR is off
+        water.SetEnabled(true);
+        assert(water.WaterStatus().ready && !water.WaterStatus().responsivity); // no preset yet
+        water.preset.Created();
+        wet_status = water.WaterStatus();
+        assert(wet_status.ready && wet_status.responsivity && !wet_status.discard);
+        wet.discard = true;
+        water.SetWater(wet);
+        assert(water.WaterStatus().discard);
+        // Water storage waits for a first SR allocation and for the retry
+        // window; a shortage then waits again without failing the tests.
+        GpuFrame dry;
+        assert(!water.PrepareWater(dry, 1000) && water.water_retry_after == 0);
+        dry.rr_output.Attach(new CpuResource);
+        water.water_retry_after = 2000;
+        assert(water.WaterStatus().waiting_memory);
+        assert(!water.PrepareWater(dry, 1999) && water.water_retry_after == 2000);
+        assert(!water.PrepareWater(dry, 2000) && water.water_retry_after == 3000); // no device
+        assert(!water.water_failed && water.WaterStatus().waiting_memory);
+        water.SetEnabled(false);
+        assert(!water.WaterStatus().waiting_memory); // nothing retries while RR is off
+        water.SetEnabled(true);
+        water.SetWater({});
+        assert(water.water_retry_after == 0);
+        water.SetWater(wet);
+        water.water_failed = true;
+        wet_status = water.WaterStatus();
+        assert(wet_status.unavailable && !wet_status.ready);
         Controller c;
         c.SetEnabled(true);
         c.SetSssEnabled(true);
@@ -970,6 +1214,65 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.PresetStatus().pending && c.Reconfigure());
         assert(!c.initialized && c.selected_view == UINT_MAX && !c.layout_pending);
+
+        // Only an admitted SR submission hands its SSS guide to masked lighting,
+        // for the next MaxAge frames of the same generation and extent. A rejected
+        // resolve of that guide, an SSS toggle or a rebuild releases it.
+        auto *guide = new CpuResource;
+        {
+            Controller masked;
+            masked.SetEnabled(true);
+            masked.SetSssEnabled(true);
+            auto &producer = masked.slots[1];
+            producer.frame = 10;
+            producer.generation = masked.generation;
+            producer.gpu.sss.guide = guide;
+            auto &ms = masked.slots[0];
+            ms.generation = masked.generation;
+            ms.pre_live = ms.native_sampling = true;
+            ms.frame = 11;
+            assert(!masked.SssMask(nullptr));
+            masked.SealSssMask(producer, false);
+            assert(!masked.SssMask(nullptr));
+            masked.SealSssMask(producer, true);
+            unsigned age{};
+            assert(masked.SssMask(nullptr, &age).Get() == guide && age == 1);
+            ms.frame = 10 + rrsssmask::MaxAge;
+            assert(masked.SssMask(nullptr, &age).Get() == guide && age == rrsssmask::MaxAge);
+            ms.frame = 11 + rrsssmask::MaxAge;
+            assert(!masked.SssMask(nullptr));
+            ms.frame = 10;
+            assert(!masked.SssMask(nullptr));
+            ms.frame = 11;
+            ms.gpu.w = 8;
+            assert(!masked.SssMask(nullptr));
+            ms.gpu.w = 0;
+            ms.pending_sr = true;
+            assert(!masked.SssMask(nullptr));
+            ms.pending_sr = false;
+            ms.native_sampling = false;
+            assert(!masked.SssMask(nullptr));
+            ms.native_sampling = true;
+            assert(masked.SssMask(nullptr));
+            masked.SealSssMask(producer, false);
+            assert(!masked.SssMask(nullptr) && !masked.sss_mask.valid && !masked.sss_mask_guide);
+            masked.SealSssMask(producer, true);
+            masked.SetSssEnabled(false);
+            assert(!masked.SssMask(nullptr) && !masked.sss_mask_guide);
+            masked.SetSssEnabled(true);
+            masked.SealSssMask(producer, true);
+            assert(masked.SssMask(nullptr));
+            masked.SetEnabled(false);
+            masked.SetEnabled(true);
+            ms.generation = masked.generation;
+            assert(!masked.SssMask(nullptr)); // Recorded under the previous generation.
+            ms.pre_live = false;
+            masked.QueueReconfigure();
+            assert(masked.Reconfigure());
+            assert(!masked.sss_mask.valid && !masked.sss_mask_guide);
+        }
+        assert(guide->refs == 1);
+        guide->Release();
         RayBudget();
     }
 };

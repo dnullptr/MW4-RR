@@ -60,32 +60,48 @@ def main():
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
         # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio,
-        # 4th-half source.
+        # 4th-half source, SSS guide mask.
         *[(f'RRVrrtScale{name}{suffix}',
            compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
                         flags=('-Ges', '-D', f'RR_NATIVE_LOBE={mask}', '-D', f'RR_NATIVE_FILL={fill}',
-                               '-D', f'RR_CAP_RATIO={cap}', '-D', f'RR_W_SOURCE={w}', *extra)), False)
-          for name, mask, fill, cap, w in (('Native1', 1, 0, 0, 0), ('Native2', 2, 0, 0, 0),
-                                           ('Fill2', 2, 1, 0, 0), ('Fill3', 3, 1, 0, 0),
-                                           ('Cap8', 0, 0, 8, 0), ('Cap4', 0, 0, 4, 0),
-                                           ('WFill', 0, 0, 0, 1), ('WNative', 0, 0, 0, 2))
+                               '-D', f'RR_CAP_RATIO={cap}', '-D', f'RR_W_SOURCE={w}',
+                               '-D', f'RR_SSS_MASK={sss}', *extra)), False)
+          for name, mask, fill, cap, w, sss in (('Native1', 1, 0, 0, 0, 0), ('Native2', 2, 0, 0, 0, 0),
+                                                ('Fill2', 2, 1, 0, 0, 0), ('Fill3', 3, 1, 0, 0, 0),
+                                                ('Cap8', 0, 0, 8, 0, 0), ('Cap4', 0, 0, 4, 0, 0),
+                                                ('WFill', 0, 0, 0, 1, 0), ('WNative', 0, 0, 0, 2, 0),
+                                                ('SssNative2', 2, 0, 0, 0, 1), ('SssFill2', 2, 1, 0, 0, 1),
+                                                ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
+    # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and
+    # R32_FLOAT lighting weights.
+    header(out / 'rr_hit_condition.generated.h', [
+        ('RRHitCondition', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition'), False),
+        ('RRHitConditionFloat', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition_float',
+                                             flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
+    # Running water test masks (src/rr_water.h).
+    header(out / 'rr_water_masks.generated.h', [
+        ('RRWaterMasks', compile_hlsl('rr_water_masks.hlsl', 'rr_water_masks'), False)])
     for source, entry, symbol, leaf in [
         ('rr_convert_guides.hlsl', 'main', 'RRGuideShader', 'rr_convert_guides'),
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
         ('rr_live_gate.hlsl', 'Validate', 'RRLiveValidate', 'rr_live_validate'),
-        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display')]:
+        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
+        ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask'),
+        ('rr_sky_depth_floor.hlsl', 'main', 'RRSkyDepthFloor', 'rr_sky_depth_floor'),
+        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth'),
+        ('rr_color_scale.hlsl', 'main', 'RRColorScale', 'rr_color_scale')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)
     # Guide test variants (src/rr_guide_test.h).
-    for test in range(1, 7):
+    for test in range(1, 10):
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', 'main', '/D', f'RR_GUIDE_TEST={test}',
                         '/Fh', str(out / f'rr_convert_guides_test{test}.generated.h'),
                         '/Vn', f'RRGuideShaderTest{test}',
