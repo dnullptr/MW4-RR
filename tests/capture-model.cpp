@@ -270,6 +270,22 @@ static void FinishedTransitions() {
     assert(s.state == State::Failed && s.message == "disk full");
 }
 
+static void FailIgnoredWhileWriting() {
+    Seq s = Collecting();
+    for (unsigned i = 0; i < Frames; ++i)
+        Done(s, Make(40 + i, s.Take()));
+    assert(s.Settle().size() == Frames && s.state == State::Writing);
+    Done(s, Make(48, 9)); // Queued while the writer runs.
+    s.Fail("too late");   // The writer owns this session's outcome.
+    assert(s.state == State::Writing && s.message.empty() && s.completed.size() == 1);
+    s.attempts = MaxAttempts;
+    assert(!s.Count() && s.state == State::Writing && s.message.empty());
+    s.Finished(false, "disk full");
+    assert(s.state == State::Failed && s.message == "disk full");
+    s.Fail("again"); // Outside Writing, Fail still applies.
+    assert(s.state == State::Failed && s.message == "again" && s.completed.empty());
+}
+
 // Like a ComPtr that is moved around: explicit bool, released when the last owner goes.
 struct Handle {
     static inline int live = 0;
@@ -348,6 +364,60 @@ static void Packing() {
         assert(packed[i] == want[i]);
     r.height = 0;
     PackRows(buffer, r, [&](const unsigned char *, std::uint64_t) { assert(false); });
+}
+
+static void RegionBounds() {
+    // 3 x 2 texels of 2 bytes, 8-byte rows, 5 bytes in: PackRows reads bytes 5..18.
+    Region r;
+    r.present = true;
+    r.width = 3;
+    r.height = 2;
+    r.bytes_per_pixel = 2;
+    r.offset = 5;
+    r.pitch = 8;
+    assert(Fits(r, 19) && Fits(r, 1000) && !Fits(r, 18) && !Fits(r, 0));
+    r.height = 1; // One row: the pitch is never stepped.
+    assert(Fits(r, 11) && !Fits(r, 10));
+    r.pitch = 6; // Pitch equal to the row is tight packing.
+    r.height = 2;
+    assert(Fits(r, 17) && !Fits(r, 16));
+    r.pitch = 5; // Rows would overlap.
+    assert(!Fits(r, 1000));
+    r.pitch = 8;
+    const std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+    Region empty = r;
+    empty.present = false;
+    assert(!Fits(empty, 1000) && !Fits(empty, max));
+    empty = r;
+    empty.width = 0;
+    assert(!Fits(empty, 1000) && !Fits(empty, max));
+    empty = r;
+    empty.height = 0;
+    assert(!Fits(empty, 1000) && !Fits(empty, max));
+    empty = r;
+    empty.bytes_per_pixel = 0;
+    assert(!Fits(empty, 1000) && !Fits(empty, max));
+    // Sums that would wrap around 64 bits never fit.
+    Region big = r;
+    big.offset = max - 2;
+    assert(!Fits(big, max));
+    big.offset = max - 6; // The first row fits exactly; the second wraps.
+    big.height = 1;
+    assert(Fits(big, max));
+    big.height = 2;
+    assert(!Fits(big, max));
+    big = r;
+    big.pitch = max / 2 + 1; // pitch * (height - 1) alone wraps.
+    big.height = 3;
+    assert(!Fits(big, max));
+    big.height = 2; // Reads up to 5 + pitch + 6, which is below 2^64.
+    assert(Fits(big, max) && Fits(big, 11 + big.pitch) && !Fits(big, 10 + big.pitch));
+    big.width = 0xffffffffu;
+    big.bytes_per_pixel = 0xffffffffu;
+    big.pitch = max;
+    big.height = 1;
+    big.offset = 0;
+    assert(Fits(big, max) && !Fits(big, std::uint64_t(0xffffffffu) * 0xffffffffu - 1));
 }
 
 static void Names() {
@@ -684,8 +754,10 @@ int main(int argc, char **argv) {
     FailDropsLater();
     CountOverflow();
     FinishedTransitions();
+    FailIgnoredWhileWriting();
     MoveOnlyBuffers();
     Packing();
+    RegionBounds();
     Names();
     Json();
     JsonNumberMatchesPrintf();

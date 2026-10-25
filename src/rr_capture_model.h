@@ -118,6 +118,14 @@ template <class Write> void PackRows(const unsigned char *base, const Region &r,
     for (unsigned y = 0; y < r.height; ++y)
         write(base + r.offset + y * r.pitch, row_bytes);
 }
+// True when every byte PackRows reads from a present, non-empty region lies within bytes.
+inline bool Fits(const Region &r, std::uint64_t bytes) {
+    const std::uint64_t row = std::uint64_t(r.width) * r.bytes_per_pixel;
+    if (!r.present || !row || !r.height || r.pitch < row || r.offset > bytes ||
+        row > bytes - r.offset)
+        return false;
+    return r.height == 1 || r.pitch <= (bytes - r.offset - row) / (r.height - 1);
+}
 
 inline void JsonNumber(std::string &out, double v) {
     if (!std::isfinite(v)) {
@@ -414,6 +422,8 @@ template <class F> class Sequence {
         return done;
     }
     void Fail(std::string why) {
+        if (state == State::Writing)
+            return; // A writer owns this session's outcome; only Finished ends it.
         state = State::Failed;
         message = std::move(why);
         run.clear();
