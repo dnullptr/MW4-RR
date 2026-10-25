@@ -94,12 +94,12 @@ int main() {
             assert((ok == 4) == rrsr::Eligible(q) && ok >= 3);
         }
     // A short buffer keeps a terminated prefix; an empty one is left alone.
-    char small[12];
-    rrsr::Describe(p, small, sizeof(small));
-    assert(!strcmp(small, "color 0x40 "));
-    small[0] = 'x';
-    rrsr::Describe(p, small, 0);
-    assert(small[0] == 'x');
+    char short_text[12];
+    rrsr::Describe(p, short_text, sizeof(short_text));
+    assert(!strcmp(short_text, "color 0x40 "));
+    short_text[0] = 'x';
+    rrsr::Describe(p, short_text, 0);
+    assert(short_text[0] == 'x');
     auto a = rrspatial::Coordinate(0, 2, 4);
     assert(a.first == 0 && a.second == 1 && a.fraction == 0);
     a = rrspatial::Coordinate(1, 2, 4);
