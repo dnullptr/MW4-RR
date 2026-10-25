@@ -26,15 +26,18 @@ float3 Opacity(int2 q) {
     return saturate(o);
 }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    [branch] if (Admitted != 1)
-        return; // submission-time gate: never read coverage of an unadmitted frame
+    // Submission-time gate. Admitted lives in an upload-heap CBV that the CPU writes, and every
+    // wave loads it on its own, so both barriers stay unconditional: a word rewritten while the
+    // dispatch is in flight must not leave part of a group waiting at a barrier the rest skipped.
+    // Unadmitted, no thread reads or writes a resource (inside is false, Stats stays untouched).
+    const bool admitted = Admitted == 1u;
     if (gi == 0) {
         g_eligible = 0;
         g_covered = 0;
         g_opacity = 0;
     }
     GroupMemoryBarrierWithGroupSync();
-    const bool inside = id.x < Width && id.y < Height;
+    const bool inside = admitted && id.x < Width && id.y < Height;
     const uint status = inside ? Status[id.xy] : 0u;
     const bool eligible = status == 1u || status == 3u || (status == 2u && (Flags & 1u));
     float3 c = 0;
@@ -73,7 +76,10 @@ float3 Opacity(int2 q) {
                 NormalRoughness[id.xy] = n;
             }
         }
-        if (debug) { // opacity as diffuse, specular black; uncovered eligible pixels show black
+        // Debug: opacity as diffuse, specular black; uncovered eligible pixels show black. It runs
+        // after the normal blend, so roughness is still blended here when the roughness flag is
+        // set, as in rrblend::Reference.
+        if (debug) {
             d.rgb = c;
             s.rgb = 0;
         }
@@ -84,11 +90,13 @@ float3 Opacity(int2 q) {
         InterlockedAdd(g_eligible, 1u);
     if (covered) {
         InterlockedAdd(g_covered, 1u);
+        // At most 64 per pixel: the uint32 sum is exact up to 2^26 covered pixels (8192x8192),
+        // well above 4K (3840x2160).
         InterlockedAdd(g_opacity, uint(round(dot(c, kLuma) * 64.0)));
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0) {
-        if (id.x == 0 && id.y == 0)
+        if (admitted && id.x == 0 && id.y == 0)
             Stats.Store(0, 1u);
         if (g_eligible) Stats.InterlockedAdd(4, g_eligible);
         if (g_covered) Stats.InterlockedAdd(8, g_covered);
