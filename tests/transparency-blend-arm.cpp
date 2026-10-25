@@ -50,6 +50,10 @@ static void NullList() {
     assert(!latch.Take(nullptr, out) && !out.held);
     latch.Set(&a, {held, 1});
     assert(!latch.Take(nullptr, out) && !latch.Armed() && held.use_count() == 1);
+    // A later event on a null list disarms an earlier arm.
+    latch.Set(&a, {held, 1});
+    latch.Set(nullptr, {held, 2});
+    assert(!latch.Armed() && held.use_count() == 1 && !latch.Take(&a, out) && !out.held);
 }
 
 // A new event replaces the previous arm; Clear drops it.
