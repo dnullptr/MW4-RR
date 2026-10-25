@@ -455,9 +455,11 @@ int main() {
     std::string report;
     assert(!health.Report(1000, report));
     assert(shown.presents == 0 && shown.fg_evaluations == 0);
-    health.Frame({0, 1, 0, 0});
-    health.Frame({0, 1, 12, 0}, {3, 0, true, false, true, false});
-    health.Frame({1, 0, 0, 30}, {1, 7, true, true, false, true});
+    // Each guide gets its own count (sss 4, glass 1, hit 2, responsivity 3), so a swap shows.
+    health.Frame({0, 1, 0, 0}, {0, 0, true, false, false, true});
+    health.Frame({0, 1, 12, 0}, {3, 0, true, false, true, true});
+    health.Frame({1, 0, 0, 30}, {1, 7, true, true, true, true});
+    health.Frame({0, 1, 0, 0}, {0, 0, true, false, false, false});
     health.Reset(rrlive::HistoryPolicy::Rejected | rrlive::HistoryPolicy::Gap);
     shown.presents += 16;
     shown.unfocused_presents += 5;
@@ -466,11 +468,11 @@ int main() {
     assert(!health.Report(1000 + rrhealth::Tracker::Interval - 1, report));
     assert(shown.presents == 16);
     assert(health.Report(1000 + rrhealth::Tracker::Interval, report));
-    assert(report.find("frames=3 rejected=1 resets=1") != std::string::npos);
+    assert(report.find("frames=4 rejected=1 resets=1") != std::string::npos);
     assert(report.find("[rejected=1 cut=0 generation=0 gap=1]") != std::string::npos);
     assert(report.find("isolatedGuideFrames=1 maxIsolatedPixels=12") != std::string::npos);
     assert(report.find("sanitizedSssFrames=1 maxSanitizedSamples=30") != std::string::npos);
-    assert(report.find("maxSanitizedSamples=30 guides[sss=2 glass=1 hit=1 responsivity=1] "
+    assert(report.find("maxSanitizedSamples=30 guides[sss=4 glass=1 hit=2 responsivity=3] "
                        "nonFiniteColorFrames=2 maxNonFiniteColorPixels=3 "
                        "nonFiniteOutputFrames=1 maxNonFiniteOutputPixels=7 presents=16 "
                        "unfocusedPresents=5 focused=1 fgEvaluations=12") != std::string::npos);

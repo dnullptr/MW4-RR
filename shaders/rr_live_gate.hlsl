@@ -1,4 +1,5 @@
 #include "../src/rr_spatial_fallback.h"
+#include "../src/rr_gate_stats.h"
 // Private full-frame presentation gate. Persistent state is initialized once
 // outside replayable game recordings. A replayed reset must never clear it.
 cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength,OutputScale;uint2 Unused;}
@@ -8,8 +9,9 @@ Texture2D<float4> CurrentColor:register(t2);
 RWTexture2D<float4> GameOutput:register(u0);
 // Stats bytes: 0 bad frame, 4 copied frame, 8 isolated guide pixels, 12 sanitized SSS samples,
 // 16 water pixels (rr_water_masks.hlsl), 20..63 hit distance statistics (rr_hit_condition.hlsl),
-// 64..227 ray density (rr_vrrt_probability.hlsl), 228 non-finite color pixels RR receives,
-// 232 non-finite RR output pixels.
+// 64..227 ray density (rr_vrrt_probability.hlsl), then rr_gate_stats.h: 228 non-finite color
+// pixels RR receives, 232 non-finite pixels of the RR output Display shows (none on a frame
+// it rejects or blocks).
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
 // Flags bit0: tolerate isolated unusable guide pixels. Each such pixel keeps
@@ -32,14 +34,16 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  // One unconditional write also avoids FXC dropping an initial zero store
  // when later branches conditionally overwrite the same raw buffer address.
  Stats.Store4(0,uint4(bad,0,0,0));
- Stats.Store2(228,uint2(0,0)); // not 16..227: the water, hit distance and density passes zero those
+ // Not 16..227: the water, hit distance and density passes zero those. The density pass's
+ // zero copy covers 228..255 too, from the slot's pre list, which runs before this.
+ Stats.Store2(RR_STATS_NON_FINITE_COLOR,uint2(0,0));
 }
 [numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){
  if(id.x>=RenderW||id.y>=RenderH)return;
  uint old;
  // Counted only: the game's color (slot 10) at its subrect, as Display's fallback reads it.
  float3 color=CurrentColor.Load(int3(ColorX+id.x,ColorY+id.y,0)).rgb;
- if(!Finite3(color))Stats.InterlockedAdd(228,1,old);
+ if(!Finite3(color))Stats.InterlockedAdd(RR_STATS_NON_FINITE_COLOR,1,old);
  uint status=Status.Load(int3(id.xy,0));
  if(status>=1&&status<=3)return;
  if(status==4&&(Flags&TolerateIsolated)!=0){Stats.InterlockedAdd(8,1,old);return;}
@@ -62,7 +66,7 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
   return;
  }
  float3 color=Reconstructed.Load(int3(id.xy,0)).rgb;
- if(!Finite3(color)){uint old;Stats.InterlockedAdd(232,1,old);}
+ if(!Finite3(color)){uint old;Stats.InterlockedAdd(RR_STATS_NON_FINITE_OUTPUT,1,old);}
  // Color scale test (rr_color_scale.h): undo the scale on RR's input. 0 = off.
  if(OutputScale>0)color*=OutputScale;
  GameOutput[id.xy]=float4(color,1);

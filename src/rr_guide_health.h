@@ -6,7 +6,8 @@
 #include <string>
 namespace rrhealth {
 // What one RR evaluation was given and produced: the gate's non-finite pixel counts in the
-// color RR received and in RR's output, and the optional guides that were bound.
+// color RR received and in the RR output the gate displayed (none if rejected or blocked), and
+// the optional guides that were bound.
 struct Evaluation {
     std::uint32_t non_finite_color{}, non_finite_output{};
     bool sss{}, glass{}, hit{}, responsivity{};
@@ -70,7 +71,7 @@ class Tracker {
         if (now < since || now - since < Interval)
             return false;
         const bool active = frames || resets;
-        const auto shown = Take();
+        const auto taken = Take();
         if (active) {
             char text[640];
             std::snprintf(text, sizeof(text),
@@ -87,8 +88,8 @@ class Tracker {
                           isolated_max, sanitized_frames, sanitized_max, sss_frames, glass_frames,
                           hit_frames, responsivity_frames, non_finite_color_frames,
                           non_finite_color_max, non_finite_output_frames, non_finite_output_max,
-                          shown[0], shown[1],
-                          presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, shown[2]);
+                          taken[0], taken[1],
+                          presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, taken[2]);
             out = text;
         }
         *this = {};

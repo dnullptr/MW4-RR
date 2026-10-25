@@ -76,13 +76,18 @@ static const char *PresetLabel(unsigned value) {
             return rrpreset::names[i];
     return "Unknown";
 }
+// The game window has the focus. Lock-free: OnPresent tests it before any lock.
+static bool Foreground() {
+    DWORD foreground{};
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    return foreground == GetCurrentProcessId();
+}
 static void OnRuntime(reshade::api::effect_runtime *runtime) {
     Observer().Poll();
     {
         std::lock_guard lock(settings_mutex);
         LoadSettings();
-        DWORD foreground{};
-        GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+        const bool foreground = Foreground();
         static bool down[3]{};
         const int keys[] = {VK_F8, VK_F9, VK_F11};
         const bool ctrl_or_alt = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
@@ -90,8 +95,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         bool changed = false;
         for (unsigned i = 0; i < 3; ++i) {
             const bool pressed = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt,
-                                          foreground == GetCurrentProcessId())) {
+            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt, foreground)) {
                 if (i == 0)
                     requested_rr = !requested_rr;
                 else if (i == 1)
@@ -106,7 +110,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         // Its down and up arrive together, too briefly to poll, so ReShade's key messages are
         // read; both in one frame show as released. A second request is ignored while active.
         if (runtime && (runtime->is_key_pressed(VK_PAUSE) || runtime->is_key_released(VK_PAUSE)) &&
-            foreground == GetCurrentProcessId() && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+            foreground && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
             !(GetAsyncKeyState(VK_MENU) & 0x8000))
             LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
         if (changed) {
@@ -133,9 +137,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
 }
 // Every present, before OnRuntime takes any lock: lock-free counts for the RR health line.
 static void OnPresent(reshade::api::effect_runtime *runtime) {
-    DWORD foreground{};
-    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
-    const bool focused = foreground == GetCurrentProcessId();
+    const bool focused = Foreground();
     auto &shown = rrhealth::presentation;
     shown.presents.fetch_add(1, std::memory_order_relaxed);
     if (!focused)

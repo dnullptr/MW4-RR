@@ -46,7 +46,7 @@ class Controller {
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
         bool guides_withheld{};
-        bool responsivity_used{}; // RR was given a responsivity mask (sky edge test or SSS)
+        bool responsivity_used{}; // RR was given a responsivity mask (sky edge test, water or SSS)
         GpuFrame gpu;
         bool busy{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
@@ -508,8 +508,9 @@ class Controller {
         for (auto &s : slots) {
             if (s.recorded && s.sealed && !s.reported && Complete(s)) {
                 auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
-                const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
                 s.reported = true;
+                // After reported, as the readers below: a failed map is then reported once.
+                const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
                 const bool sss = s.sss_used && !s.guides_withheld && s.sss.admission.accepted;
                 const bool glass =
                     s.transparency_used && !s.guides_withheld && s.transparency_accepted;
