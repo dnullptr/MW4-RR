@@ -27,6 +27,11 @@
 #else
 #define RR_ANIMATED_TEXTURE_MASK_KEY "AnimatedTextureMask"
 #endif
+#ifdef NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#define RR_FREE_MEM_ON_RELEASE_KEY NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#else
+#define RR_FREE_MEM_ON_RELEASE_KEY "FreeMemOnReleaseFeature"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -69,9 +74,9 @@ inline constexpr int CreationFlags(int game_flags, bool linear_depth = false) {
            ~(linear_depth ? int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : 0);
 }
 static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) == 64 && CreationFlags(75) == 11);
-static_assert(CreationFlags(11) == 11 && CreationFlags(0x1bf) == 0x1bf && CreationFlags(64) == 0);
+static_assert(CreationFlags(11) == 11 && CreationFlags(0x1ff) == 0x1bf && CreationFlags(64) == 0);
 static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) == 8 && CreationFlags(75, true) == 3);
-static_assert(CreationFlags(11, true) == 3 && CreationFlags(0x1bf, true) == 0x1b7 &&
+static_assert(CreationFlags(11, true) == 3 && CreationFlags(0x1ff, true) == 0x1b7 &&
               CreationFlags(3, true) == 3);
 
 // linear_depth: RR reads view-space depth (the weapon depth test, src/rr_weapon_depth.h)
@@ -89,7 +94,7 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
     p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, CreationFlags(v.flags, linear_depth));
     // A released feature frees its VRAM instead of staying cached in NGX (Streamline does too).
-    p.Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
+    p.Set(RR_FREE_MEM_ON_RELEASE_KEY, 1);
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));

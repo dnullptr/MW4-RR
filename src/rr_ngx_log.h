@@ -17,6 +17,8 @@
 #include <type_traits>
 #include "rr_ngx_api.h"
 #include "rr_evaluation_params.h"
+#include "rr_settings_model.h"
+#include "rr_trace_model.h"
 // What RR was created with, which runtime ran it, and NGX's result codes. Nothing here runs per
 // frame: creation attempts, retirement and inference failures only.
 namespace rrngxlog {
@@ -74,12 +76,19 @@ struct Code {
         snprintf(text, sizeof(text), "0x%08X %s", code, ResultName(code));
     }
 };
-// rrprivate::Require with the NGX result appended: "<what>: <code>".
-inline void Require(bool valid, const char *what, unsigned code) {
+// A call that hands back an object: NGX's code, or "null handle" when it succeeded without one.
+inline Code Returned(unsigned code, const void *object) {
+    Code c(code);
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_Result(code)) && !object)
+        snprintf(c.text, sizeof(c.text), "null handle");
+    return c;
+}
+// rrprivate::Require with the call's outcome appended: "<what>: <outcome>".
+inline void Require(bool valid, const char *what, const Code &outcome) {
     if (valid)
         return;
     char line[160];
-    snprintf(line, sizeof(line), "%s: %s", what, Code(code).text);
+    snprintf(line, sizeof(line), "%s: %s", what, outcome.text);
     throw std::runtime_error(line);
 }
 
@@ -116,14 +125,12 @@ inline bool ModuleVersion(HMODULE m, unsigned (&v)[4]) {
     const void *data = g ? LockResource(g) : nullptr;
     return data && FixedFileVersion(data, bytes, v);
 }
-// The probe's rule (rr_trace.h Probe::Poll): the app's nvngx_dlssd.dll or an NGX model update.
+// The probe's rule (rrtrace::RrModelPath), for a path in any case.
 inline bool ModelPath(const wchar_t *path) {
     wchar_t lower[MAX_PATH]{};
     for (size_t i = 0; path[i] && i + 1 < MAX_PATH; ++i)
         lower[i] = static_cast<wchar_t>(towlower(path[i]));
-    const wchar_t *leaf = wcsrchr(lower, L'\\');
-    leaf = leaf ? leaf + 1 : lower;
-    return wcscmp(leaf, L"nvngx_dlssd.dll") == 0 || wcsstr(lower, L"\\ngx\\models\\dlssd\\");
+    return rrtrace::RrModelPath(lower);
 }
 
 struct Adapter {
@@ -248,32 +255,37 @@ inline void DescribeCapability(const Capability &c, char *out, size_t size) {
              "RR capability: available=%s needsUpdatedDriver=%s minDriver=%s.%s featureInit=%s",
              field[0], field[1], field[2], field[3], c.init ? init.text : "?");
 }
-// Queries, reads and destroys the capability map. False when the runtime lacks the export.
-inline bool CapabilityLine(const rreval::Api &api, char *out, size_t size) {
-    if (!api.capabilities)
-        return false;
+// Queries, reads and destroys the capability map; a failed query or a missing export has its own
+// line, so the capability flags are never left unread without a trace.
+inline void CapabilityLine(const rreval::Api &api, char *out, size_t size) {
+    if (!api.capabilities) {
+        snprintf(out, size, "RR capability: export missing");
+        return;
+    }
     NVSDK_NGX_Parameter *map{};
     const auto result = api.capabilities(&map);
-    if (NVSDK_NGX_FAILED(result) || !map) {
-        snprintf(out, size, "RR capability query failed: %s", Code(result).text);
-        return true;
-    }
-    DescribeCapability(ReadCapability(*map), out, size);
-    if (api.destroy)
+    if (NVSDK_NGX_FAILED(result) || !map)
+        snprintf(out, size, "RR capability query failed: %s", Returned(result, map).text);
+    else
+        DescribeCapability(ReadCapability(*map), out, size);
+    // The caller owns the map, even one handed back with a failure.
+    if (map && api.destroy)
         api.destroy(map);
-    return true;
 }
-// "RR created: preset F, quality 1, flags 75 -> 11, render 2224x1248, output 3840x2160": the
-// game's flags, then the ones RR got (linear_depth: created for the weapon depth test).
+// "RR created: preset F, quality 1 (Balanced), flags 75 -> 11, render 2224x1248, output
+// 3840x2160": the game's flags, then the ones RR got (linear_depth: the weapon depth test).
 inline void DescribeCreation(const rreval::Options &o, unsigned preset, bool linear_depth,
                              char *out, size_t size) {
     const char *name = "unknown";
     for (size_t i = 0; i < std::size(rrpreset::values); ++i)
         if (rrpreset::values[i] == preset)
             name = rrpreset::names[i];
+    // The panel's names; NGX has no quality past DLAA (5).
+    const char *quality =
+        o.quality >= 0 && o.quality <= 5 ? rrsettings::QualityLabel(o.quality) : "unknown";
     snprintf(out, size,
-             "RR created: preset %s, quality %d, flags %d -> %d, render %ux%u, output %ux%u", name,
-             o.quality, o.flags, rreval::CreationFlags(o.flags, linear_depth), o.width, o.height,
-             o.out_width, o.out_height);
+             "RR created: preset %s, quality %d (%s), flags %d -> %d, render %ux%u, output %ux%u",
+             name, o.quality, quality, o.flags, rreval::CreationFlags(o.flags, linear_depth),
+             o.width, o.height, o.out_width, o.out_height);
 }
 } // namespace rrngxlog

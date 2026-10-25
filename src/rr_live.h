@@ -155,7 +155,7 @@ class Controller {
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
-    // A successful creation's runtime, logged by Poll after it releases the mutex: module and DXGI
+    // A creation attempt's runtime, logged by Poll after it releases the mutex: module and DXGI
     // queries never run under it. The probe pins the NGX core module.
     struct RuntimeReport {
         HMODULE core{};
@@ -369,7 +369,8 @@ class Controller {
                (weapon_hold == WeaponHold::None ||
                 weapon_hold_changes != rrweapondepth::changes.load(std::memory_order_relaxed));
     }
-    void HoldWeaponDepth(WeaponHold why, unsigned changes) {
+    // outcome (Refused): why NGX refused, an rrngxlog::Code text, "null handle" or "threw".
+    void HoldWeaponDepth(WeaponHold why, unsigned changes, const char *outcome = nullptr) {
         // Frames already in flight on the same RR repeat the same hold: log it once.
         if (weapon_hold == why && weapon_hold_changes == changes)
             return;
@@ -379,9 +380,14 @@ class Controller {
         if (why == WeaponHold::Projection)
             Log("Weapon depth test: the game's projection does not map to linear depth; test "
                 "off until its setting changes");
-        else if (why == WeaponHold::Refused)
-            Log("Weapon depth test: RR did not accept linear depth; test off until its setting "
-                "changes, RR runs with hardware depth");
+        else if (why == WeaponHold::Refused) {
+            char line[200];
+            snprintf(line, sizeof(line),
+                     "Weapon depth test: RR did not accept linear depth%s%s%s; test off until its "
+                     "setting changes, RR runs with hardware depth",
+                     outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
+            Log(line);
+        }
     }
     void QueueReconfigure() {
         layout_pending = true;
@@ -1508,6 +1514,7 @@ class Controller {
             try {
                 Log(rrngxlog::RuntimeLine(report.core, report.device.Get()).c_str());
             } catch (...) {
+                // A line that cannot be built is dropped: nothing may escape into ReShade.
             }
     }
     // All native identity/binding/view/constant/context proofs are required at
@@ -1980,13 +1987,16 @@ class Controller {
                 runtime = mod;
                 runtime_epoch = epoch;
                 public_device = pub;
+                // Logged by the next Poll whether or not this attempt creates RR.
+                runtime_report = {mod, pub};
                 selected_view = scope.viewport;
                 key = o;
                 api = resolve(mod);
                 Require(api.Valid(), "live NGX exports missing");
                 const auto allocated = api.allocate(&parameters);
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
-                                  "live NGX parameter allocation failed", allocated);
+                                  "live NGX parameter allocation failed",
+                                  rrngxlog::Returned(allocated, parameters));
                 rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
@@ -1994,7 +2004,8 @@ class Controller {
                                           parameters, &feature);
                 if (weapon_on && (NVSDK_NGX_FAILED(created) || !feature)) {
                     // RR refused linear depth: hold the test and create RR as before.
-                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes,
+                                    rrngxlog::Returned(created, feature).text);
                     weapon_on = weapon_test.active = false;
                     feature = nullptr;
                     rreval::CreateParameters(*parameters, o, preset.desired);
@@ -2002,10 +2013,11 @@ class Controller {
                                          parameters, &feature);
                 }
                 char line[200];
-                if (rrngxlog::CapabilityLine(api, line, sizeof(line)))
-                    Log(line);
+                rrngxlog::CapabilityLine(api, line, sizeof(line));
+                Log(line);
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
-                                  "live RR feature creation failed", created);
+                                  "live RR feature creation failed",
+                                  rrngxlog::Returned(created, feature));
                 preset.Created();
                 weapon_linear = weapon_on;
                 rrngxlog::DescribeCreation(o, preset.desired, weapon_on, line, sizeof(line));
@@ -2013,13 +2025,13 @@ class Controller {
                 if (weapon_on) {
                     int sent = -1;
                     parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
+                    // Read back from the parameters; decimal, as the "RR created" line above.
                     snprintf(line, sizeof(line),
                              "Weapon depth test: RR created with linear depth (game create flags "
-                             "0x%x, sent 0x%x)",
-                             unsigned(o.flags), unsigned(sent));
+                             "%d, sent %d)",
+                             o.flags, sent);
                     Log(line);
                 }
-                runtime_report = {mod, pub};
             }
             // Development tests (shared textures, see UseTest). RR takes one mask:
             // while in use, the sky edge mask replaces the SSS one.
@@ -2187,9 +2199,11 @@ class Controller {
             }
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
+            bool threw = false; // then evaluated_result is the sentinel above, not NGX's
             try {
                 evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
             } catch (...) {
+                threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
             }
             s->inference_ok = NVSDK_NGX_SUCCEED(evaluated_result);
@@ -2222,15 +2236,17 @@ class Controller {
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
             if (!s->inference_ok) {
+                const rrngxlog::Code code(evaluated_result);
+                const char *outcome = threw ? "threw" : code.text;
                 // A linear-depth RR that fails: restart it with hardware depth rather than
                 // turning RR off.
                 if (weapon_on) {
-                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes, outcome);
                     QueueReconfigure();
                 } else {
                     char line[128];
                     snprintf(line, sizeof(line), "RR inference failed (%s); native SR retained",
-                             rrngxlog::Code(evaluated_result).text);
+                             outcome);
                     Failure(line);
                 }
             }

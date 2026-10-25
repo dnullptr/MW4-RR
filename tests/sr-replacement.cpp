@@ -3,7 +3,11 @@
 #include "../src/rr_evaluation_params.h"
 #include "../src/rr_ngx_log.h"
 #include <cassert>
+#include <cctype>
+#include <climits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 static unsigned originals{}, replacements{}, afters{};
 static bool handle_rr = true, throw_rr = false, expect_reset = false, throw_original = false;
 static NVSDK_NGX_Result original_result = NVSDK_NGX_Result_Success;
@@ -157,7 +161,7 @@ static void CreationParameters() {
     int flags = -1, free_mem = -1, quality = -1, denoise = -1, subrects = -1;
     assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
     assert(flags == 11);
-    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, &free_mem)));
+    assert(NVSDK_NGX_SUCCEED(p.Get(RR_FREE_MEM_ON_RELEASE_KEY, &free_mem)));
     assert(free_mem == 1);
     unsigned width = 0, height = 0, out_width = 0, out_height = 0, roughness = 0, depth = 0;
     unsigned creation_mask = 0, visibility_mask = 0;
@@ -181,13 +185,12 @@ static void CreationParameters() {
     assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_VisibilityNodeMask, &visibility_mask)) &&
            visibility_mask == 1);
     assert(rrpreset::Requested(p, 6));
-    // The stored key still carries the game's flags, so a flag change is still a recreation.
-    assert(o.flags == 75);
+    // The stored key keeps the game's flags, so a flag change is still a recreation.
     auto changed = o;
     changed.flags = 11;
     assert(!rreval::SameCreation(o, changed));
     // Bits other than AutoExposure reach RR as the game set them.
-    o.flags = 0x1bf;
+    o.flags = 0x1ff;
     RecordingParams q;
     rreval::CreateParameters(q, o);
     assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
@@ -201,9 +204,11 @@ static void CreationParameters() {
 }
 static RecordingParams *capability_map{};
 static NVSDK_NGX_Result capability_result = NVSDK_NGX_Result_Success;
+static bool capability_map_on_failure{}; // a failed query that still hands back a map
 static unsigned capability_destroys{};
 static NVSDK_NGX_Result NVSDK_CONV Capabilities(NVSDK_NGX_Parameter **out) {
-    *out = NVSDK_NGX_SUCCEED(capability_result) ? capability_map : nullptr;
+    *out = NVSDK_NGX_SUCCEED(capability_result) || capability_map_on_failure ? capability_map
+                                                                              : nullptr;
     return capability_result;
 }
 static NVSDK_NGX_Result NVSDK_CONV DestroyCapabilities(NVSDK_NGX_Parameter *p) {
@@ -223,15 +228,27 @@ static void NgxLog() {
     assert(!strcmp(Code(0xBAD00013u).text, "0xBAD00013 unknown"));
     assert(!strcmp(Code(0u).text, "0x00000000 unknown"));
     assert(!strcmp(rrngxlog::ResultName(0xBAD0000Fu), "FAIL_UnableToWriteToAppDataPath"));
-    rrngxlog::Require(true, "unused", 0xBAD00000u);
-    bool thrown = false;
-    try {
-        rrngxlog::Require(false, "live RR feature creation failed", 0xBAD0000Du);
-    } catch (const std::runtime_error &e) {
-        thrown =
-            !strcmp(e.what(), "live RR feature creation failed: 0xBAD0000D FAIL_OutOfGPUMemory");
-    }
-    assert(thrown);
+    // A success that hands back no object is named as such, not as "Success".
+    int object{};
+    assert(!strcmp(rrngxlog::Returned(0x1u, &object).text, "0x00000001 Success"));
+    assert(!strcmp(rrngxlog::Returned(0x1u, nullptr).text, "null handle"));
+    assert(!strcmp(rrngxlog::Returned(0xBAD00005u, nullptr).text,
+                   "0xBAD00005 FAIL_InvalidParameter"));
+    assert(!strcmp(rrngxlog::Returned(0xBAD00005u, &object).text,
+                   "0xBAD00005 FAIL_InvalidParameter"));
+    rrngxlog::Require(true, "unused", Code(0xBAD00000u));
+    const auto thrown = [](const Code &outcome, const char *expected) {
+        try {
+            rrngxlog::Require(false, "live RR feature creation failed", outcome);
+        } catch (const std::runtime_error &e) {
+            return !strcmp(e.what(), expected);
+        }
+        return false;
+    };
+    assert(thrown(Code(0xBAD0000Du),
+                  "live RR feature creation failed: 0xBAD0000D FAIL_OutOfGPUMemory"));
+    assert(thrown(rrngxlog::Returned(0x1u, nullptr),
+                  "live RR feature creation failed: null handle"));
 
     // VS_FIXEDFILEINFO at DWORD 3: signature, struct version, file version MS/LS (310.9.1.0).
     uint32_t info[20]{};
@@ -290,6 +307,21 @@ static void NgxLog() {
     // No core module, device or model in this process.
     assert(rrngxlog::RuntimeLine(nullptr, nullptr) ==
            "RR runtime: NGX core ? ?; model not loaded; driver ?");
+    // A loaded core module prints its path and its dotted file version.
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    unsigned kernel_version[4]{};
+    assert(rrngxlog::ModuleVersion(kernel, kernel_version));
+    const auto runtime = rrngxlog::RuntimeLine(kernel, nullptr);
+    const std::string head = "RR runtime: NGX core ", tail = "; model not loaded; driver ?";
+    assert(runtime.rfind(head, 0) == 0 && runtime.ends_with(tail));
+    const auto module = runtime.substr(head.size(), runtime.size() - head.size() - tail.size());
+    const auto space = module.rfind(' ');
+    assert(space != std::string::npos);
+    std::string path = module.substr(0, space);
+    for (auto &ch : path)
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    assert(path.ends_with("\\kernel32.dll"));
+    assert(module.substr(space + 1) == rrngxlog::Version(kernel_version).text);
 
     RecordingParams caps;
     caps.Set(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, 1);
@@ -314,17 +346,28 @@ static void NgxLog() {
     rrngxlog::DescribeCapability({}, text, sizeof(text));
     assert(!strcmp(text, "RR capability: available=? needsUpdatedDriver=? minDriver=?.? "
                          "featureInit=?"));
-    // The query: optional export, the map destroyed after reading, a failed query's code.
+    // The query: a missing export, the map destroyed after reading, a failed query's code.
     rreval::Api api;
-    assert(!rrngxlog::CapabilityLine(api, text, sizeof(text)));
+    rrngxlog::CapabilityLine(api, text, sizeof(text));
+    assert(!strcmp(text, "RR capability: export missing"));
     api.capabilities = &Capabilities;
     api.destroy = &DestroyCapabilities;
     capability_map = &caps;
-    assert(rrngxlog::CapabilityLine(api, text, sizeof(text)) && !strcmp(text, full));
-    assert(capability_destroys == 1);
+    rrngxlog::CapabilityLine(api, text, sizeof(text));
+    assert(!strcmp(text, full) && capability_destroys == 1);
     capability_result = NVSDK_NGX_Result(0xBAD0000Cu);
-    assert(rrngxlog::CapabilityLine(api, text, sizeof(text)) && capability_destroys == 1);
-    assert(!strcmp(text, "RR capability query failed: 0xBAD0000C FAIL_OutOfDate"));
+    rrngxlog::CapabilityLine(api, text, sizeof(text));
+    assert(!strcmp(text, "RR capability query failed: 0xBAD0000C FAIL_OutOfDate") &&
+           capability_destroys == 1);
+    // A map handed back with a failure is still destroyed.
+    capability_map_on_failure = true;
+    rrngxlog::CapabilityLine(api, text, sizeof(text));
+    assert(!strcmp(text, "RR capability query failed: 0xBAD0000C FAIL_OutOfDate") &&
+           capability_destroys == 2);
+    capability_result = NVSDK_NGX_Result_Success;
+    capability_map = nullptr;
+    rrngxlog::CapabilityLine(api, text, sizeof(text));
+    assert(!strcmp(text, "RR capability query failed: null handle") && capability_destroys == 2);
 
     rreval::Options o;
     o.width = 2224;
@@ -334,18 +377,28 @@ static void NgxLog() {
     o.quality = 1;
     o.flags = 75;
     rrngxlog::DescribeCreation(o, 6, false, text, sizeof(text));
-    assert(!strcmp(text, "RR created: preset F, quality 1, flags 75 -> 11, render 2224x1248, "
-                         "output 3840x2160"));
+    assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 11, "
+                         "render 2224x1248, output 3840x2160"));
     // Linear depth (the weapon depth test): the flags RR got lose DepthInverted too.
     rrngxlog::DescribeCreation(o, 6, true, text, sizeof(text));
-    assert(!strcmp(text, "RR created: preset F, quality 1, flags 75 -> 3, render 2224x1248, "
-                         "output 3840x2160"));
+    assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 3, "
+                         "render 2224x1248, output 3840x2160"));
     o.flags = 0;
+    o.quality = 5;
     rrngxlog::DescribeCreation(o, 0, false, text, sizeof(text));
-    assert(!strcmp(text, "RR created: preset Default, quality 1, flags 0 -> 0, render 2224x1248, "
-                         "output 3840x2160"));
+    assert(!strcmp(text, "RR created: preset Default, quality 5 (Native / DLAA), flags 0 -> 0, "
+                         "render 2224x1248, output 3840x2160"));
+    o.quality = 6;
     rrngxlog::DescribeCreation(o, 1, false, text, sizeof(text));
-    assert(!strncmp(text, "RR created: preset unknown,", strlen("RR created: preset unknown,")));
+    assert(!strncmp(text, "RR created: preset unknown, quality 6 (unknown),",
+                    strlen("RR created: preset unknown, quality 6 (unknown),")));
+    // The widest line still fits the 200-byte buffer AfterSR formats it into.
+    o = {};
+    o.quality = INT_MIN;
+    o.flags = INT_MIN;
+    char creation[200];
+    rrngxlog::DescribeCreation(o, 1, false, creation, sizeof(creation));
+    assert(std::string_view(creation).ends_with(" output 4294967295x4294967295"));
 }
 int main() {
     rrtrace::ProbeTestAccess::Run();

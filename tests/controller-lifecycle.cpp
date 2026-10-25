@@ -1,7 +1,10 @@
 #define NOMINMAX
 #define RR_FILTER_DIAGNOSTIC
 #include "../src/rr_live.h"
+#include <algorithm>
 #include <cassert>
+#include <string>
+#include <thread>
 
 // CPU-only COM double. No device, adapter, queue, or GPU is created.
 struct CpuFence final : ID3D12Fence {
@@ -108,10 +111,7 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{}, log_lines{};
-static void CountLog(const char *) {
-    ++log_lines;
-}
+static unsigned releases{}, destroys{};
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -219,6 +219,33 @@ struct ControllerCpuTest {
         assert((g.ReadFinite() == std::array<UINT, 2>{157, 158}));
         assert(readback->read.Begin == 228 && readback->read.End == 236);
     }
+    // A creation attempt's runtime is logged once, by the next Poll, with the controller mutex
+    // released: its module and DXGI queries never run under it.
+    static inline Controller *polled{};
+    static inline bool unlocked{};
+    static void LogUnlocked(const char *s) {
+        Logged(s);
+        // From another thread: the mutex is recursive, so this one would always get it.
+        std::thread([] {
+            if (polled->mutex.try_lock()) {
+                polled->mutex.unlock();
+                unlocked = true;
+            }
+        }).join();
+    }
+    static void RuntimeLog() {
+        Controller c;
+        polled = &c;
+        c.logger = &LogUnlocked;
+        c.runtime_report = {GetModuleHandleW(L"kernel32.dll"), nullptr};
+        c.Poll();
+        assert(logged.rfind("RR runtime: NGX core ", 0) == 0 && unlocked);
+        assert(std::count(logged.begin(), logged.end(), '\n') == 1);
+        c.Poll(); // Drained: the next Poll logs nothing.
+        assert(std::count(logged.begin(), logged.end(), '\n') == 1);
+        logged.clear();
+        polled = nullptr;
+    }
     static void WeaponDepth() {
         // The weapon depth test restarts RR only when its setting differs from the depth
         // type RR was created with. A test that could not run stays off through Reconfigure
@@ -237,12 +264,19 @@ struct ControllerCpuTest {
         assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Waiting);
         c.weapon_test.active = true;
         assert(c.WeaponDepthState() == State::Active);
-        c.logger = CountLog;
-        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        // The refusal names NGX's outcome.
+        c.logger = Logged;
+        const rrngxlog::Code refused(0xBAD00005u);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, refused.text);
         assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
-        assert(c.WeaponDepthState() == State::Refused && log_lines == 1);
-        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
-        assert(log_lines == 1); // Frames still in flight repeat the hold; logged once.
+        assert(c.WeaponDepthState() == State::Refused);
+        const std::string refusal = "Weapon depth test: RR did not accept linear depth (0xBAD00005 "
+                                    "FAIL_InvalidParameter); test off until its setting changes, "
+                                    "RR runs with hardware depth\n";
+        assert(logged == refusal);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, "threw");
+        assert(logged == refusal); // Frames still in flight repeat the hold; logged once.
+        logged.clear();
         c.logger = nullptr;
         c.feature = nullptr; // Released by Reconfigure in the game; no NGX here.
         c.QueueReconfigure();
@@ -334,6 +368,7 @@ struct ControllerCpuTest {
         DevTests();
         RetirementFailure();
         StatsReaders();
+        RuntimeLog();
         WeaponDepth();
         HitDistanceTests();
         // Diagnostic route changes must retire existing work, then reset once.
