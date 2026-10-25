@@ -47,7 +47,9 @@ inline std::vector<Entry> Parse(const std::string &text) {
             entry.index = Trim(rest.substr(0, rest.find(';')));
         }
         auto value = line.substr(equals + 1);
-        value.resize(std::min(value.size(), value.find("//")));
+        // No std::min: tests/settings-and-layout.cpp sees the Windows min macro (no NOMINMAX).
+        if (const auto comment = value.find("//"); comment != std::string::npos)
+            value.resize(comment);
         entry.value = Trim(value);
         if (!entry.name.empty())
             entries.push_back(std::move(entry));
