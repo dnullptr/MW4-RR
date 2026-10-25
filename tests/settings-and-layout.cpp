@@ -6,9 +6,12 @@
 #include "../src/rr_guide_health.h"
 #include "../src/rr_ray_density.h"
 #include "../src/rr_ray_budget.h"
+#include "../src/rr_vrrt_rate.h"
+#include "../src/rr_vrrt_target.h"
 #include "../src/rr_lighting_source.h"
 #include "../src/rr_responsivity.h"
 #include "../src/rr_specular_distance.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -314,6 +317,31 @@ int main() {
     assert(rb::Raised(0.2f, inf, 0.5f) == 0.5f);
     for (unsigned c = rb::Scale15; c < rb::Count; ++c)
         assert(rb::Raised(0.01f, rb::scales[c], 0.5f) == 0.01f * rb::scales[c]);
+    // The shader shares this rule (src/rr_vrrt_target.h); the CPU copy forwards to it, bit for bit.
+    constexpr float targets[] = {0.0f, -0.0f, 1e-30f, 0.01f, 0.2f, 0.5f, 0.99f,
+                                 1.0f, 3.0f,  -0.1f,  -inf,  inf,  nan},
+                    scales[] = {0.0f, 0.5f,  1.0f,  1.0001f, 1.5f, 2.0f,
+                                2.5f, 1e30f, -2.0f, inf,     nan},
+                    caps[] = {0.0f, 0.25f, 0.5f, 1.0f, 1e-31f, -1.0f, inf, nan};
+    for (float target : targets)
+        for (float scale : scales)
+            for (float cap : caps) {
+                const bool raise = target > 0 && target < cap && scale > 1 && !std::isinf(target);
+                const float want = raise ? (std::min)(target * scale, cap) : target;
+                const float shared = rrvrrt::RaisedTarget(target, scale, cap),
+                            cpu = rb::Raised(target, scale, cap);
+                assert(std::memcmp(&shared, &want, sizeof(float)) == 0 ||
+                       (std::isnan(shared) && std::isnan(want)));
+                assert(std::memcmp(&cpu, &shared, sizeof(float)) == 0 ||
+                       (std::isnan(cpu) && std::isnan(shared)));
+                assert(!raise || (shared > target && shared <= cap));
+                assert(raise || std::isnan(target) || shared == target);
+            }
+    assert(rrvrrt::RaisedTarget(0.2f, 2.0f, 0.9f) == 0.2f * 2.0f);
+    assert(rrvrrt::RaisedTarget(0.4f, 2.5f, 0.5f) == 0.5f);
+    assert(rrvrrt::RaisedTarget(0.5f, 2.0f, 0.5f) == 0.5f);
+    assert(rrvrrt::RaisedTarget(0.2f, 2.0f, 0.0f) == 0.2f);
+    assert(rrvrrt::RaisedTarget(0.2f, 1.0f, 0.5f) == 0.2f);
 
     // The list proof is logged in one line.
     assert(rb::Describe(rb::Prove(lists(8294400, 8294544, 8294544), 1920, 1080)) ==
@@ -475,4 +503,46 @@ int main() {
     assert(!verdicts.Changed(ready, 11500));   // too soon again
     assert(!verdicts.Changed(noproof, 12000)); // back to the logged reason: nothing to log
     assert(!verdicts.Changed(ready, 5));       // the clock went backwards: suppressed
+
+    // Extra rays per pixel come from the shared rate rule: a request code of 16 or more is
+    // code - 15 rays, so code - 16 beyond the first. The denominator is unchanged.
+    // rate(packed, enabled, threshold, clamp, promote, boundary, ring); no budget unless enabled.
+    auto rate = [](unsigned packed, int enabled = 0, int threshold = 0, int clamp = 0,
+                   int promote = 0, int boundary = 0, int ring = 0) {
+        return rrvrrt::InverseRate(packed, enabled, promote, clamp, threshold, boundary, ring);
+    };
+    for (unsigned code = 0; code < 256; ++code) { // no budget: the code alone decides
+        const rrvrrt::Rate r = rate(code);
+        assert(r.supported && r.denominator == (code >= 16 ? 1u : 16u - code));
+        assert(r.extra == (code >= 16 ? code - 16 : 0u));
+    }
+    assert(rate(15).extra == 0 && rate(16).extra == 0 && rate(17).extra == 1);
+    assert(rate(200).extra == 184 && rate(200).denominator == 1 && rate(255).extra == 239);
+    // The code is the low byte of the low 16 bits; 0xFFFF alone means "not requested".
+    assert(rate(0x1211).extra == 1 && rate(0x10000 | 17).extra == 1);
+    assert(rate(0x00FF).extra == 239);
+    const rrvrrt::Rate none = rate(0xFFFF);
+    assert(none.supported && none.denominator == 0 && none.extra == 0);
+    // Budget clamping happens first. Threshold 18 allows codes below 17; codes 17 and above become
+    // 16 inside a tile ring at or below the boundary and 17 outside it.
+    assert(rate(30, 1, 18, 1, 0, 0, 1).extra == 1 && rate(30, 1, 18, 1, 0, 0, 0).extra == 0);
+    assert(rate(30, 1, 18, 1, 0, 2, 2).extra == 0 && rate(30, 1, 18, 1, 0, 1, 2).extra == 1);
+    assert(rate(255, 1, 18, 1, 0, 0, 1).extra == 1);
+    assert(rate(17, 1, 18, 1, 0, 0, 1).extra == 1 && rate(17, 1, 18, 1, 0, 0, 0).extra == 0);
+    assert(rate(30, 1, 18, 1, 0, 0, 1).denominator == 1 && rate(5, 1, 18, 1, 0, 0, 1).extra == 0);
+    assert(rate(5, 1, 18, 1, 0, 0, 1).denominator == 11 && rate(16, 1, 18, 1, 0, 0, 1).extra == 0);
+    assert(rate(255, 1, 100, 1, 0, 0, 0).extra == 82 && rate(255, 1, 100, 1, 0, 0, 1).extra == 83);
+    assert(rate(30, 1, 18, 0, 0, 0, 1).extra == 14); // clamping off
+    assert(rate(30, 0, 18, 1, 0, 0, 1).extra == 14); // budget control off
+    assert(rate(30, 1, 0, 1, 0, 0, 1).extra == 14 && rate(30, 1, -18, 1, 0, 0, 1).extra == 14);
+    assert(rate(30, 1, 1, 1, 0, 0, 0).extra == 0 && rate(30, 1, 1, 1, 0, 0, 0).denominator == 17);
+    // A negative threshold promotes codes up to its limit to the limit (+1 outside the boundary).
+    assert(rate(3, 1, -18, 1, 1, 0, 0).extra == 1 && rate(3, 1, -18, 1, 1, 0, 1).extra == 2);
+    assert(rate(17, 1, -18, 1, 1, 0, 0).extra == 1 && rate(18, 1, -18, 1, 1, 0, 0).extra == 2);
+    assert(rate(30, 1, -18, 1, 1, 0, 1).extra == 14 && rate(3, 1, -18, 1, 0, 0, 1).extra == 0);
+    assert(rate(3, 1, 18, 1, 1, 0, 1).extra == 0 && rate(3, 1, 18, 1, 1, 0, 1).denominator == 13);
+    // An unsupported budget gives no rays and no extra.
+    const rrvrrt::Rate unsupported = rate(200, 1, (std::numeric_limits<int>::min)());
+    assert(!unsupported.supported && unsupported.denominator == 0 && unsupported.extra == 0);
+    assert(rate(200, 0, (std::numeric_limits<int>::min)()).extra == 184); // only when enabled
 }

@@ -10,9 +10,9 @@ using UInt=unsigned;
 #else
 typedef uint UInt;
 #endif
-struct Rate {bool supported;UInt denominator;};
+struct Rate {bool supported;UInt denominator;UInt extra;};
 inline Rate InverseRate(UInt packedRequest,int enabled,int promote,int clampRate,int threshold,int boundary,int ring){
- Rate result;result.supported=true;result.denominator=0;
+ Rate result;result.supported=true;result.denominator=0;result.extra=0;
  packedRequest&=65535u;if(packedRequest==65535u)return result;
  int code=int(packedRequest&255u);
  if(enabled!=0){
@@ -25,6 +25,6 @@ inline Rate InverseRate(UInt packedRequest,int enabled,int promote,int clampRate
  }
  const int inverse=code>=16?1:16-code;
  if(inverse<1||inverse>255){result.supported=false;return result;}
- result.denominator=UInt(inverse);return result;
+ result.denominator=UInt(inverse);result.extra=code>=16?UInt(code-16):0;return result;
 }
 }

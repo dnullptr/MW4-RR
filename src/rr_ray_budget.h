@@ -1,5 +1,6 @@
 #pragma once
 #include "rr_ray_density.h"
+#include "rr_vrrt_target.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -96,13 +97,11 @@ inline float Cap(std::uint64_t entries, unsigned w, unsigned h) {
         return 0;
     return float((std::min)(MaxTarget, Fill * double(entries) / (double(w) * h)));
 }
-// Same rule the GPU applies (the shader uses a shared copy in src/rr_vrrt_target.h): only a
-// positive target below the cap is raised, to min(target * scale, cap); never lowered. Zero,
-// negative, NaN and infinite targets and scale <= 1 return target unchanged.
+// The rule the GPU applies, shared with the shader (src/rr_vrrt_target.h): only a positive target
+// below the cap is raised, to min(target * scale, cap); never lowered. Zero, negative, NaN and
+// infinite targets and scale <= 1 return target unchanged.
 inline float Raised(float target, float scale, float cap) {
-    if (!(target > 0 && target < cap && scale > 1))
-        return target;
-    return (std::min)(target * scale, cap);
+    return rrvrrt::RaisedTarget(target, scale, cap);
 }
 inline std::string ViewText(const View &v) {
     if (v.binding == Binding::Root)
