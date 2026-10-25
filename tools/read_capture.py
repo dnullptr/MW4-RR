@@ -29,8 +29,7 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
 # Per-frame test settings and their off values; the summary shows only the ones that are on.
 FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
-               'hit_distance_test': 0, 'linear_depth': False, 'water_masks': False,
-               'water_guide': 0}
+               'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
 
 
 def small_float(bits, mantissa_bits):
@@ -241,6 +240,9 @@ def self_test():
                'frame 1 tests that are on')
         expect('warning: the frames differ in lighting input or test settings' in text,
                'mixed test settings warned')
+        same = {**manifest, 'frames': [manifest['frames'][0]] * 2}
+        expect(not any(line.startswith('warning') for line in summary(same, frames)),
+               'uniform test settings not warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
