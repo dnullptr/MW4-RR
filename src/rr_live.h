@@ -6,6 +6,7 @@
 #include "rr_responsivity.h"
 #include "rr_water.h"
 #include "rr_sky_depth_test.h"
+#include "rr_vrrt_apply_patch.h"
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
@@ -38,6 +39,9 @@ class Controller {
     struct Slot {
         rrsss::Producer sss;
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
+        // The hit distance tests conditioned this slot's copy, in mode (rrhitcond).
+        bool hit_conditioned{};
+        unsigned hit_mode{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
@@ -100,10 +104,10 @@ class Controller {
     bool tolerate_isolated = true;
     bool responsivity_enabled{}, responsivity_active{};
     // Development tests (sky edge mask, color brightness, sky depth floor, weapon
-    // depth): one texture each, shared by every slot, created on first use and released by
-    // Reconfigure. They sit in the persistent ledger, so pool projections count
-    // each once, and the reserve grows by exactly their size (test_reserve,
-    // given back on release).
+    // depth, hit distance scratch): one texture each, shared by every slot, created
+    // on first use and released by Reconfigure. They sit in the persistent ledger,
+    // so pool projections count each once, and the reserve grows by exactly their
+    // size (test_reserve, given back on release).
     struct DevTest {
         ComPtr<ID3D12Resource> texture;
         bool active{};     // the latest evaluation used it
@@ -113,7 +117,9 @@ class Controller {
     // wide_output: RR's output while the color test brightens its input, in FP32
     // so the brightened result does not clip in the FP16 rr_output.
     // weapon_test: the linear depth RR reads while the weapon depth test runs.
-    DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test;
+    // hit_scratch: the raw hit distance the conditioning reads while it rewrites
+    // a slot's copy; used only inside one guide recording.
+    DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test, hit_scratch;
     UINT64 test_reserve{};
     // Weapon depth test (rrweapondepth): weapon_linear is the depth type the current RR
     // feature was created with; weapon_hold says why the test stays off until its setting
@@ -143,6 +149,9 @@ class Controller {
     ComPtr<ID3D12Resource> sss_mask_guide;
     bool hit_enabled{};
     unsigned hit_reports{};
+    // The hit distance tests' pipelines could not be created: off this session.
+    bool hit_condition_failed{};
+    rrhitcond::Tracker hit_pixels;
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
@@ -431,7 +440,7 @@ class Controller {
         persistent.Release(budget);
         // The test textures were in the persistent ledger; give back the reserve
         // they added, never below what is still allocated.
-        sky_edge_test = color_test = depth_test = wide_output = weapon_test = {};
+        sky_edge_test = color_test = depth_test = wide_output = weapon_test = hit_scratch = {};
         weapon_linear = false;
         weapon_logged = {};
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
@@ -502,6 +511,8 @@ class Controller {
                              {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
+                if (s.gate_recorded && s.hit_conditioned)
+                    hit_pixels.Add(s.gpu.ReadHitStats(), s.hit_mode, UINT64(s.gpu.w) * s.gpu.h);
                 if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
                     water_stats.Add(s.gpu.ReadWaterPixels(),
                                     UINT64((std::min)(s.options.width, s.gpu.w)) *
@@ -513,6 +524,7 @@ class Controller {
                     m.stats = v;
                     m.delivered = v[0] == 0 && v[1] != 0;
                     m.replaced_sr = s.replaced_sr;
+                    m.hit_distance_test = s.hit_used && s.hit_conditioned ? s.hit_mode : 0u;
                     m.water_masks = s.water_used;
                     m.water_guide = s.gpu.water_guide;
                     try {
@@ -556,6 +568,8 @@ class Controller {
         if (health.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (density.Report(GetTickCount64(), report))
+            Log(report.c_str());
+        if (hit_pixels.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (water_stats.Report(GetTickCount64(), report, water))
             Log(report.c_str());
@@ -797,6 +811,7 @@ class Controller {
                 rrresponsivity::Clamp(rrskyedge::strength.load(std::memory_order_relaxed));
             h.sky_edge_radius =
                 rrskyedge::ClampRadius(rrskyedge::radius.load(std::memory_order_relaxed));
+            h.ray_selection = rrapply::last_variant.load(std::memory_order_relaxed);
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {
@@ -887,6 +902,17 @@ class Controller {
         if (!weapon_linear)
             return WeaponState::Restarting;
         return weapon_test.active ? WeaponState::Active : WeaponState::Waiting;
+    }
+    // The specular hit distance tests (rrhitcond), while one is on and the hit
+    // distance is sent. Failed: their pipelines could not be created.
+    TestState HitDistanceTest() {
+        std::lock_guard lock(mutex);
+        return Test(hit_scratch, rrhitcond::changes.load(std::memory_order_relaxed),
+                    rrhitcond::Mode() != 0 && hit_enabled);
+    }
+    bool HitDistanceTestFailed() {
+        std::lock_guard lock(mutex);
+        return hit_condition_failed;
     }
     bool Running() {
         std::lock_guard lock(mutex);
@@ -1014,6 +1040,88 @@ class Controller {
             Failure(e.what());
             return false;
         }
+    }
+
+    // Whether the hit distance tests would condition cl's guide recording now,
+    // and why not (Off, NoSlot or Repeat), so the caller can skip capturing.
+    bool HitDistancePending(ID3D12GraphicsCommandList *cl, rrhitcond::Outcome &why) {
+        std::lock_guard lock(mutex);
+        return HitSlotLocked(cl, why);
+    }
+    // Specular hit distance tests (rrhitcond): conditions this recording's copy of
+    // the native distance in place, just before the native temporal pass. Its t5,
+    // weights, holds this frame's raw lighting weights, whose lobe-1 bits mark a
+    // fresh specular ray. The caller proved that binding and its state and captured
+    // restore, the pass's compute state; state_of(resource, state) gives a
+    // resource's tracked state on cl (used for PackedSurface, which this pass does
+    // not bind). Nothing is recorded unless it conditions. The fill is left out
+    // while a guide test replaces the normals it compares.
+    template <class StateOf>
+    rrhitcond::Outcome ConditionSpecularDistance(ID3D12GraphicsCommandList *cl,
+                                                 ID3D12Resource *weights,
+                                                 D3D12_RESOURCE_STATES weights_state,
+                                                 const rrcompute::Snapshot &restore,
+                                                 StateOf state_of) {
+        using rrhitcond::Outcome;
+        std::lock_guard lock(mutex);
+        Outcome why{};
+        auto *match = HitSlotLocked(cl, why);
+        if (!match)
+            return why;
+        auto &s = *match;
+        unsigned mode = rrhitcond::Mode();
+        if (rrhitcond::NormalsReplaced(s.gpu.guide_test))
+            mode &= ~rrhitcond::FillHoles;
+        if (!mode)
+            return Outcome::Off;
+        if (!s.gpu.hit_ready || !s.gpu.specular_hit)
+            return Outcome::NoCopy;
+        if (!weights)
+            return Outcome::Weights;
+        const auto d = weights->GetDesc();
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width != s.gpu.w ||
+            d.Height != s.gpu.h || d.DepthOrArraySize != 1 || d.MipLevels != 1 ||
+            d.SampleDesc.Count != 1 ||
+            (d.Format != DXGI_FORMAT_R32_UINT && d.Format != DXGI_FORMAT_R32_FLOAT) ||
+            !rrsparsecopy::Readable(weights_state) ||
+            !rrsparsecopy::SameDevice(pipelines.device.Get(), weights))
+            return Outcome::Weights;
+        auto *surface = s.gpu.sources[3].Get();
+        D3D12_RESOURCE_STATES surface_state{};
+        if (!surface || !state_of(surface, surface_state) ||
+            !rrsparsecopy::Readable(surface_state))
+            return Outcome::Surface;
+        if (!restore.valid || !restore.complete || !restore.heap_restore_valid ||
+            restore.command != cl)
+            return Outcome::Context;
+        try {
+            pipelines.HitConditionPipeline();
+        } catch (const rrprivate::AllocationDeferred &) {
+            return Outcome::Memory; // retried on a later frame
+        } catch (const std::exception &e) {
+            hit_condition_failed = true;
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "Specular hit distance tests off for this session: %s", e.what());
+            Log(line);
+            return Outcome::Failed;
+        }
+        // The panel's "active" is left to the evaluation (AfterSR), which knows
+        // whether RR got the conditioned copy.
+        const bool shown = hit_scratch.active;
+        const bool ready =
+            UseTest(hit_scratch, true, rrhitcond::changes.load(std::memory_order_relaxed),
+                    s.gpu.w, s.gpu.h, DXGI_FORMAT_R16_FLOAT, "Specular hit distance tests");
+        hit_scratch.active = shown;
+        if (!ready)
+            return Outcome::Memory;
+        rrinternal::Scope copy_guard;
+        rrcompute::Tracker::Internal state_guard;
+        s.gpu.ConditionDistance(cl, pipelines, hit_scratch.texture.Get(), weights, mode);
+        restore.Restore(cl, true);
+        s.hit_conditioned = true;
+        s.hit_mode = mode;
+        return Outcome::Conditioned;
     }
 
     bool OwnedSssDraw(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *variant,
@@ -1272,6 +1380,27 @@ class Controller {
     }
 #endif
   private:
+    // The one guide recording on cl the hit distance tests have not conditioned
+    // yet, or null with why not.
+    Slot *HitSlotLocked(ID3D12GraphicsCommandList *cl, rrhitcond::Outcome &why) {
+        why = rrhitcond::Outcome::Off;
+        if (!rrhitcond::Mode() || !enabled || !hit_enabled || failed || retired ||
+            hit_condition_failed || !cl)
+            return nullptr;
+        why = rrhitcond::Outcome::NoSlot;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl)) {
+                if (match)
+                    return nullptr;
+                match = &s;
+            }
+        if (match && match->hit_conditioned) {
+            why = rrhitcond::Outcome::Repeat;
+            return nullptr;
+        }
+        return match;
+    }
     bool LightingValid(const Slot &s) const {
 #ifdef RR_FILTER_DIAGNOSTIC
         if (rrfilter::Native(native_filter_effective))
@@ -1790,6 +1919,9 @@ class Controller {
             // radiance/history. Explicit toggles and real frame rejection still Reject.
             s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
                           !o.color_x && !o.color_y;
+            // The panel shows the hit distance tests active only while RR gets the
+            // conditioned copy.
+            hit_scratch.active = s->hit_used && s->hit_conditioned;
             // Water tests read the classification this slot's prepass wrote.
             s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
                             !o.color_x && !o.color_y;

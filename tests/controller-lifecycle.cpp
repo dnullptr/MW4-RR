@@ -154,12 +154,13 @@ struct ControllerCpuTest {
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
+        c.hit_scratch.active = true;
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
         assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
-               c.applied_color_scale == 1.0f);
+               !c.hit_scratch.active && c.applied_color_scale == 1.0f);
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();
@@ -265,11 +266,69 @@ struct ControllerCpuTest {
         rrguidetest::mode = 0;
         c.feature = nullptr;
     }
+    static void HitDistanceTests() {
+        // The hit distance tests record nothing while off and act once on the
+        // single guide recording of a list.
+        using rrhitcond::Outcome;
+        Controller c;
+        rrcompute::Snapshot restore;
+        auto state_of = [](ID3D12Resource *, D3D12_RESOURCE_STATES &) { return false; };
+        auto *weights = new CpuResource;
+        // Never called: slots only compare it with their recording.
+        auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(weights);
+        auto run = [&](ID3D12GraphicsCommandList *cl) {
+            return c.ConditionSpecularDistance(
+                cl, weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, restore, state_of);
+        };
+        auto pending = [&](Outcome expected) {
+            Outcome why{};
+            return !c.HitDistancePending(list, why) && why == expected;
+        };
+        assert(run(list) == Outcome::Off && pending(Outcome::Off)); // no test on
+        rrhitcond::fill = true;
+        assert(run(list) == Outcome::Off); // RR off
+        c.SetEnabled(true);
+        assert(run(list) == Outcome::Off); // hit distance off
+        c.SetSpecularHitEnabled(true);
+        assert(run(nullptr) == Outcome::Off);
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot));
+        auto &s = c.slots[0], &other = c.slots[1];
+        s.generation = other.generation = c.generation;
+        s.pre_live = true;
+        s.pre.Attach(list);
+        Outcome why{};
+        assert(c.HitDistancePending(list, why));
+        assert(run(list) == Outcome::NoCopy);
+        // A guide test that replaces normals leaves the fill out.
+        s.gpu.guide_test = rrguidetest::FaceCamera;
+        assert(run(list) == Outcome::Off);
+        rrhitcond::sky_miss = true;
+        assert(run(list) == Outcome::NoCopy);
+        rrhitcond::sky_miss = false;
+        s.gpu.guide_test = rrguidetest::FlipBackFaces;
+        assert(run(list) == Outcome::NoCopy);
+        s.gpu.hit_ready = true;
+        s.gpu.specular_hit = weights;
+        assert(run(list) == Outcome::Weights); // not a 2D texture
+        other.pre_live = true;
+        other.pre.Attach(list);
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot)); // two on one list
+        other.pre.Detach();
+        other.pre_live = false;
+        s.hit_conditioned = true;
+        assert(run(list) == Outcome::Repeat && pending(Outcome::Repeat));
+        c.hit_condition_failed = true;
+        assert(run(list) == Outcome::Off);
+        s.pre.Detach();
+        rrhitcond::fill = false;
+        weights->Release();
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
         StatsReaders();
         WeaponDepth();
+        HitDistanceTests();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);

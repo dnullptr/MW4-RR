@@ -638,6 +638,7 @@ static void ManifestShape() {
     h.sky_edge_radius = 3;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
+    frames[0].meta.hit_distance_test = 2;
     const std::string m = Manifest(h, frames);
     assert(Balanced(m));
     assert(Contains(m, "\"cpu_time_ms\": 100000000.125")); // Fixed, where %.9g would round.
@@ -670,7 +671,8 @@ static void ManifestShape() {
                               "\"water_strength\": 0.75",        "\"water_discard\": true",
                               "\"water_animated\": false",       "\"water_guide\": 2",
                               "\"weapon_depth\": false",       "\"sky_edge_enabled\": true",
-                              "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3"};
+                              "\"sky_edge_strength\": -0.25",  "\"sky_edge_radius\": 3",
+                              "\"ray_selection\": 0"};
     for (const char *s : settings)
         assert(Contains(m, s));
     h.weapon_depth = true; // The weapon depth test: depth is linear view depth.
@@ -700,6 +702,7 @@ static void ManifestShape() {
                                 "\"reset\": false",
                                 "\"reset_reasons\"",
                                 "\"replaced_sr\"",
+                                "\"hit_distance_test\": 2",
                                 "\"water_masks\": true",
                                 "\"water_masks\": false",
                                 "\"water_guide\": 3",

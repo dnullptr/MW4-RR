@@ -100,6 +100,9 @@ inline const char *ResponsivitySourceName(unsigned source) {
 inline constexpr unsigned ColorScaleReset = 16;
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
+    // Specular hit distance tests applied to the sent distance (rrhitcond mode bits:
+    // 1 sky and misses far, 2 fill); 0 when it is the game's raw value.
+    unsigned hit_distance_test{};
     bool delivered{}, reset{}, replaced_sr{};
     // Water tests (rr_water.h): whether this frame computed the water masks (the settings say
     // which ones RR took), and the water guide mode its guides were converted with.
@@ -122,6 +125,7 @@ struct Header {
     std::string created;
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{};
+    unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
         responsivity_enabled{}, sky_depth_test{}, weapon_depth{};
@@ -281,6 +285,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("reset"), m.reset);
     JsonUint(f.Key("reset_reasons"), m.reset_reasons);
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
+    JsonUint(f.Key("hit_distance_test"), m.hit_distance_test);
     JsonBool(f.Key("water_masks"), m.water_masks);
     JsonUint(f.Key("water_guide"), m.water_guide);
     JsonNumber(f.Key("color_scale"), m.color_scale);
@@ -371,6 +376,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("sky_edge_enabled"), h.sky_edge_enabled);
     JsonNumber(s.Key("sky_edge_strength"), h.sky_edge_strength);
     JsonUint(s.Key("sky_edge_radius"), h.sky_edge_radius);
+    JsonUint(s.Key("ray_selection"), h.ray_selection);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";
