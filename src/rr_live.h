@@ -468,14 +468,17 @@ class Controller {
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
-        // The test textures were in the persistent ledger; give back the reserve
-        // they added, never below what is still allocated.
+        // The test textures were in the persistent ledger and the ray buffers in the slots;
+        // give back the reserve they added (test_reserve, ray_reserve, saturating), never below
+        // what is still allocated.
         sky_edge_test = color_test = depth_test = wide_output = weapon_test = hit_scratch = {};
         weapon_linear = false;
         weapon_logged = {};
-        budget.limit = (std::max)({Budget::Minimum, budget.bytes,
-                                   budget.limit - (std::min)(test_reserve, budget.limit)});
-        test_reserve = 0;
+        const UINT64 reserved =
+            test_reserve > UINT64_MAX - ray_reserve ? UINT64_MAX : test_reserve + ray_reserve;
+        budget.limit = (std::max)(
+            {Budget::Minimum, budget.bytes, budget.limit - (std::min)(reserved, budget.limit)});
+        test_reserve = ray_reserve = 0;
         applied_color_scale = 1.0f;
         init_list.Reset();
         init_allocator.Reset();

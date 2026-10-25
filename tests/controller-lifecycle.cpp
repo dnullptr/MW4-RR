@@ -460,6 +460,69 @@ struct ControllerCpuTest {
             assert(RayWaiting(c));
         }
     }
+    // M1: the ray buffers' growth of budget.limit (AllocateRay reserves on top of the limit) is
+    // given back at Reconfigure together with test_reserve, so rebuilds do not ratchet it.
+    // RayPrepare counts it on every exit of a Prepare call. There is no device here (and Budget::
+    // Reserve needs DXGI), so each exit changes the limit as AllocateRay and PrepareRayLog do:
+    // Reserve raises it to floor + needed, then the catch keeps floor + added and rethrows.
+    static void RayReserve() {
+        constexpr UINT64 log = 4096, values = 65536, pre = Budget::Minimum + 8192;
+        enum Exit { Allocated, DeferredSecond, MapFailed, NotReserved };
+        auto prepare = [](Controller &c, Exit exit) {
+            const UINT64 floor = c.budget.limit;
+            if (exit == NotReserved)
+                return false;                      // nothing allocated, the limit unchanged
+            c.budget.limit = floor + log + values; // Reserve(floor + needed)
+            if (exit == DeferredSecond) {
+                c.budget.limit = floor + log; // the first buffer was allocated
+                throw rrprivate::AllocationDeferred();
+            }
+            if (exit == MapFailed)
+                throw std::runtime_error("ray budget upload map failed");
+            return true;
+        };
+        for (const Exit exit : {Allocated, DeferredSecond, MapFailed, NotReserved}) {
+            Controller c;
+            c.budget.limit = pre;
+            bool threw = false;
+            try {
+                assert(c.RayPrepare([&] { return prepare(c, exit); }) == (exit == Allocated));
+            } catch (const std::exception &) {
+                threw = true;
+            }
+            assert(threw == (exit == DeferredSecond || exit == MapFailed));
+            const UINT64 grown = exit == NotReserved      ? 0
+                                 : exit == DeferredSecond ? log
+                                                          : log + values;
+            assert(c.ray_reserve == grown && c.budget.limit == pre + grown);
+            // A retry grows it again (here by the whole sum): counted too.
+            assert(c.RayPrepare([&] { return prepare(c, Allocated); }));
+            assert(c.ray_reserve == grown + log + values);
+            c.QueueReconfigure();
+            assert(c.Reconfigure() && c.budget.limit == pre && !c.ray_reserve);
+        }
+        // Counted saturating, given back with test_reserve in one step, saturating, never below
+        // what is allocated.
+        Controller c;
+        c.budget.limit = pre;
+        c.ray_reserve = UINT64_MAX - 5;
+        assert(c.RayPrepare([&] { return prepare(c, Allocated); }) && c.ray_reserve == UINT64_MAX);
+        c.budget.limit = pre + 300;
+        c.test_reserve = 200;
+        c.ray_reserve = 100;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && c.budget.limit == pre && !c.test_reserve && !c.ray_reserve);
+        c.budget.limit = pre;
+        c.test_reserve = 10;
+        c.ray_reserve = UINT64_MAX - 5;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
+        c.budget.limit = pre;
+        c.budget.bytes = pre - 100;
+        c.ray_reserve = 200;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && c.budget.limit == pre - 100);
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -1659,6 +1722,7 @@ struct ControllerCpuTest {
         RayPlacement();
         RayRestart();
         RayOldMark();
+        RayReserve();
     }
 };
 } // namespace rrlive

@@ -425,7 +425,8 @@ struct GpuFrame {
     // The ray budget test (every offset is in rr_ray_copies.h): ray_cb (DEFAULT 64 KiB, COMMON
     // outside a patch) is the patched resolve's b1, ray_values (UPLOAD 256 B) stays mapped at
     // ray_map, ray_log (READBACK 256 B) collects the copies. ray_bytes is their share of `bytes`:
-    // optional, so kept out of the pool projection. Until Retire: ray_sources holds the native
+    // optional, so never multiplied into the per-slot base; every pool projection counts them once
+    // in its persistent term (PersistentBytes). Until Retire: ray_sources holds the native
     // buffers this recording copied (resolve b1, b3, t0; apply b1, b3; patch b1), ray_serial the
     // nonzero serial written into ray_values (0: none yet, so no logging copy), ray_patch_open
     // whether ray_cb waits for EndPatch.
@@ -1297,7 +1298,9 @@ struct GpuFrame {
         D3D12_RESOURCE_DESC desc;
         D3D12_HEAP_TYPE type;
     };
-    // Allocates the missing `buffers` after reserving their sum in the ledger (overflow-checked).
+    // Allocates the missing `buffers` after raising the pool ceiling by their sum on top of the
+    // current limit (rrraycopy::RayCeiling, overflow-checked). The controller counts that growth
+    // (Controller::RayPrepare) and gives it back at Reconfigure.
     bool AllocateRay(Pipelines &p, Budget &b, std::initializer_list<RayBuffer> buffers) {
         if (!p.device)
             return false;

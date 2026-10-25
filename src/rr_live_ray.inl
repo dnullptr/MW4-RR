@@ -45,6 +45,10 @@ std::atomic<UINT> ray_resolves{};
 // Summary has no failure counter, so the first failure and the first dropped readback are
 // logged once each.
 bool ray_log_failed{}, ray_log_warned{}, ray_memory_waiting{};
+// What the ray buffers grew budget.limit by (AllocateRay reserves on top of the limit, never out
+// of the headroom below it), given back at Reconfigure with test_reserve so that rebuilds do not
+// ratchet the limit.
+UINT64 ray_reserve{};
 std::array<UINT64, 2> ray_list_offsets{}; // the view offsets of the published u5 and u6
 
 void RayWrite(const char *line) noexcept {
@@ -101,6 +105,24 @@ UINT RayNextSerial() noexcept {
     if (++ray_next_serial == 0)
         ++ray_next_serial; // serials are nonzero (rr_ray_copies.h)
     return ray_next_serial;
+}
+// Runs `prepare` (a PrepareRayLog or PrepareRayPatch call) and adds what it grew budget.limit by
+// to ray_reserve, saturating, on return and on every exception: AllocateRay's catch keeps the
+// growth for the buffers it allocated, and PrepareRayLog's first Map can throw after all of it.
+// Nothing else changes budget.limit inside those calls.
+template <class Prepare> bool RayPrepare(Prepare prepare) {
+    struct Growth {
+        Controller &c;
+        const UINT64 before;
+        ~Growth() {
+            if (c.budget.limit > before) {
+                const UINT64 grown = c.budget.limit - before;
+                c.ray_reserve =
+                    grown > UINT64_MAX - c.ray_reserve ? UINT64_MAX : c.ray_reserve + grown;
+            }
+        }
+    } growth{*this, budget.limit};
+    return prepare();
 }
 // Two proven applies measure the same lists: extent and grid, both lobes' entries, the pixel
 // list (u3) and the counter (u2).
@@ -416,7 +438,7 @@ void RayActiveLog(unsigned m, const rrraybudget::Plan &plan) noexcept {
 // other failure disables logging for the session. Never a stop. Returns the bits recorded.
 template <class Record> unsigned RayLogCopies(Slot &s, UINT64 now, Record record) noexcept {
     try {
-        if (!s.gpu.PrepareRayLog(pipelines, budget)) {
+        if (!RayPrepare([&] { return s.gpu.PrepareRayLog(pipelines, budget); })) {
             ray_retry_after = now + rrraybudget::RetryMs;
             return 0;
         }
@@ -550,7 +572,7 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
                           static_cast<unsigned long>(governor.hr));
             return RayStopResolve(RayWhy::Pipeline, details);
         }
-        if (!s.gpu.PrepareRayPatch(pipelines, budget)) {
+        if (!RayPrepare([&] { return s.gpu.PrepareRayPatch(pipelines, budget); })) {
             ray_retry_after = now + rrraybudget::RetryMs;
             return RayRefuse(RayWhy::Memory, m);
         }
