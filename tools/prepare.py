@@ -84,7 +84,7 @@ def main():
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)
     # Guide test variants (src/rr_guide_test.h).
-    for test in range(1, 5):
+    for test in range(1, 7):
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', 'main', '/D', f'RR_GUIDE_TEST={test}',
                         '/Fh', str(out / f'rr_convert_guides_test{test}.generated.h'),
                         '/Vn', f'RRGuideShaderTest{test}',

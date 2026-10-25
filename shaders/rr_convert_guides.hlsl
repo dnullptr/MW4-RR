@@ -92,15 +92,21 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
 #if RR_GUIDE_TEST==1
     if(dot(normal,ray)>0)normal=-normal; // back faces (e.g. foliage undersides) face the camera
-#elif RR_GUIDE_TEST==2
-    normal=-ray;
 #elif RR_GUIDE_TEST==3
     if(!special)diffuse=0.5;
+#elif RR_GUIDE_TEST==5
+    if(!special)roughness=0.5;
+#elif RR_GUIDE_TEST==6
+    // Every guide flat: only depth, motion and color still vary per pixel.
+    if(!special){diffuse=0.5;roughness=0.5;}
 #endif
     float3 specular=RRGameSpecularReflectance(materialF0,roughness,dot(normal,ray));
     if(!RRFinite3(specular))return;
-#if RR_GUIDE_TEST==4
+#if RR_GUIDE_TEST==4 || RR_GUIDE_TEST==6
     specular=0;
+#endif
+#if RR_GUIDE_TEST==2 || RR_GUIDE_TEST==6
+    normal=-ray; // after the specular guide, so it keeps the real view angle
 #endif
     NormalRoughness[p]=float4(normal,roughness);
     DiffuseAlbedo[p]=float4(diffuse,1);

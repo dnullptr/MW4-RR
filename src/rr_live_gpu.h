@@ -7,6 +7,8 @@
 #include "../build/rr_convert_guides_test2.generated.h"
 #include "../build/rr_convert_guides_test3.generated.h"
 #include "../build/rr_convert_guides_test4.generated.h"
+#include "../build/rr_convert_guides_test5.generated.h"
+#include "../build/rr_convert_guides_test6.generated.h"
 #include "rr_guide_test.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
@@ -136,6 +138,10 @@ struct Pipelines {
                  converter_tests[2]);
         Pipeline(converter_root.Get(), RRGuideShaderTest4, sizeof(RRGuideShaderTest4),
                  converter_tests[3]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest5, sizeof(RRGuideShaderTest5),
+                 converter_tests[4]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest6, sizeof(RRGuideShaderTest6),
+                 converter_tests[5]);
         ranges[0].NumDescriptors = 3;
         ranges[1].NumDescriptors = 1;
         D3D12_ROOT_PARAMETER q[5]{};
