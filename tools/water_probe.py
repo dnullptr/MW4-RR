@@ -27,13 +27,19 @@ Assumptions (the report repeats the ones that were decided from data):
   (width, height) is tried as well, both residuals are reported, and the clearly better one is used.
 - Jitter: every frame is rendered at its own sub-pixel jitter (manifest `jitter`, render pixels),
   which RR removes itself. Unless camera.motion_vectors_jittered is 1 the vectors do not contain it,
-  so the previous frame is sampled at pixel + mv_px + s * (jitter[i-1] - jitter[i]) with s = +1 or
-  -1 (the sign convention is not known in advance). s is decided on the first usable pair by the
-  lowest residual (control window, else the frame outside the region, else the whole frame) over
-  the pixels that are misaligned without compensation, and must beat s = 0 clearly; the choice and
-  the residuals are reported. Bilinear resampling of very sharp textures still leaves a small
-  residual (the floor is higher the sharper the texture), so compare against a control that has a
-  similar texture where possible.
+  so the previous frame is sampled at pixel + mv_px + (sx dx, sy dy), (dx, dy) = jitter[i-1] -
+  jitter[i], with sx, sy in {+1, -1} (the sign convention of each axis is not known in advance).
+  They are decided on the first usable pair from the guide residuals only (the colour is noisy), in
+  the control window, else the frame outside the region, else the whole frame, over the pixels that
+  are misaligned without compensation, and must beat no compensation clearly; the choice and the
+  residuals are reported. If the jitter changes but nothing can be decided, the two animation hints
+  report fires=None ("jitter not compensated").
+- Resampling floor: warping with a fractional shift blurs sharp textures, which alone makes a
+  static surface look like it changes. Per pair the round trip |warp(warp(frame i, +f), -f) -
+  frame i| / 2, f = frac(mv + jitter offset), measures that on frame i itself (guides, colour and
+  delta; reported as *_resampling_floor); the animation hints also need the region residual above
+  HINT_FLOOR_RATIO x this floor. The residual can still not tell flow or waves from the per-frame
+  blue-noise dither the game applies to water normals; hence the wording of those hints.
 - normal_roughness: rgb = signed world-space normal, a = linear roughness. Colour is pre-exposed HDR
   (scene * pre_exposure): colour residuals use colour / pre_exposure so that exposure changes do not
   count as animation. R11G11B10 (6-bit mantissa) alone leaves about 0.1 % of the luminance as residual
@@ -75,6 +81,7 @@ HINT_FLAT_ANGLE_DEG = 10.0      # ... and mean normal angle spread below this
 HINT_RESIDUAL_RATIO = 3.0       # animates beyond the motion vectors: region residual above this x control
 MIN_RESIDUAL = 1e-3             # ... and above this absolute floor (so 0 vs 1e-9 noise does not count)
 MIN_RELATIVE_COLOUR = 0.01      # colour hint: ... and above this fraction of the region's mean luminance
+HINT_FLOOR_RATIO = 2.0          # ... and above this x the region's own resampling floor (see temporal_stats)
 DISOCCLUSION_TOLERANCE = 0.05   # reprojected source depth may differ from the pixel's by this fraction
 BOX_SIZE = 5                    # box filter that suppresses lighting noise before comparing colour
 CONTROL_MARGIN = 4              # automatic control keeps this many pixels away from the region
@@ -141,6 +148,7 @@ def make_taps(mv, offset=(0.0, 0.0)):
     x1, y1 = np.minimum(x0 + 1, width - 1), np.minimum(y0 + 1, height - 1)
     fx, fy = (sx - x0).ravel(), (sy - y0).ravel()
     return {'shape': (height, width), 'inside': inside,
+            'shift': mv + np.asarray(offset, np.float32),
             'index': [(y0 * width + x0).ravel(), (y0 * width + x1).ravel(),
                       (y1 * width + x0).ravel(), (y1 * width + x1).ravel()],
             'weight': [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy],
@@ -296,8 +304,10 @@ def jitter_delta(metas, i):
     return np.array(jitters[0], np.float64) - np.array(jitters[1], np.float64)
 
 
-def pair_offset(item, sign):
-    return (0.0, 0.0) if item['jitter_delta'] is None else tuple(sign * item['jitter_delta'])
+def pair_offset(item, signs):
+    """Jitter compensation (dx, dy) of the pair ending at this frame for the axis signs (sx, sy)."""
+    delta = item['jitter_delta']
+    return (0.0, 0.0) if delta is None else (signs[0] * delta[0], signs[1] * delta[1])
 
 
 def prepare(frames, metas, notes):
@@ -350,8 +360,19 @@ def camera_moved(metas):
                for k in keys[1:])
 
 
-def pair_maps(prev, cur, taps, prev_item, cur_item):
-    """Residual maps (NaN where unusable) of frame i-1 warped into frame i, and the valid mask."""
+def resampling_floor(image, shift):
+    """What bilinear resampling alone does to `image` at the fractional part f of `shift`: the
+    round trip |warp(warp(image, +f), -f) - image| / 2 (it errs about twice as much as one warp)."""
+    fraction = (shift - np.floor(shift)).astype(np.float32)
+    forward, back = make_taps(fraction), make_taps(-fraction)
+    reached = forward['inside'] if image.ndim == 2 else forward['inside'][..., None]
+    shifted = np.where(reached, warp(image, forward), np.nan)
+    return np.abs(warp(shifted, back) - image) / 2
+
+
+def pair_maps(prev, cur, taps, prev_item, cur_item, floor=False):
+    """Residual maps (NaN where unusable) of frame i-1 warped into frame i, and the valid mask. With
+    floor=True also '<name>_floor' maps: the resampling-only baseline of frame i at the same shift."""
     height, width = taps['shape']
     with np.errstate(invalid='ignore'):
         source_depth = prev_item['depth'].ravel()[taps['nearest']].reshape(height, width)
@@ -364,6 +385,13 @@ def pair_maps(prev, cur, taps, prev_item, cur_item):
         maps['colour'] = np.abs(warp(prev_item['colour'], taps) - cur_item['colour'])
         if prev_item['delta'] is not None and cur_item['delta'] is not None:
             maps['transparency_delta'] = np.abs(warp(prev_item['delta'], taps) - cur_item['delta'])
+        if floor:
+            for name, channels in (('normal_roughness', 4), ('diffuse_albedo', 3)):
+                maps[f'{name}_floor'] = resampling_floor(cur[name][..., :channels],
+                                                         taps['shift']).mean(axis=-1)
+            maps['colour_floor'] = resampling_floor(cur_item['colour'], taps['shift'])
+            if 'transparency_delta' in maps:
+                maps['transparency_delta_floor'] = resampling_floor(cur_item['delta'], taps['shift'])
     return {k: np.where(valid & np.isfinite(v), v, np.nan).astype(np.float32)
             for k, v in maps.items()}, valid
 
@@ -372,7 +400,8 @@ def first_usable_pair(metas):
     return next((i for i in range(1, len(metas)) if not metas[i].get('reset')), None)
 
 
-SCORE_KEYS = ('normal_roughness', 'diffuse_albedo', 'colour')
+GUIDE_KEYS = ('normal_roughness', 'diffuse_albedo')
+SCORE_KEYS = GUIDE_KEYS + ('colour',)
 
 
 def score_maps(maps, valid, window):
@@ -386,9 +415,9 @@ def score_maps(maps, valid, window):
     return (float(np.mean(values)) if values else None), int(valid[y0:y1, x0:x1].sum())
 
 
-def combined_residual(maps):
-    """Per-pixel mean of the guide and colour residual maps (NaN where all are unusable)."""
-    stack = np.stack([maps[key] for key in SCORE_KEYS])
+def combined_residual(maps, keys=SCORE_KEYS):
+    """Per-pixel mean of the residual maps `keys` (NaN where all are unusable)."""
+    stack = np.stack([maps[key] for key in keys])
     finite = np.isfinite(stack)
     mean = np.where(finite, stack, 0.0).sum(axis=0) / np.maximum(finite.sum(axis=0), 1)
     return np.where(finite.any(axis=0), mean, np.nan)
@@ -400,7 +429,7 @@ def pair_score(frames, derived, mv, i):
     return score_maps(maps, valid, (0, 0, valid.shape[1], valid.shape[0]))
 
 
-def choose_motion(frames, metas, derived, notes):
+def choose_motion(frames, metas, derived, notes, tiny_pixels=MV_TINY_PIXELS):
     """Set derived[i]['mv'] (render pixels) and describe the convention used and why."""
     height, width = frames[0]['color'].shape[:2]
     mv = [motion_pixels(frame, meta) for frame, meta in zip(frames, metas)]
@@ -411,7 +440,7 @@ def choose_motion(frames, metas, derived, notes):
                           'sampled at pixel + mv', 'mean_magnitude_px': mean,
             'camera_moved': camera_moved(metas), 'alternative_checked': False}
     pair = first_usable_pair(metas)
-    if pair is not None and mean is not None and mean < MV_TINY_PIXELS and info['camera_moved']:
+    if pair is not None and mean is not None and mean < tiny_pixels and info['camera_moved']:
         alternative = [motion_pixels(f, m, (width, height)) for f, m in zip(frames, metas)]
         (px_score, px_valid), (alt_score, alt_valid) = \
             pair_score(frames, derived, mv, pair), pair_score(frames, derived, alternative, pair)
@@ -440,57 +469,67 @@ def choose_motion(frames, metas, derived, notes):
     return info
 
 
+def sign_label(signs):
+    return f'{signs[0]:+d},{signs[1]:+d}'
+
+
 def choose_jitter(frames, metas, derived, windows):
-    """Sign s of the jitter compensation pixel + mv + s * (jitter[i-1] - jitter[i]); returns (s, info).
-    Decided on the first usable pair, in the control window, else in the frame outside the region (the
-    water must not decide its own compensation), else in the whole frame. Only pixels whose
-    uncompensated residual exceeds MIN_RESIDUAL count (hard edges that do not move would otherwise
-    dilute or reverse the decision), at least MIN_HINT_PIXELS of them; the best of s = +1, -1 must
-    lower their mean residual below ALT_IMPROVEMENT x the uncompensated one."""
-    info = {'rule': 'previous frame sampled at pixel + mv + s * (jitter[i-1] - jitter[i]); s chosen '
-                    'from {+1, -1} by the lowest residual on the first usable pair', 'applied': False,
-            'sign': None, 'decided_on': None}
+    """Axis signs (sx, sy) of the jitter compensation pixel + mv + (sx dx, sy dy), with (dx, dy) =
+    jitter[i-1] - jitter[i]; returns ((sx, sy), info). Engines differ in the sign of each axis, so all
+    of {+1, -1}^2 are tried (an axis whose jitter does not change keeps 0). Decided on the first usable
+    pair from the GUIDE residuals only (the guides are noise free and rendered at the jitter; the
+    colour is noisy), in the control window, else in the frame outside the region (the water must not
+    decide its own compensation), else in the whole frame. Only pixels whose uncompensated residual
+    exceeds MIN_RESIDUAL count (hard edges that do not move would otherwise dilute or reverse the
+    decision), at least MIN_HINT_PIXELS of them; the best candidate must lower their mean residual
+    below ALT_IMPROVEMENT x the uncompensated one."""
+    info = {'rule': 'previous frame sampled at pixel + mv + (sx*dx, sy*dy), (dx, dy) = jitter[i-1] - '
+                    'jitter[i]; (sx, sy) chosen from {+1, -1}^2 by the lowest guide residual on the '
+                    'first usable pair', 'applied': False, 'sign': None, 'decided_on': None}
     pair = first_usable_pair(metas)
     delta = derived[pair]['jitter_delta'] if pair is not None else None
     if delta is None:
         info['reason'] = ('camera.motion_vectors_jittered is set, jitter is missing, or there is no usable '
                           'frame pair: no jitter compensation')
-        return 0, info
+        return (0, 0), info
     if np.abs(delta).max() < JITTER_MIN_PIXELS:
         info['reason'] = 'jitter does not change between the first usable pair: nothing to compensate'
-        return 0, info
+        return (0, 0), info
     info['pair'] = pair
+    options = [(1, -1) if abs(d) >= JITTER_MIN_PIXELS else (0,) for d in delta]
+    candidates = [(sx, sy) for sx in options[0] for sy in options[1]]
     maps = {}
-    for sign in (0, 1, -1):
-        taps = make_taps(derived[pair]['mv'], pair_offset(derived[pair], sign))
-        maps[sign] = combined_residual(pair_maps(frames[pair - 1], frames[pair], taps,
-                                                 derived[pair - 1], derived[pair])[0])
+    for signs in [(0, 0)] + candidates:
+        taps = make_taps(derived[pair]['mv'], pair_offset(derived[pair], signs))
+        maps[signs] = combined_residual(pair_maps(frames[pair - 1], frames[pair], taps,
+                                                  derived[pair - 1], derived[pair])[0], GUIDE_KEYS)
     whole, region = windows['whole_frame'], windows.get('region')
-    candidates = {'control': (windows['control'], None)} if 'control' in windows else {}
-    candidates['outside_region' if region else 'whole_frame'] = (whole, region)
+    where = {'control': (windows['control'], None)} if 'control' in windows else {}
+    where['outside_region' if region else 'whole_frame'] = (whole, region)
     info['residuals'] = {}
-    for name, (window, exclude) in candidates.items():
-        use = np.ones(maps[0].shape, bool)
+    for name, (window, exclude) in where.items():
+        use = np.ones(maps[(0, 0)].shape, bool)
         if exclude is not None:
             use[exclude[1]:exclude[3], exclude[0]:exclude[2]] = False
         x0, y0, x1, y1 = window
-        chosen = (use & (maps[0] > MIN_RESIDUAL))[y0:y1, x0:x1]
+        chosen = (use & (maps[(0, 0)] > MIN_RESIDUAL))[y0:y1, x0:x1]
         by = {}
-        for sign in (0, 1, -1):
-            values = maps[sign][y0:y1, x0:x1][chosen]
+        for signs, residual in maps.items():
+            values = residual[y0:y1, x0:x1][chosen]
             values = values[np.isfinite(values)]
-            by[sign] = float(values.mean()) if values.size else None
-        info['residuals'][name] = {'none': by[0], '+1': by[1], '-1': by[-1], 'pixels': int(chosen.sum())}
+            by[signs] = float(values.mean()) if values.size else None
+        info['residuals'][name] = {'none': by[(0, 0)], 'pixels': int(chosen.sum()),
+                                   **{sign_label(signs): by[signs] for signs in candidates}}
         if chosen.sum() < MIN_HINT_PIXELS or None in by.values():
             continue
-        sign = 1 if by[1] <= by[-1] else -1
-        if by[sign] < ALT_IMPROVEMENT * by[0]:
-            info.update(applied=True, sign=sign, decided_on=name)
-            return sign, info
-    info['reason'] = (f'no window had {MIN_HINT_PIXELS}+ pixels with an uncompensated residual above '
-                      f'{MIN_RESIDUAL} that s=+1 or s=-1 lowered below {ALT_IMPROVEMENT} x: no jitter '
-                      'compensation')
-    return 0, info
+        best = min(candidates, key=lambda signs: by[signs])
+        if by[best] < ALT_IMPROVEMENT * by[(0, 0)]:
+            info.update(applied=True, sign=list(best), decided_on=name)
+            return best, info
+    info['reason'] = (f'no window had {MIN_HINT_PIXELS}+ pixels with an uncompensated guide residual '
+                      f'above {MIN_RESIDUAL} that any axis sign pair lowered below {ALT_IMPROVEMENT} x: '
+                      'jitter not compensated')
+    return (0, 0), info
 
 
 # --- window statistics ----------------------------------------------------------------------------
@@ -507,22 +546,25 @@ def clip_window(window, width, height, name, notes):
 
 def pick_control(region, ordinary, delta):
     """Same-size window clear of the region (CONTROL_MARGIN) with the most status==1 pixels, then the
-    fewest pixels whose transparency delta exceeds DELTA_THRESHOLD; first in raster order on ties."""
+    fewest pixels whose transparency delta exceeds DELTA_THRESHOLD, counted in the window grown by
+    CONTROL_MARGIN (the box filter and bilinear taps reach that far); first in raster order on ties."""
     height, width = ordinary.shape
     x0, y0, x1, y1 = region
     w, h = x1 - x0, y1 - y0
     if w > width or h > height:
         return None
+    ys, xs = np.indices((height - h + 1, width - w + 1))
 
-    def window_sums(mask):
+    def window_sums(mask, grow=0):
         total = np.zeros((height + 1, width + 1), np.int64)
         total[1:, 1:] = mask.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
-        return total[h:, w:] - total[:height - h + 1, w:] - total[h:, :width - w + 1] + \
-            total[:height - h + 1, :width - w + 1]
+        top, bottom = np.clip(ys - grow, 0, height), np.clip(ys + h + grow, 0, height)
+        left, right = np.clip(xs - grow, 0, width), np.clip(xs + w + grow, 0, width)
+        return total[bottom, right] - total[top, right] - total[bottom, left] + total[top, left]
 
     count = window_sums(ordinary)
-    changed = window_sums(delta > DELTA_THRESHOLD) if delta is not None else np.zeros_like(count)
-    ys, xs = np.indices(count.shape)
+    changed = window_sums(delta > DELTA_THRESHOLD, CONTROL_MARGIN) if delta is not None \
+        else np.zeros_like(count)
     clear = (xs + w <= x0 - CONTROL_MARGIN) | (xs >= x1 + CONTROL_MARGIN) | \
         (ys + h <= y0 - CONTROL_MARGIN) | (ys >= y1 + CONTROL_MARGIN)
     if not clear.any():
@@ -606,10 +648,11 @@ def window_stats(frame, item, delta, matrix, layout, window):
     return stats
 
 
-def temporal_stats(frames, metas, derived, windows, jitter_sign):
+def temporal_stats(frames, metas, derived, windows, jitter_signs):
     """Per window: residuals after warping frame i-1 into frame i with i's motion vectors (plus the
-    jitter compensation), averaged over the pairs. Also returns the maps and index of the first
-    usable pair, for the pictures."""
+    jitter compensation), averaged over the pairs, and the resampling-only floor of the same
+    warps (what bilinear resampling at the same fractional shifts does to frame i itself). Also
+    returns the maps and index of the first usable pair, for the pictures."""
     per_pair = {name: {} for name in windows}
     skipped, used, first = [], 0, None
     for i in range(1, len(frames)):
@@ -617,8 +660,8 @@ def temporal_stats(frames, metas, derived, windows, jitter_sign):
             skipped.append(i)
             continue
         maps, valid = pair_maps(frames[i - 1], frames[i],
-                                make_taps(derived[i]['mv'], pair_offset(derived[i], jitter_sign)),
-                                derived[i - 1], derived[i])
+                                make_taps(derived[i]['mv'], pair_offset(derived[i], jitter_signs)),
+                                derived[i - 1], derived[i], floor=True)
         used += 1
         first = first or (maps, i)
         for name, (x0, y0, x1, y1) in windows.items():
@@ -637,13 +680,18 @@ def temporal_stats(frames, metas, derived, windows, jitter_sign):
     for name in windows:
         means = {key: mean(values) for key, values in per_pair[name].items()}
         guides = [means[k] for k in ('normal_roughness', 'diffuse_albedo') if means.get(k) is not None]
+        guide_floors = [means[f'{k}_floor'] for k in ('normal_roughness', 'diffuse_albedo')
+                        if means.get(f'{k}_floor') is not None]
         result[name] = {'pairs_used': used, 'pairs_skipped_reset': skipped,
                         'valid_pixels': means['valid_pixels'],
                         'guide_residual': mean(guides),
                         'normal_roughness_residual': means.get('normal_roughness'),
                         'diffuse_albedo_residual': means.get('diffuse_albedo'),
                         'colour_residual': means.get('colour'),
-                        'transparency_delta_residual': means.get('transparency_delta')}
+                        'transparency_delta_residual': means.get('transparency_delta'),
+                        'guide_resampling_floor': mean(guide_floors),
+                        'colour_resampling_floor': means.get('colour_floor'),
+                        'transparency_delta_resampling_floor': means.get('transparency_delta_floor')}
     return result, first
 
 
@@ -657,13 +705,17 @@ def dig(data, *keys):
     return data
 
 
-def animates(region_value, control_value):
-    return region_value > HINT_RESIDUAL_RATIO * control_value and region_value > MIN_RESIDUAL
+def animates(region_value, control_value, floor=None):
+    """Region residual above HINT_RESIDUAL_RATIO x control, MIN_RESIDUAL and HINT_FLOOR_RATIO x the
+    region's resampling floor (when known)."""
+    return region_value > HINT_RESIDUAL_RATIO * control_value and region_value > MIN_RESIDUAL and \
+        (floor is None or region_value > HINT_FLOOR_RATIO * floor)
 
 
-def make_hints(region, control):
+def make_hints(region, control, jitter_undecided=False):
     """HEURISTIC readings of the region (and control) statistics; fires is None if not evaluable,
-    including when region or control has fewer than MIN_HINT_PIXELS valid pixels."""
+    including when region or control has fewer than MIN_HINT_PIXELS valid pixels, and for the two
+    animation hints when the jitter changes between frames but no compensation could be decided."""
     hints = []
 
     def add(hint_id, fires, statement, detail, low_sample=False):
@@ -709,40 +761,57 @@ def make_hints(region, control):
             f'plane RMS {rms:.3g} of median view depth (flat needs < {HINT_FLAT_PLANE_RMS}), '
             f'normal angle spread {angle:.3g} deg (flat needs < {HINT_FLAT_ANGLE_DEG})')
 
-    statement = 'guides animate in the region beyond the motion vectors'
+    not_compensated = ('jitter not compensated: the sub-pixel jitter changes between frames and no axis '
+                       'sign pair could be decided from the guides, so the residuals would mostly '
+                       'measure the jitter')
+    statement = ('guides change frame to frame beyond the motion vectors (flow, waves or per-frame '
+                 'dither)')
     r, c = dig(region, 'temporal', 'guide_residual'), dig(control, 'temporal', 'guide_residual')
+    floor = dig(region, 'temporal', 'guide_resampling_floor')
     if r is None or c is None:
         add('guides_animate', None, f'not evaluated: {statement}', 'needs a control window and 2+ frames')
+    elif jitter_undecided:
+        add('guides_animate', None, f'not evaluated: {statement}', not_compensated)
     elif few(*moving):
         add('guides_animate', None, f'not evaluated: {statement}', few(*moving), True)
     else:
-        fires = animates(r, c)
+        fires = animates(r, c, floor)
         add('guides_animate', fires, statement if fires else f'not indicated: {statement}',
-            f'region guide residual {r:.3g}, control {c:.3g} (needs > {HINT_RESIDUAL_RATIO} x control '
-            f'and > {MIN_RESIDUAL})')
+            f'region guide residual {r:.3g}, control {c:.3g}, region resampling floor '
+            f'{"n/a" if floor is None else format(floor, ".3g")} (needs > {HINT_RESIDUAL_RATIO} x control, '
+            f'> {MIN_RESIDUAL} and > {HINT_FLOOR_RATIO} x the floor)')
 
-    statement = 'colour or transparency layer animates beyond the motion vectors'
+    statement = ('colour or transparency layer changes frame to frame beyond the motion vectors (flow, '
+                 'waves, per-frame dither or noise)')
     checks = [(label, dig(region, 'temporal', key), dig(control, 'temporal', key),
-               dig(region, 'temporal', f'{key}_relative'), dig(control, 'temporal', f'{key}_relative'))
-              for label, key in (('colour', 'colour_residual'), ('delta', 'transparency_delta_residual'))]
+               dig(region, 'temporal', f'{key}_relative'), dig(control, 'temporal', f'{key}_relative'),
+               dig(region, 'temporal', floor_key))
+              for label, key, floor_key in (('colour', 'colour_residual', 'colour_resampling_floor'),
+                                            ('delta', 'transparency_delta_residual',
+                                             'transparency_delta_resampling_floor'))]
     checks = [check for check in checks if check[1] is not None and check[2] is not None]
     if not checks:
         add('colour_animates', None, f'not evaluated: {statement}', 'needs a control window and 2+ frames')
+    elif jitter_undecided:
+        add('colour_animates', None, f'not evaluated: {statement}', not_compensated)
     elif few(*moving):
         add('colour_animates', None, f'not evaluated: {statement}', few(*moving), True)
     else:
-        def part(label, r, c, relative_r, relative_c):
+        def part(label, r, c, relative_r, relative_c, floor):
             text = f'region {label} residual {r:.3g}, control {c:.3g}'
+            if floor is not None:
+                text += f', region resampling floor {floor:.3g}'
             if relative_r is None or relative_c is None:
                 return text
             return text + (f' (relative to mean luminance {dig(region, "mean_luminance"):.3g} / '
                            f'{dig(control, "mean_luminance"):.3g}: {relative_r:.3g} / {relative_c:.3g})')
 
-        fires = any(animates(r, c) and (rr is None or rr > MIN_RELATIVE_COLOUR) for _, r, c, rr, _ in checks)
+        fires = any(animates(r, c, floor) and (rr is None or rr > MIN_RELATIVE_COLOUR)
+                    for _, r, c, rr, _, floor in checks)
         add('colour_animates', fires, statement if fires else f'not indicated: {statement}',
             '; '.join(part(*check) for check in checks) + f' (needs > {HINT_RESIDUAL_RATIO} x control, > '
-            f'{MIN_RESIDUAL} and > {MIN_RELATIVE_COLOUR} of the region luminance; luminance / pre_exposure '
-            'after a 5x5 box filter)')
+            f'{MIN_RESIDUAL}, > {MIN_RELATIVE_COLOUR} of the region luminance and > {HINT_FLOOR_RATIO} x '
+            'the floor; luminance / pre_exposure after a 5x5 box filter)')
     return hints
 
 
@@ -898,7 +967,7 @@ def normals_look_encoded(normals):
     return finite.size > 0 and bool(finite.min() >= 0)
 
 
-def analyse(manifest, frames, region, control):
+def analyse(manifest, frames, region, control, mv_tiny_pixels=MV_TINY_PIXELS):
     """Measure everything; returns (report dict, data for the pictures)."""
     if not frames:
         raise ValueError('capture has no frames')
@@ -910,7 +979,7 @@ def analyse(manifest, frames, region, control):
     metas = manifest['frames']
     notes = []
     derived, layout, matrices = prepare(frames, metas, notes)
-    motion = choose_motion(frames, metas, derived, notes)
+    motion = choose_motion(frames, metas, derived, notes, mv_tiny_pixels)
     before = frames[0].get('color_before_transparency')
     delta = relative_delta(frames[0]['color'], before) if before is not None else None
     if delta is None:
@@ -942,22 +1011,23 @@ def analyse(manifest, frames, region, control):
                     f'pixels, {picked["changed_pixels"]} pixels with transparency delta > {DELTA_THRESHOLD}')}
         if control_info:
             windows['control'] = tuple(control_info['window'])
-    jitter_sign, jitter = choose_jitter(frames, metas, derived, windows)
+    jitter_signs, jitter = choose_jitter(frames, metas, derived, windows)
     if jitter['applied']:
         residual = jitter['residuals'][jitter['decided_on']]
-        notes.append(f'jitter compensation s={jitter_sign:+d} decided in the {jitter["decided_on"]} window '
-                     f'(residual {residual["none"]:.3g} without, '
-                     f'{residual["+1" if jitter_sign > 0 else "-1"]:.3g} with, over '
+        notes.append(f'jitter compensation signs (x, y) = ({jitter_signs[0]:+d}, {jitter_signs[1]:+d}) '
+                     f'decided in the {jitter["decided_on"]} window (guide residual {residual["none"]:.3g} '
+                     f'without, {residual[sign_label(jitter_signs)]:.3g} with, over '
                      f'{residual["pixels"]} pixels)')
     elif 'residuals' in jitter:
         notes.append(jitter['reason'])
+    jitter_undecided = 'residuals' in jitter and not jitter['applied']
     stats = {name: window_stats(frames[0], derived[0], delta, matrices[0], layout, window)
              for name, window in windows.items()}
     for name, window_stat in stats.items():
         if window_stat['ordinary_pixels'] == 0:
             notes.append(f'{name} has no status==1 pixels (see its status histogram): guide, depth-plane, '
                          'motion and delta statistics are empty')
-    temporal, first = temporal_stats(frames, metas, derived, windows, jitter_sign) if len(frames) > 1 \
+    temporal, first = temporal_stats(frames, metas, derived, windows, jitter_signs) if len(frames) > 1 \
         else ({name: None for name in windows}, None)
     if len(frames) > 1 and first is None:
         notes.append('every frame pair was skipped (frame i has the reset flag): no temporal statistics')
@@ -972,7 +1042,7 @@ def analyse(manifest, frames, region, control):
     if layout is not None:
         clip = {key: layout[key] for key in ('layout', 'ambiguous', 'source', 'structure_layout',
                                              'data_layout', 'scores')}
-    hints = make_hints(stats.get('region'), stats.get('control')) if region else []
+    hints = make_hints(stats.get('region'), stats.get('control'), jitter_undecided) if region else []
     notes += [f'hint {hint["id"]} not evaluated: {hint["detail"]}' for hint in hints if hint['low_sample']]
     report = {
         'capture': {'frame_count': len(frames), 'render_size': [width, height],
@@ -1059,11 +1129,12 @@ def render_text(report):
     return '\n'.join(lines)
 
 
-def run_probe(folder, region=None, control=None, out_dir=None, echo=False):
+def run_probe(folder, region=None, control=None, out_dir=None, echo=False,
+              mv_tiny_pixels=MV_TINY_PIXELS):
     """Load the capture, measure, write pictures and report.json/report.txt; returns the report."""
     folder = Path(folder)
     manifest, frames = load(folder)
-    report, panel = analyse(manifest, frames, region, control)
+    report, panel = analyse(manifest, frames, region, control, mv_tiny_pixels)
     report['capture']['folder'] = str(folder)
     out = Path(out_dir) if out_dir else folder / 'water-probe'
     out.mkdir(parents=True, exist_ok=True)
@@ -1119,36 +1190,42 @@ def synthetic_projection():
     return m, np.linalg.inv(m)
 
 
-def scene_jitter(t, jitter):
-    """Jitter of frame t in render pixels: alternates between 0 and `jitter` in x."""
-    return jitter * (t % 2), -0.125
+def scene_jitter(t, jitter, jitter_y=0.0):
+    """Jitter of frame t in render pixels: alternates between 0 and `jitter` in x and between -0.125
+    and -0.125 + `jitter_y` in y."""
+    return jitter * (t % 2), -0.125 + jitter_y * (t % 2)
 
 
-def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1):
+def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, flip_y=False,
+                    period=SYN_WATER_PERIOD, noise=0.0):
     """Frame t of the synthetic scene as float arrays, rendered at the frame's jitter.
 
     Default: static camera, zero motion; sky rows on top; a ground plane (control); a static
     transparent patch at the left; a flat "water" rectangle whose normals and colour layer scroll
     `scroll` px per frame. With drift: a textured flat scene shifting `drift` px per frame, motion
-    vectors stored normalised by the image width, as a moving camera would. The textures are sampled
-    at pixel + sign * jitter (the tool does not know which sign the renderer uses)."""
+    vectors stored normalised by the image width, as a moving camera would. Everything, the masks
+    and their edges and the depth included, is evaluated at the jittered pixel centre
+    pixel + sign * jitter (the tool does not know which sign the renderer uses; flip_y gives y the
+    opposite sign). noise: standard deviation of colour noise (the same field in the colour and in
+    the colour before transparency, new every frame, like ray-traced lighting)."""
     yy, xx = np.mgrid[0:SYN_H, 0:SYN_W].astype(np.float64)
     fy = 1 / math.tan(SYN_FOV / 2)
-    ndc_y = 1 - (yy + 0.5) / SYN_H * 2
+    jx, jy = scene_jitter(t, jitter, jitter_y)
+    sx, sy = xx + sign * jx, yy + (-sign if flip_y else sign) * jy
+    ndc_y = 1 - (sy + 0.5) / SYN_H * 2
     none = np.zeros(yy.shape, bool)
     x0, y0, x1, y1 = SYN_REGION
-    water = none if drift else (xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1)
-    sky = none if drift else yy < 12
-    patch = none if drift else (xx < 8) & (yy >= 12) & (yy < 44)
-    strip = none if drift else (xx >= 84) & (yy >= 12)    # static textured "terrain" outside the region
-    jx, jy = scene_jitter(t, jitter)
-    sx, sy = xx + sign * jx, yy + sign * jy
+    cx, cy = sx + 0.5, sy + 0.5
+    water = none if drift else (cx >= x0) & (cx < x1) & (cy >= y0) & (cy < y1)
+    sky = none if drift else cy < 12
+    patch = none if drift else (cx < 8) & (cy >= 12) & (cy < 44)
+    strip = none if drift else (cx >= 84) & (cy >= 12)    # static textured "terrain" outside the region
     if drift:
         phase = 2 * np.pi * (sx + drift * t) / 24
         wave = np.sin(phase) * np.cos(2 * np.pi * sy / 20)
         z = np.full(yy.shape, 5.0)
     else:
-        phase = 2 * np.pi * ((sx - t * scroll) / SYN_WATER_PERIOD[0] + sy / SYN_WATER_PERIOD[1])
+        phase = 2 * np.pi * ((sx - t * scroll) / period[0] + sy / period[1])
         wave = np.where(strip, np.sin(2 * np.pi * sx / 20) * np.cos(2 * np.pi * sy / 18), np.sin(phase))
         phase = np.where(strip, 2 * np.pi * sx / 20, phase)
         z = np.where(water, 5.0, 6.0 / ((0.3 * ndc_y / fy + 1) / math.hypot(0.3, 1)))
@@ -1165,6 +1242,8 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1):
         array[sky] = 0.0
     base = 0.6 + 0.2 * wave if drift else np.where(sky, 0.8, np.where(strip, 0.5 + 0.1 * wave, 0.5))
     before = base[..., None] * np.ones(3)
+    if noise:
+        before = before + noise * np.random.default_rng(1000 + t).standard_normal(before.shape)
     color = before + np.where(water, 0.3 + 0.2 * wave, 0.0)[..., None] + \
         np.where(patch & ~water, 0.2, 0.0)[..., None]
     motion = np.zeros((SYN_H, SYN_W, 2))
@@ -1175,14 +1254,15 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1):
 
 
 def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.25, sign=1,
-                  exposure=1.0):
+                  exposure=1.0, **scene_options):
     """Write a synthetic capture that follows capture-format.md (manifest.json last). Odd frames
-    have pre_exposure `exposure` (colours scaled to match) and jitter `jitter`."""
+    have pre_exposure `exposure` (colours scaled to match) and jitter `jitter`; scene_options
+    (jitter_y, flip_y, period, noise) go to synthetic_scene."""
     projection, c2v = synthetic_projection()
     folder.mkdir(parents=True, exist_ok=True)
     manifest_frames = []
     for t in range(frames):
-        scene = synthetic_scene(t, drift, scroll, jitter, sign)
+        scene = synthetic_scene(t, drift, scroll, jitter, sign, **scene_options)
         pre_exposure = exposure if t % 2 else 1.0
         color = encode_r11g11b10(scene['color'] * pre_exposure)
         prior = encode_r11g11b10(scene['before'] * pre_exposure)
@@ -1212,7 +1292,8 @@ def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.2
         world_to_view[3, 0] = -moved
         camera = {'position': [moved, 0, 0], 'right': [1, 0, 0], 'up': [0, 1, 0], 'forward': [0, 0, 1],
                   'near': SYN_NEAR, 'far': 1e30, 'fov': SYN_FOV, 'aspect': SYN_W / SYN_H,
-                  'jitter': list(scene_jitter(t, jitter)), 'motion_vector_scale': [1, 1],
+                  'jitter': list(scene_jitter(t, jitter, scene_options.get('jitter_y', 0.0))),
+                  'motion_vector_scale': [1, 1],
                   'view_to_clip': projection.ravel().tolist(), 'clip_to_view': c2v.ravel().tolist(),
                   'depth_inverted': 1, 'camera_motion_included': 1, 'motion_vectors_3d': 0, 'reset': 0,
                   'orthographic': 0, 'motion_vectors_dilated': 0, 'motion_vectors_jittered': 0}
@@ -1221,8 +1302,8 @@ def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.2
             'reset': False, 'reset_reasons': 0, 'replaced_sr': True,
             'stats': {'bad_frame': 0, 'copied_frame': 1, 'isolated_guide_pixels': 0,
                       'sanitized_sss_samples': 0},
-            'jitter': list(scene_jitter(t, jitter)), 'motion_vector_scale': [1, 1],
-            'pre_exposure': pre_exposure,
+            'jitter': list(scene_jitter(t, jitter, scene_options.get('jitter_y', 0.0))),
+            'motion_vector_scale': [1, 1], 'pre_exposure': pre_exposure,
             'exposure_scale': 1, 'color_subrect': [0, 0], 'depth_subrect': [0, 0],
             'motion_subrect': [0, 0], 'world_to_view': world_to_view.ravel().tolist(),
             'view_to_clip': projection.ravel().tolist(), 'camera': camera, 'cpu_time_ms': 1000.0 * t,
@@ -1300,12 +1381,53 @@ def self_test():
            not normals_look_encoded(np.array([[-0.1, 0.5, 1.0]])) and
            not normals_look_encoded(np.full((2, 3), np.nan)), 'encoded-normals note ignores NaN')
     expect(pick_control((0, 0, SYN_W, SYN_H), ordinary, None) is None, 'no room for a control')
+    changed = np.zeros((SYN_H, SYN_W))
+    changed[20, 30] = 1.0     # one changed pixel: windows within CONTROL_MARGIN of it lose to a clear one
+    fallback = pick_control((50, 20, 70, 40), np.ones((SYN_H, SYN_W), bool), changed)
+    expect(fallback['changed_pixels'] == 0 and
+           not (fallback['window'][0] - CONTROL_MARGIN <= 30 < fallback['window'][2] + CONTROL_MARGIN and
+                fallback['window'][1] - CONTROL_MARGIN <= 20 < fallback['window'][3] + CONTROL_MARGIN),
+           f'control keeps CONTROL_MARGIN away from changed pixels: {fallback}')
+    stripes = np.tile(np.array([0.0, 1.0]), (8, 4))     # columns alternate 0, 1
+    def floor_of(image, shift):
+        return resampling_floor(image, np.full((8, 8, 2), shift, np.float32))[2:6, 2:6]
+
+    expect(np.allclose(floor_of(stripes, [0.5, 0.0]), 0.25) and
+           np.allclose(floor_of(stripes, [3.0, 2.0]), 0.0) and
+           np.allclose(floor_of(np.ones((8, 8)), [0.3, 0.7]), 0.0, atol=1e-6),
+           'resampling floor: a half-pixel shift of 0/1 stripes errs by 0.25 after the round trip, '
+           'whole-pixel shifts and flat images by 0')
+    expect(animates(2.0, 0.0, None) and animates(2.0, 0.0, 0.9) and not animates(2.0, 0.0, 1.1) and
+           not animates(2.0, 1.0, None), 'animates: control ratio and floor ratio')
     rough = make_hints({'ordinary_pixels': 1000, 'plane_fit': {'rms_over_median_view_depth': 0.05},
                         'normals': {'mean_angle_deg': 3.0}}, None)
     flat_hint = next(h for h in rough if h['id'] == 'flat_surface')
     expect(flat_hint['fires'] is False and 'rough geometry (riverbed?)' in flat_hint['statement'],
            'rough geometry hint')
     expect(all(h['fires'] is None for h in rough if h['id'] != 'flat_surface'), 'no control, no hints')
+
+    def moving_stats(guide_floor, colour_floor):
+        region = {'ordinary_pixels': 1000, 'mean_luminance': 0.8,
+                  'temporal': {'valid_pixels': 900, 'guide_residual': 0.01,
+                               'guide_resampling_floor': guide_floor, 'colour_residual': 0.02,
+                               'colour_residual_relative': 0.025, 'colour_resampling_floor': colour_floor}}
+        quiet = {'ordinary_pixels': 1000, 'mean_luminance': 0.5,
+                 'temporal': {'valid_pixels': 900, 'guide_residual': 0.0, 'colour_residual': 0.0,
+                              'colour_residual_relative': 0.0}}
+        return region, quiet
+
+    def fires(hints, hint_id):
+        return next(h for h in hints if h['id'] == hint_id)['fires']
+
+    above = make_hints(*moving_stats(0.004, 0.005))     # residuals 2.5x and 4x their floors
+    below = make_hints(*moving_stats(0.006, 0.015))     # 1.7x and 1.3x
+    expect(fires(above, 'guides_animate') is True and fires(above, 'colour_animates') is True and
+           fires(below, 'guides_animate') is False and fires(below, 'colour_animates') is False,
+           'animation hints need HINT_FLOOR_RATIO x the resampling floor')
+    unsure = make_hints(*moving_stats(0.004, 0.005), jitter_undecided=True)
+    expect(all(fires(unsure, name) is None for name in ('guides_animate', 'colour_animates')) and
+           all('jitter not compensated' in h['detail'] for h in unsure if h['id'] in
+               ('guides_animate', 'colour_animates')), 'undecided jitter: animation hints not evaluated')
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1315,7 +1437,7 @@ def self_test():
         # Region plus automatic control, end to end.
         report = run_probe(tmp / 'water', region=SYN_REGION, out_dir=out)
         region, control = region_of(report, 'region'), region_of(report, 'control')
-        expect(report['control']['window'] == [8, 12, 40, 44], f'automatic control {report["control"]}')
+        expect(report['control']['window'] == [12, 12, 44, 44], f'automatic control {report["control"]}')
         expect(control['ordinary_pixels'] == 32 * 32, 'control is all status==1')
         expect(region['transparency_delta']['fraction_above'] > 0.5, 'region delta fraction')
         expect(control['transparency_delta']['fraction_above'] < 0.1, 'control delta fraction')
@@ -1323,9 +1445,11 @@ def self_test():
         expect(rt['pairs_used'] == 7 and ct['pairs_used'] == 7, 'seven frame pairs')
         expect(rt['guide_residual'] > 3 * ct['guide_residual'] and rt['guide_residual'] > MIN_RESIDUAL,
                f'guide residual {rt["guide_residual"]} vs {ct["guide_residual"]}')
-        # (the patch edge next to the control is static; compensating the jitter leaves a little there)
-        expect(ct['guide_residual'] < MIN_RESIDUAL and ct['colour_residual'] < MIN_RESIDUAL,
-               'control is static')
+        # (edges are rendered at the jitter too, and the control keeps clear of the patch edge)
+        expect(ct['guide_residual'] < 1e-6 and ct['colour_residual'] < 1e-6, 'control is static')
+        expect(all(rt[f'{key}_residual'] > HINT_FLOOR_RATIO * rt[f'{key}_resampling_floor'] > 0
+                   for key in ('guide', 'colour', 'transparency_delta')),
+               f'moving water is well above its resampling floor: {rt}')
         expect(rt['colour_residual'] > MIN_RESIDUAL and rt['transparency_delta_residual'] > MIN_RESIDUAL,
                'region colour and delta animate')
         expect(region['plane_fit']['rms_over_median_view_depth'] < 1e-4, 'water is a flat plane')
@@ -1342,7 +1466,7 @@ def self_test():
                clip['data_layout'] == 'row-vector', 'clip layout')
         expect(report['conventions']['motion']['alternative_checked'] is False, 'motion convention')
         info = report['conventions']['jitter']
-        expect(info['applied'] and info['sign'] == -1 and info['decided_on'] == 'outside_region',
+        expect(info['applied'] and info['sign'] == [-1, 0] and info['decided_on'] == 'outside_region',
                f'jitter sign is found from the textured terrain: {info}')
         expect(region['mean_luminance'] > control['mean_luminance'] and
                'relative to mean luminance' in hint(report, 'colour_animates')['detail'], 'luminance detail')
@@ -1430,9 +1554,9 @@ def self_test():
             still = run_probe(tmp / f'jitter{sign}', **args)
             info = still['conventions']['jitter']
             residual = info['residuals']['outside_region']
-            expect(info['applied'] and info['sign'] == -sign and info['decided_on'] == 'outside_region',
+            expect(info['applied'] and info['sign'] == [-sign, 0] and info['decided_on'] == 'outside_region',
                    f'jitter sign for renderer sign {sign}: {info}')
-            right, wrong = ('+1', '-1') if info['sign'] > 0 else ('-1', '+1')
+            right, wrong = f'{-sign:+d},+0', f'{sign:+d},+0'
             expect(residual[wrong] > residual['none'] > residual[right], f'jitter residuals {residual}')
             temporal = region_of(still, 'region')['temporal']
             expect(all(hint(still, name)['fires'] is False for name in ('guides_animate', 'colour_animates')),
@@ -1441,8 +1565,66 @@ def self_test():
             motion_vectors_jittered=1) for f in m['frames']])
         raw_jitter = run_probe(flagged, **args)
         expect(not raw_jitter['conventions']['jitter']['applied'] and
+               'residuals' not in raw_jitter['conventions']['jitter'] and
                all(hint(raw_jitter, name)['fires'] is True for name in ('guides_animate', 'colour_animates')),
                'jitter in the pixels but not compensated would read as animation')
+
+        # Noisy colour (sigma 0.15 on a 0.5 base, new every frame) and a y jitter that changes with the
+        # opposite renderer sign to x: the sign pair is decided from the guides, static water does not
+        # animate, scrolling water still does. The region is a sub-rectangle of the water, so a 4 px
+        # rim of scrolling water is part of "outside the region" and the decision has to survive it.
+        args = dict(region=(52, 24, 76, 48), control=(12, 20, 36, 44), out_dir=out)
+        for label, options, signs in (('noisy colour', dict(noise=0.15), [-1, 0]),
+                                      ('flipped y jitter', dict(jitter_y=0.4, flip_y=True), [-1, 1]),
+                                      ('noisy and flipped', dict(noise=0.15, jitter_y=0.4, flip_y=True),
+                                       [-1, 1])):
+            runs = {}
+            for motion, scroll in (('static', 0), ('scrolling', 1.0)):
+                folder = tmp / f'{label}-{motion}'.replace(' ', '_')
+                write_capture(folder, scroll=scroll, jitter=0.5, **options)
+                runs[motion] = run_probe(folder, **args)
+                info = runs[motion]['conventions']['jitter']
+                expect(info['applied'] and info['sign'] == signs and info['decided_on'] == 'outside_region',
+                       f'{label}, {motion}: jitter signs {info}')
+            temporal = region_of(runs['static'], 'region')['temporal']
+            expect(all(hint(runs['static'], name)['fires'] is False
+                       for name in ('guides_animate', 'colour_animates')),
+                   f'{label}: static water must not animate: {temporal}')
+            expect(all(hint(runs['scrolling'], name)['fires'] is True
+                       for name in ('guides_animate', 'colour_animates')),
+                   f'{label}: scrolling water must animate: '
+                   f'{region_of(runs["scrolling"], "region")["temporal"]}')
+
+        # Jitter that changes while the only texture is inside the region (so nothing outside can
+        # decide the sign): the two animation hints are not evaluated, and say why.
+        lost = run_probe(tmp / 'jitter1', region=(48, 12, 96, 64), control=(12, 14, 36, 38), out_dir=out)
+        info = lost['conventions']['jitter']
+        expect(not info['applied'] and 'residuals' in info and 'jitter not compensated' in info['reason'] and
+               any('jitter not compensated' in note for note in lost['notes']), f'undecided jitter: {info}')
+        for name in ('guides_animate', 'colour_animates'):
+            undecided = hint(lost, name)
+            expect(undecided['fires'] is None and 'jitter not compensated' in undecided['detail'] and
+                   undecided['statement'].startswith('not evaluated'), f'{name} needs a decided jitter')
+
+        # Sharp texture (8x12 px wavelength): bilinear resampling alone leaves a residual above
+        # MIN_RESIDUAL. The static pattern must not fire guides_animate (without the floor rule it
+        # would), the scrolling one must, and the round-trip floor tracks the static residual.
+        sharp = {}
+        for motion, scroll in (('static', 0), ('scrolling', 1.0)):
+            write_capture(tmp / f'sharp-{motion}', scroll=scroll, jitter=0.5, period=(8.0, 12.0))
+            sharp[motion] = run_probe(tmp / f'sharp-{motion}', region=SYN_REGION, out_dir=out)
+        still = region_of(sharp['static'], 'region')['temporal']
+        quiet = region_of(sharp['static'], 'control')['temporal']
+        expect(sharp['static']['conventions']['jitter']['applied'] and
+               animates(still['guide_residual'], quiet['guide_residual']) and
+               hint(sharp['static'], 'guides_animate')['fires'] is False and
+               0.7 < still['guide_residual'] / still['guide_resampling_floor'] < 1.5,
+               f'sharp static pattern is resampling, not animation: {still} control {quiet}')
+        moving = region_of(sharp['scrolling'], 'region')['temporal']
+        expect(hint(sharp['scrolling'], 'guides_animate')['fires'] is True and
+               hint(sharp['scrolling'], 'colour_animates')['fires'] is True and
+               moving['guide_residual'] > 5 * moving['guide_resampling_floor'],
+               f'sharp scrolling pattern animates: {moving}')
 
         # Exposure changing between frames must not read as animation.
         write_capture(tmp / 'exposure', scroll=0, jitter=0, exposure=2.0)
@@ -1465,12 +1647,7 @@ def self_test():
         # An alternative scaling that keeps fewer than half the valid pixels is rejected even if its
         # residual is lower (a 50 px drift leaves 46 of 96 columns).
         write_capture(tmp / 'bigdrift', drift=50)
-        tiny_pixels = globals()['MV_TINY_PIXELS']
-        globals()['MV_TINY_PIXELS'] = 10.0
-        try:
-            big = run_probe(tmp / 'bigdrift', region=(20, 10, 60, 50), out_dir=out)
-        finally:
-            globals()['MV_TINY_PIXELS'] = tiny_pixels
+        big = run_probe(tmp / 'bigdrift', region=(20, 10, 60, 50), out_dir=out, mv_tiny_pixels=10.0)
         motion = big['conventions']['motion']
         expect(motion['alternative_checked'] and 'width, height' not in motion['convention'] and
                motion['residual_alternative'] < motion['residual_pixel_convention'] and
