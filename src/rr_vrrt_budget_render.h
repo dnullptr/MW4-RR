@@ -377,6 +377,7 @@ static bool PreserveRayBudget(reshade::api::command_list *list, uint32_t x, uint
         if ((b.shader != rrraybudget::Resolve && b.shader != rrraybudget::Clear) || !b.pipeline)
             return false;
         if (b.shader == rrraybudget::Resolve) {
+            LiveRR().RayBudgetResolveSeen(); // every resolve ages the Budget marks, RR on or off
             static std::atomic<bool> seen{};
             if (!seen.exchange(true)) { // Addition 7: shows the resolve's build is recognised
                 char line[96];

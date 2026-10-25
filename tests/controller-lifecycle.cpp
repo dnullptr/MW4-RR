@@ -104,6 +104,15 @@ struct ControllerCpuTest {
         s.pre_live = true;
         return s;
     }
+    // The slot's next recording, from a cleared slot as retirement leaves it.
+    static Controller::Slot &RayNext(Controller &c) {
+        c.slots[0] = {};
+        return RayLive(c);
+    }
+    static bool RaySame(const rrraybudget::Armed &a, const rrraybudget::Armed &b) {
+        return a.w == b.w && a.h == b.h && a.capacity == b.capacity && a.margin == b.margin &&
+               a.pixels == b.pixels && a.counter == b.counter;
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -181,7 +190,7 @@ struct ControllerCpuTest {
             lobe2.mask = 2;
             lobe2.armed = RayArmed();
             lobe2.armed.w = 22;
-            m.ray_next_serial = 10;
+            m.ray_resolves = 10;
             m.RaySetMark(0x5000, 64, lobe1, 10);
             auto got = m.RayConsumed(0x5000, 64);
             assert(got.mask == 1 && got.armed.w == 11);
@@ -205,28 +214,28 @@ struct ControllerCpuTest {
             m.RaySetMark(0xA000, 0, lobe1, 10);
             assert(m.RayConsumed(0xA000, 0).mask == 1 && !m.RayConsumed(0x6000, 0).mask);
             assert(m.RayConsumed(0x7000, 0).mask == 1);
-            // A mark lives for the recording that patched and the 7 after it.
-            m.ray_next_serial = 17;
+            // A mark lives until 8 further resolves were seen: live after 7, expired at the 8th.
+            m.ray_resolves = 17;
             assert(m.RayConsumed(0x9000, 0).mask == 1 && m.RayConsumed(0, 0).mask == 1);
-            m.ray_next_serial = 18;
+            m.ray_resolves = 18;
             assert(!m.RayConsumed(0x9000, 0).mask && !m.RayConsumed(0, 0).mask);
             // An empty or expired entry is taken before a live one is replaced.
             m.ray_marks = {};
             m.ray_next_mark = 0;
-            m.ray_next_serial = 10;
+            m.ray_resolves = 10;
             for (UINT64 r = 0x1000; r <= 0x4000; r += 0x1000)
                 m.RaySetMark(r, 0, lobe1, 10);
             m.RayClearMark(0x2000, 0);
             m.RaySetMark(0x5000, 0, lobe1, 10);
             assert(m.RayConsumed(0x1000, 0).mask && m.RayConsumed(0x5000, 0).mask);
             assert(!m.RayConsumed(0x2000, 0).mask);
-            m.RaySetMark(0x3000, 0, lobe1, 1); // patched 9 recordings ago: expired
+            m.RaySetMark(0x3000, 0, lobe1, 1); // patched 9 resolves ago: expired
             m.RaySetMark(0x6000, 0, lobe1, 10);
             for (UINT64 r : {0x1000, 0x4000, 0x5000, 0x6000})
                 assert(m.RayConsumed(r, 0).mask == 1);
             // An unknown identity: the union of the live marks, the newest one's snapshot.
             m.ray_marks = {};
-            m.ray_next_serial = 18;
+            m.ray_resolves = 18;
             m.RaySetMark(0x6000, 64, lobe2, 17); // the newest first: not the last one found
             m.RaySetMark(0x5000, 64, lobe1, 16);
             got = m.RayConsumed(0, 0);
@@ -240,8 +249,7 @@ struct ControllerCpuTest {
             plan.mask = 1;
             plan.armed = RayArmed();
             plan.armed.w = 33;
-            a.ray_next_serial = 4;
-            a.RaySetMark(0x5000, 64, plan, 4);
+            a.RaySetMark(0x5000, 64, plan, a.ray_resolves.load());
             a.RayBudgetApply(nullptr, RayLists(), {});
             assert(s.ray_budget == 1 && s.ray_armed.w == 33);
             s.ray_patched = 2;
@@ -253,11 +261,13 @@ struct ControllerCpuTest {
             // An apply whose Budget is not proven takes the union of the live marks.
             a.RayBudgetApply(nullptr, rrraybudget::Lists{}, {});
             assert(s.ray_budget == 1 && s.ray_armed.w == 33);
-            // A raised Budget stays counted when a later apply of the recording reads another.
+            // A later apply that reads a Budget with no live mark keeps the lobe already counted
+            // and its snapshot, and its proof does not replace the unproven one stored before it.
             auto other = RayLists();
             other.budget_resource = 0x7000;
             a.RayBudgetApply(nullptr, other, {});
-            assert(s.ray_budget == 1 && s.ray_armed.w == 33 && s.ray_lists == other);
+            assert(s.ray_budget == 1 && s.ray_armed.w == 33);
+            assert(s.ray_lists.why == Why::ListsUnproven);
             // A resolve without a proven Budget changes no mark; one with it clears that mark.
             rrvrrt::RayResolve native;
             native.why = Why::Shape;
@@ -302,6 +312,7 @@ struct ControllerCpuTest {
             s.ray_budget = 1;
             s.ray_armed = RayArmed();
             s.ray_lists = RayLists();
+            s.pre_submitted = true; // the reader's rates are this recording's
             r.RayJudge(s, RayRates(), {}, Controller::RayLogState::None);
             assert(s.ray_done && r.ray_gate.Stopped() == Why::None);
             r.RayUnverified(s);
@@ -316,6 +327,7 @@ struct ControllerCpuTest {
         {
             auto judge = [](Controller &c, std::uint32_t serial) {
                 auto &s = c.slots[0];
+                s.pre_submitted = true;
                 s.ray_patched = 1;
                 s.ray_written = {0x3f000000u, 0};
                 s.ray_patch_armed = RayArmed();
@@ -360,6 +372,252 @@ struct ControllerCpuTest {
             u.ray_logged = rrraybudget::LogApplyTarget;
             unraised.RayJudge(u, RayRates(), {}, Controller::RayLogState::Failed);
             assert(u.ray_done && unraised.ray_gate.Stopped() == Why::None && !unraised.failed);
+        }
+        // RayPatched records the patch: its lobes, the bits it wrote, the executed copy, its
+        // arming snapshot, and its Budget's mark from the resolve count it was patched at.
+        {
+            Controller p;
+            auto &s = RayLive(p);
+            rrraybudget::Plan plan;
+            plan.mask = 2;
+            plan.bits = {0x3f800000u, 0x40000000u};
+            plan.armed = RayArmed();
+            plan.armed.w = 55;
+            plan.armed.margin = {3, 4};
+            rrvrrt::RayResolve in;
+            in.budget_resource = 0x5000;
+            in.budget_offset = 64;
+            p.ray_resolves = 3; // the patched resolve was the third one seen
+            p.RayPatched(s, plan, in, 100, rrraybudget::Times2);
+            assert(s.ray_patched == 2 && s.ray_written[0] == plan.bits[0] &&
+                   s.ray_written[1] == plan.bits[1]);
+            assert(s.ray_logged == rrraybudget::LogExecuted);
+            assert(RaySame(s.ray_patch_armed, plan.armed));
+            auto got = p.RayConsumed(0x5000, 64);
+            assert(got.mask == 2 && RaySame(got.armed, plan.armed));
+            assert(!p.RayConsumed(0x5000, 128).mask && !p.RayConsumed(0x6000, 64).mask);
+            p.ray_resolves = 10; // 7 further resolves
+            assert(p.RayConsumed(0x5000, 64).mask == 2);
+            p.ray_resolves = 11;
+            assert(!p.RayConsumed(0x5000, 64).mask);
+            assert(p.ray_gate.Stopped() == Why::None && !p.failed);
+        }
+        // Marks age by resolves, not recordings (A4). Recordings that only apply leave the Budget
+        // as the governor wrote it; every resolve the hook sees counts, whatever its placement and
+        // with RR disabled too: PreserveRayBudget calls RayBudgetResolveSeen before its Enabled
+        // check, and RayBudgetResolve only while RR is enabled.
+        {
+            Controller c;
+            auto &s = RayLive(c);
+            auto resolve = [&c](ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &in) {
+                c.RayBudgetResolveSeen();
+                bool dispatched = false;
+                const bool patched = c.Enabled() && c.RayBudgetResolve(cl, in, 3, 1, 1, dispatched);
+                assert(!patched && !dispatched);
+            };
+            rrraybudget::Plan plan;
+            plan.mask = 1;
+            plan.armed = RayArmed();
+            plan.armed.w = 66;
+            rrvrrt::RayResolve proven;
+            proven.budget_resource = 0x5000;
+            proven.budget_offset = 64;
+            c.RayBudgetResolveSeen(); // the patched resolve itself
+            c.RayPatched(s, plan, proven, 1, rrraybudget::Times2);
+            // 10 recordings that only apply: each one consumed the raised Budget.
+            for (unsigned i = 0; i < 10; ++i) {
+                auto &r = RayNext(c);
+                c.RayBudgetApply(nullptr, RayLists(), {});
+                assert(r.ray_budget == 1 && r.ray_armed.w == 66);
+            }
+            // 7 further resolves: refused in a recording, repeated, after SR, outside any, and 3
+            // with RR disabled. None proves a Budget, so none clears the mark.
+            rrvrrt::RayResolve shape;
+            shape.why = Why::Shape;
+            auto &r = RayNext(c);
+            resolve(nullptr, shape);
+            assert(r.ray_resolved);
+            resolve(nullptr, shape);
+            r.recorded = true;
+            resolve(nullptr, shape);
+            resolve(reinterpret_cast<ID3D12GraphicsCommandList *>(0x40), shape);
+            c.SetEnabled(false);
+            for (unsigned i = 0; i < 3; ++i)
+                resolve(nullptr, shape);
+            c.SetEnabled(true);
+            auto &live = RayNext(c);
+            c.RayBudgetApply(nullptr, RayLists(), {});
+            assert(live.ray_budget == 1 && live.ray_armed.w == 66);
+            // The 8th, with RR disabled: after F8 on again, the next apply is not raised.
+            c.SetEnabled(false);
+            resolve(nullptr, shape);
+            c.SetEnabled(true);
+            auto &expired = RayNext(c);
+            c.RayBudgetApply(nullptr, RayLists(), {});
+            assert(expired.ray_applied && !expired.ray_budget && !c.RayConsumed(0, 0).mask);
+        }
+        // A recording keeps its worst list proof (A3): an unproven apply's proof sticks, and two
+        // proven applies that differ make it ListsChanged. Judged as raised frames, none of these
+        // is verified: each one stops the test with ListsAfterArming.
+        {
+            auto judged = [](const rrraybudget::Lists &first, const rrraybudget::Lists &second,
+                             Why stored) {
+                Controller c;
+                auto &s = RayLive(c);
+                rrraybudget::Plan plan;
+                plan.mask = 1;
+                plan.armed = RayArmed();
+                c.RaySetMark(0x5000, 64, plan, 0);
+                c.RayBudgetApply(nullptr, first, {});
+                c.RayBudgetApply(nullptr, second, {});
+                assert(s.ray_budget == 1 && s.ray_lists.why == stored);
+                s.pre_submitted = true;
+                c.RayJudge(s, RayRates(), {}, Controller::RayLogState::None);
+                assert(s.ray_done && !c.failed);
+                return c.ray_gate.Stopped();
+            };
+            const rrraybudget::Lists unproven{};
+            auto counter = RayLists();
+            counter.v[3].bytes = 8; // a larger counter: either proof alone passes the arming check
+            assert(judged(unproven, RayLists(), Why::ListsUnproven) == Why::ListsAfterArming);
+            assert(judged(RayLists(), unproven, Why::ListsUnproven) == Why::ListsAfterArming);
+            assert(judged(counter, RayLists(), Why::ListsChanged) == Why::ListsAfterArming);
+            assert(judged(RayLists(), counter, Why::ListsChanged) == Why::ListsAfterArming);
+            // Control: two applies with the same proof are judged on it, and pass.
+            assert(judged(RayLists(), RayLists(), Why::None) == Why::None);
+        }
+        // Every raised Budget the recording's applies consumed stays counted (ORed).
+        {
+            Controller o;
+            auto &s = RayLive(o);
+            rrraybudget::Plan lobe1, lobe2;
+            lobe1.mask = 1;
+            lobe1.armed = RayArmed();
+            lobe2.mask = 2;
+            lobe2.armed = RayArmed();
+            o.RaySetMark(0x5000, 64, lobe1, 0);
+            o.RaySetMark(0x6000, 0, lobe2, 0);
+            o.RayBudgetApply(nullptr, RayLists(), {});
+            assert(s.ray_budget == 1);
+            auto second = RayLists();
+            second.budget_resource = 0x6000;
+            second.budget_offset = 0;
+            o.RayBudgetApply(nullptr, second, {});
+            assert(s.ray_budget == 3);
+        }
+        // An apply that OnDispatch reports while rrbypass Health has failed (no proof, no logging
+        // copies) still consumes a live mark: the raised slot, reported without reader stats, is
+        // counted unverified exactly once.
+        {
+            Controller h;
+            auto *fence = new CpuFence;
+            fence->completed = 1;
+            h.fence.Attach(fence);
+            auto &s = RayLive(h);
+            rrraybudget::Plan plan;
+            plan.mask = 1;
+            plan.armed = RayArmed();
+            h.RaySetMark(0x5000, 64, plan, 0);
+            h.RayBudgetApply(nullptr, rrraybudget::Lists{}, rrvrrt::RayApply{});
+            assert(s.ray_applied && s.ray_budget == 1 && s.ray_lists.why == Why::ListsUnproven);
+            for (unsigned i = 0; i < 6; ++i)
+                h.ray_gate.Unverified();
+            s.pre_live = false;
+            s.busy = s.recorded = s.sealed = true;
+            s.fence_value = 1;
+            h.PollLocked(); // reported without reader stats, then retired
+            assert(!s.busy && !s.ray_budget && !RayWaiting(h)); // 7: counted once
+            h.ray_gate.Unverified();
+            assert(RayWaiting(h));
+        }
+        // Rates that are not the recording's own (its prepass list was not submitted, or its apply
+        // half did not run as recorded) measure nothing: a raised frame is unverified, not judged.
+        // The slot is raised only through its Budget; its register 253 (log word 28) is 1.
+        {
+            auto raised = [](Controller &c, bool submitted, std::uint32_t apply_serial,
+                             std::uint32_t scene253) {
+                auto &s = c.slots[0];
+                for (unsigned i = 0; i < 7; ++i)
+                    c.ray_gate.Unverified();
+                s.ray_budget = 1;
+                s.ray_armed = RayArmed();
+                s.ray_lists = RayLists();
+                s.ray_serial = 7;
+                s.ray_logged = rrraybudget::LogApplyScene253;
+                s.pre_submitted = submitted;
+                Log log{};
+                log[rrraycopy::ApplySerial.at / 4] = apply_serial;
+                log[28] = scene253;
+                c.RayJudge(s, RayRates(), log, Controller::RayLogState::Read);
+                assert(s.ray_done && !c.failed);
+            };
+            // A stale apply serial: the stale register 253 is not judged (no ListsAfterArming),
+            // and the frame is the 8th unverified one in a row.
+            Controller stale, unsubmitted, own, remap;
+            raised(stale, true, 6, 1);
+            assert(stale.ray_gate.Stopped() == Why::None && RayWaiting(stale));
+            raised(unsubmitted, false, 7, 1);
+            assert(unsubmitted.ray_gate.Stopped() == Why::None && RayWaiting(unsubmitted));
+            // Controls: its own log is judged, and passes or stops on its register 253.
+            raised(own, true, 7, 2048);
+            assert(own.ray_gate.Stopped() == Why::None && !RayWaiting(own));
+            raised(remap, true, 7, 1);
+            assert(remap.ray_gate.Stopped() == Why::ListsAfterArming);
+        }
+        // An unraised frame in either case skips Complete and Summary::Completed: here the
+        // reader's uncounted frame is not counted.
+        {
+            auto uncounted = [](bool submitted, bool stale) {
+                Controller u;
+                auto &s = RayLive(u);
+                std::string a, b;
+                assert(!u.ray_summary.Report(1, u.ray_gate, u.StatusLocked(1), a, b));
+                rrvrrt::RayResolve shape;
+                shape.why = Why::Shape;
+                bool dispatched = false;
+                assert(!u.RayBudgetResolve(nullptr, shape, 3, 1, 1, dispatched) && !dispatched);
+                u.RayBudgetApply(nullptr, RayLists(), {});
+                assert(!s.ray_budget && !s.ray_patched && s.ray_serial);
+                s.pre_submitted = submitted;
+                s.ray_logged = rrraybudget::LogApplyTarget;
+                Log log{};
+                log[rrraycopy::ApplySerial.at / 4] = stale ? s.ray_serial + 1 : s.ray_serial;
+                u.RayJudge(s, rrdensity::Frame{}, log, Controller::RayLogState::Read);
+                assert(s.ray_done && u.ray_gate.Stopped() == Why::None && !u.failed);
+                assert(u.ray_summary.Report(20001, u.ray_gate, u.StatusLocked(20001), a, b));
+                assert(a.find(" uncounted=") != std::string::npos);
+                return a.find(" uncounted=1 ") != std::string::npos;
+            };
+            assert(uncounted(true, false)); // control: its own frame is counted
+            assert(!uncounted(false, false));
+            assert(!uncounted(true, true));
+        }
+        // The serial filter at RayJudge: a stale resolve half's LogResolveStats (x = 0, below the
+        // reader's raw rays) is dropped, and the frame is judged on its apply half and passes.
+        {
+            auto stats = [](Controller &c, std::uint32_t resolve_serial) {
+                auto &s = c.slots[0];
+                for (unsigned i = 0; i < 7; ++i)
+                    c.ray_gate.Unverified();
+                s.ray_budget = 1;
+                s.ray_armed = RayArmed();
+                s.ray_lists = RayLists();
+                s.ray_serial = 7;
+                s.pre_submitted = true;
+                s.ray_logged = rrraybudget::LogResolveStats | rrraybudget::LogApplyTarget;
+                Log log{};
+                log[rrraycopy::ResolveSerial.at / 4] = resolve_serial;
+                log[rrraycopy::ApplySerial.at / 4] = 7;
+                auto rates = RayRates();
+                rates[rrdensity::RawRays] = 64;
+                c.RayJudge(s, rates, log, Controller::RayLogState::Read);
+                assert(s.ray_done && !c.failed);
+            };
+            Controller stale, own;
+            stats(stale, 6);
+            assert(stale.ray_gate.Stopped() == Why::None && !RayWaiting(stale)); // verified
+            stats(own, 7); // control: with its serial, x = 0 does not cover 64 raw rays
+            assert(own.ray_gate.Stopped() == Why::StatsMismatch);
         }
     }
     static void Run() {

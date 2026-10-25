@@ -836,8 +836,13 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         auto *device = list->get_device();
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
             (ID3D12GraphicsCommandList *)list->get_native());
-        if (!native || !LiveRR().CanRaw(native.Get()) || rrbypass::Health(device).failed)
+        if (!native || !LiveRR().CanRaw(native.Get()))
             return false;
+        if (rrbypass::Health(device).failed) {
+            if (b.shader == rrbypass::Vrrt) // A3: the ray budget gate still sees this apply
+                LiveRR().RayBudgetApply(native.Get(), rrraybudget::Lists{}, rrvrrt::RayApply{});
+            return false;
+        }
         if (b.shader == rrbypass::Vrrt) {
             if (!PreserveNativeSampling(list, x, y, z))
                 return false;

@@ -8,12 +8,14 @@ using RayWhy = rrraybudget::Why;
 using RayLogWords = std::array<std::uint32_t, rrraybudget::LogWords>;
 enum class RayLogState : unsigned { None, Read, Failed }; // a slot's ray log at completion
 // A Budget identity's last patch (A4): the lobes its governor raised and that plan's arming
-// snapshot. Live for the recording that patched and the RayMarkLife - 1 after it, counted by
-// ray serial; cleared when an unpatched native resolve writes that Budget.
+// snapshot. Cleared when an unpatched native resolve in a recording writes that Budget; live
+// until RayMarkLife further cs_vrrt_resolve dispatches were seen (ray_resolves), whatever their
+// placement and whether RR was enabled. Recordings without a resolve leave the Budget as the
+// governor wrote it, so they do not age a mark.
 struct RayMark {
     UINT64 resource{}, offset{};
     unsigned mask{};
-    UINT serial{};
+    UINT resolves{}; // ray_resolves just after the patched resolve was counted
     rrraybudget::Armed armed;
 };
 static constexpr UINT RayMarkLife = 8;
@@ -30,6 +32,9 @@ bool ray_announced{};
 std::array<RayMark, 4> ray_marks{};
 unsigned ray_next_mark{};
 UINT ray_next_serial{};
+// Every cs_vrrt_resolve dispatch PreserveRayBudget sees (RayBudgetResolveSeen, lock-free: it is
+// counted before the RR-enabled check, without the mutex).
+std::atomic<UINT> ray_resolves{};
 // The logging copies stop for the session after a failure other than a memory wait; the
 // Summary has no failure counter, so the first failure and the first dropped readback are
 // logged once each.
@@ -93,14 +98,25 @@ UINT RayNextSerial() noexcept {
         ++ray_next_serial; // serials are nonzero (rr_ray_copies.h)
     return ray_next_serial;
 }
-// The recording's ray serial, taken at its first ray site (resolve or apply) whether or not
-// that site copies anything, so that marks age by recordings.
+// Two proven applies measure the same lists: extent and grid, both lobes' entries, the pixel
+// list (u3) and the counter (u2).
+static bool RaySameProof(const rrraybudget::Lists &a, const rrraybudget::Lists &b) noexcept {
+    return rrraybudget::SameExtent(a, b) && a.Entries(0) == b.Entries(0) &&
+           a.Entries(1) == b.Entries(1) && a.v[2].bytes == b.v[2].bytes &&
+           a.v[3].bytes == b.v[3].bytes;
+}
+// The recording's ray serial for the halves of its ray log, taken at its first ray site
+// (resolve or apply) whether or not that site copies anything.
 void RaySerial(Slot &s) noexcept {
     if (!s.ray_serial)
         s.ray_serial = RayNextSerial();
 }
+// The resolves seen since the mark's patch.
+UINT RayMarkAge(const RayMark &m) const noexcept {
+    return UINT(ray_resolves.load(std::memory_order_relaxed) - m.resolves);
+}
 bool RayMarkLive(const RayMark &m) const noexcept {
-    return m.resource && UINT(ray_next_serial - m.serial) < RayMarkLife;
+    return m.resource && RayMarkAge(m) < RayMarkLife;
 }
 void RayClearMark(UINT64 resource, UINT64 offset) noexcept {
     for (auto &m : ray_marks)
@@ -109,7 +125,7 @@ void RayClearMark(UINT64 resource, UINT64 offset) noexcept {
 }
 // After a patch: the identity's entry, else an empty or expired one, else the next in turn.
 void RaySetMark(UINT64 resource, UINT64 offset, const rrraybudget::Plan &plan,
-                UINT serial) noexcept {
+                UINT resolves) noexcept {
     RayMark *at{};
     for (auto &m : ray_marks)
         if (m.resource == resource && m.offset == offset) {
@@ -126,7 +142,7 @@ void RaySetMark(UINT64 resource, UINT64 offset, const rrraybudget::Plan &plan,
         at = &ray_marks[ray_next_mark % ray_marks.size()];
         ray_next_mark = unsigned((ray_next_mark + 1) % ray_marks.size());
     }
-    *at = {resource, offset, plan.mask, serial, plan.armed};
+    *at = {resource, offset, plan.mask, resolves, plan.armed};
 }
 // What an apply reading the Budget (resource, offset) consumed: that identity's live mark, or
 // for an unknown identity (resource 0) the union of the live marks' lobes with the newest
@@ -143,7 +159,7 @@ RayMark RayConsumed(UINT64 resource, UINT64 offset) const noexcept {
             continue;
         }
         found.mask |= m.mask;
-        const UINT age = ray_next_serial - m.serial;
+        const UINT age = RayMarkAge(m);
         if (age < newest) {
             newest = age;
             found.armed = m.armed;
@@ -319,6 +335,18 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
             c.log = log;
             c.logged = RaySerialBits(s.ray_logged, log, s.ray_serial);
         }
+        // Rates of a recording whose prepass list was not submitted, or whose apply half did not
+        // run as recorded (a stale apply serial), are not this frame's: a raised frame is
+        // unverified, an unraised one measures nothing (no Complete, no Summary::Completed).
+        constexpr unsigned apply_bits =
+            rrraybudget::LogApplyTarget | rrraybudget::LogApplySettings36 |
+            rrraybudget::LogApplyScene251 | rrraybudget::LogApplyScene253;
+        if (!s.pre_submitted ||
+            (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
+             log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
+            RayUnverified(s);
+            return;
+        }
         // A patch is verified against its own resolve half. One that was predicated away,
         // skipped or not read back verifies nothing: unverified, never a PatchMismatch.
         if (s.ray_patched && (state != RayLogState::Read || !s.ray_serial ||
@@ -406,7 +434,8 @@ void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve
         s.ray_written = {plan.bits[0], plan.bits[1]};
         s.ray_logged |= rrraybudget::LogExecuted;
         s.ray_patch_armed = plan.armed;
-        RaySetMark(in.budget_resource, in.budget_offset, plan, s.ray_serial);
+        RaySetMark(in.budget_resource, in.budget_offset, plan,
+                   ray_resolves.load(std::memory_order_relaxed));
         ray_summary.Patched(plan);
         ray_plan = plan;
         ray_active_at = now;
@@ -549,7 +578,16 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
             return;
         auto &s = *match;
         RaySerial(s);
-        s.ray_lists = lists;
+        // The recording keeps its worst proof: an unproven one sticks, and a proven one that
+        // differs from an earlier proven one in what the gate measures makes it ListsChanged.
+        if (!s.ray_applied)
+            s.ray_lists = lists;
+        else if (s.ray_lists.why == RayWhy::None) {
+            if (lists.why != RayWhy::None || RaySameProof(s.ray_lists, lists))
+                s.ray_lists = lists;
+            else
+                s.ray_lists.why = RayWhy::ListsChanged;
+        }
         s.ray_apply_cb = log.settings.address;
         s.ray_applied = true;
         // A raised Budget stays raised for the recording even if a later apply reads another.

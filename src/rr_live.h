@@ -937,6 +937,11 @@ class Controller {
             return dispatched;
         }
     }
+    // Every cs_vrrt_resolve dispatch the hook sees, RR enabled or not: the Budget marks age by
+    // these. Lock-free (an atomic counter), so it is safe before any other check.
+    void RayBudgetResolveSeen() noexcept {
+        ray_resolves.fetch_add(1, std::memory_order_relaxed);
+    }
     // At every recognised native VRRT apply: its list proof (ListsUnproven when not proven) and
     // the constants its logging copies read.
     void RayBudgetApply(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lists,
