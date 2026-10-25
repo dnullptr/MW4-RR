@@ -1378,6 +1378,11 @@ struct ControllerCpuTest {
         c.dropout_unavailable_changes = 5;
         c.dropout_report = 1234;
         c.dropout_frames = 7;
+        c.fx_test.blocked = c.fx_unavailable = true;
+        c.fx_unavailable_changes = 3;
+        c.fx_hold = rrfx::Hold::Preset;
+        c.fx_report = 55;
+        c.fx_frames = c.fx_merged = 4;
         c.applied_color_scale = 4.0f;
         c.applied_contrast_knee = 0.25f;
         c.QueueReconfigure();
@@ -1389,6 +1394,14 @@ struct ControllerCpuTest {
         assert(!c.dropout_test.blocked && !c.dropout_unavailable && !c.dropout_covered &&
                !c.dropout_source && !c.dropout_unavailable_changes && !c.dropout_pipeline.state &&
                !c.dropout_report && !c.dropout_frames);
+        assert(!c.fx_test.blocked && !c.fx_unavailable && !c.fx_unavailable_changes &&
+               c.fx_hold == rrfx::Hold::Off && !c.fx_pipeline.state && !c.fx_report &&
+               !c.fx_frames && !c.fx_merged);
+        // The transparent effects test is off by default; on, it waits for RR.
+        assert(c.FxStatus() == rrfx::Report::Off);
+        rrfx::enabled = true;
+        assert(c.FxStatus() == rrfx::Report::Waiting);
+        rrfx::enabled = false;
         // The refraction dropout test is off by default and reports why it is not active.
         assert(c.DropoutStatus() == rrdropout::Report::Off);
         rrdropout::enabled = true;

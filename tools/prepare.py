@@ -96,6 +96,9 @@ def main():
                                              flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
+    # Transparent effects responsivity test (src/rr_transparent_effects.h).
+    header(out / 'rr_transparent_effects.generated.h', [
+        ('RRTransparentEffects', compile_hlsl('rr_transparent_effects.hlsl', 'rr_transparent_effects'), False)])
     # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.
     header(out / 'rr_refraction_dropout.generated.h', [
         ('RRRefractionDropout', compile_hlsl('rr_refraction_dropout.hlsl', 'rr_refraction_dropout'), False)])

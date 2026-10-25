@@ -15,8 +15,8 @@ set "INC=/Isrc /Iexternal\imgui /Iexternal\streamline /Iexternal\reshade\include
 set "FLAGS=/nologo /EHsc /O2 /MD /W3 /std:c++20"
 set "HOOKS=external\minhook\src\buffer.c external\minhook\src\hook.c external\minhook\src\trampoline.c external\minhook\src\hde\hde64.c"
 set "LIBS=kernel32.lib user32.lib psapi.lib d3d12.lib dxgi.lib d3dcompiler.lib"
-rem Refraction dropout tests, in their own loop so sibling branches can extend the main one.
-for %%T in (refraction-dropout) do (
+rem Refraction dropout and transparent effects tests, in their own loop so sibling branches can extend the main one.
+for %%T in (refraction-dropout transparent-effects) do (
  cl %FLAGS% %INC% /Fobuild\tests\ /Febuild\tests\%%T.exe tests\%%T.cpp %HOOKS% /link %LIBS% || exit /b 1
  build\tests\%%T.exe || exit /b 1
 )

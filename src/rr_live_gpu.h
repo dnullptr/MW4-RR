@@ -37,6 +37,7 @@
 #include "rr_water.h"
 #include "rr_gate_stats.h"
 #include "rr_refraction_dropout_gpu.h"
+#include "rr_transparent_effects_gpu.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -471,6 +472,8 @@ struct GpuFrame {
                      rrraycopy::NativeSlots(rrraycopy::PatchFill(3))};
     // Refraction dropout test descriptors (rr_live_dropout.inl).
     rrdropout::Gpu dropout;
+    // Transparent effects mask test descriptors (rr_live_effects.inl).
+    rrfx::Gpu fx;
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT,
                                     const D3D12_CLEAR_VALUE *clear = nullptr) {

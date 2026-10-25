@@ -101,9 +101,12 @@ struct Camera {
 };
 // Which responsivity mask RR took (Meta::responsivity_source). The water mask also carries the
 // SSS values when both are on; the sky edge test replaces both.
-enum ResponsivitySource : unsigned { NoMask, SssMask, SkyEdgeMask, WaterMask, SourceCount };
+enum ResponsivitySource : unsigned {
+    NoMask, SssMask, SkyEdgeMask, WaterMask, TransparentMask, SourceCount
+};
+// TransparentMask: the transparent effects test, which carries the water or SSS mask along.
 inline constexpr const char *responsivity_sources[SourceCount] = {"none", "sss", "sky_edge",
-                                                                  "water"};
+                                                                  "water", "transparent"};
 inline const char *ResponsivitySourceName(unsigned source) {
     return source < SourceCount ? responsivity_sources[source] : "unknown";
 }

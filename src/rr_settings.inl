@@ -11,6 +11,7 @@
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_refraction_dropout.h"
+#include "rr_transparent_effects.h"
 #include "rr_contrast_test.h"
 #include "rr_lod_bias_test.h"
 #include "rr_hit_condition.h"
@@ -526,6 +527,26 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "with frame generation off. Reads the refraction coverage that the "
                        "transparency albedo blend captures, so it needs that blend on; the "
                        "color brightness and contrast tests turn it off.");
+    bool fx = rrfx::enabled;
+    if (ImGui::Checkbox("Smoke and fog: less smear (responsivity mask)", &fx)) {
+        rrfx::enabled = fx;
+        ++rrfx::changes;
+    }
+    float fx_strength = rrfx::ClampStrength(rrfx::strength);
+    if (ImGui::SliderFloat("Smoke and fog strength", &fx_strength, 0.0f, 1.0f, "%.2f",
+                           ImGuiSliderFlags_AlwaysClamp)) {
+        rrfx::strength = rrfx::ClampStrength(fx_strength);
+        ++rrfx::changes;
+    }
+    ImGui::Text("Smoke and fog mask: %s", rrfx::Label(LiveRR().FxStatus()));
+    ImGui::TextWrapped("Session-only test. Smoke, fog and light shafts are drawn over the scene "
+                       "without motion of their own, so RR blends old frames of them into new "
+                       "ones and they smear. On, RR leans on the current frame wherever a "
+                       "see-through layer adds light (the color is brighter than the color "
+                       "before transparency), keeping the water and SSS masks elsewhere. Glass "
+                       "that only dims the view is left alone. Expect less smear and possibly "
+                       "more grain in the effect. Needs RR preset F and the Transparency guide "
+                       "(F9); replaced by the sky edge test.");
     ImGui::Separator();
     auto preset = LiveRR().PresetStatus();
     int selected = 3;
