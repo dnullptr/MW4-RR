@@ -11,11 +11,13 @@ enum class RayLogState : unsigned { None, Read, Failed }; // a slot's ray log at
 // snapshot. Cleared when an unpatched native resolve in a recording writes that Budget; live
 // until RayMarkLife further cs_vrrt_resolve dispatches were seen (ray_resolves), whatever their
 // placement and whether RR was enabled. Recordings without a resolve leave the Budget as the
-// governor wrote it, so they do not age a mark.
+// governor wrote it, so they do not age a mark. A mark outlives a generation change; an apply of
+// a later generation that consumes it is raised but unverified (its snapshot is of other lists).
 struct RayMark {
     UINT64 resource{}, offset{};
     unsigned mask{};
-    UINT resolves{}; // ray_resolves just after the patched resolve was counted
+    UINT resolves{};   // ray_resolves just after the patched resolve was counted
+    UINT generation{}; // the controller generation of the patch
     rrraybudget::Armed armed;
 };
 static constexpr UINT RayMarkLife = 8;
@@ -144,13 +146,15 @@ void RaySetMark(UINT64 resource, UINT64 offset, const rrraybudget::Plan &plan,
         at = &ray_marks[ray_next_mark % ray_marks.size()];
         ray_next_mark = unsigned((ray_next_mark + 1) % ray_marks.size());
     }
-    *at = {resource, offset, plan.mask, resolves, plan.armed};
+    *at = {resource, offset, plan.mask, resolves, generation, plan.armed};
 }
 // What an apply reading the Budget (resource, offset) consumed: that identity's live mark, or
 // for an unknown identity (resource 0) the union of the live marks' lobes with the newest
-// mark's snapshot (conservative: the frame is then checked as raised).
+// mark's snapshot (conservative: the frame is then checked as raised), of an older generation
+// when any of them is.
 RayMark RayConsumed(UINT64 resource, UINT64 offset) const noexcept {
     RayMark found;
+    found.generation = generation;
     UINT newest = UINT_MAX;
     for (const auto &m : ray_marks) {
         if (!RayMarkLive(m))
@@ -161,6 +165,8 @@ RayMark RayConsumed(UINT64 resource, UINT64 offset) const noexcept {
             continue;
         }
         found.mask |= m.mask;
+        if (m.generation != generation)
+            found.generation = m.generation;
         const UINT age = RayMarkAge(m);
         if (age < newest) {
             newest = age;
@@ -338,12 +344,15 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
         }
         // Rates of a recording whose prepass list was not submitted, or whose apply half did not
         // run as recorded (a stale apply serial), are not this frame's: a raised frame is
-        // unverified, an unraised one measures nothing (no Complete, no Summary::Completed).
+        // unverified, an unraised one measures nothing (no Complete, no Summary::Completed). So
+        // is a frame that consumed a mark of an older generation: its arming snapshot is of the
+        // lists before the generation change.
         constexpr unsigned apply_bits =
             rrraybudget::LogApplyTarget | rrraybudget::LogApplySettings36 |
             rrraybudget::LogApplyScene251 | rrraybudget::LogApplyScene253;
-        if (!s.pre_submitted || (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
-                                 log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
+        if (!s.pre_submitted || s.ray_old_mark ||
+            (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
+             log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
             RayUnverified(s);
             return;
         }
@@ -448,6 +457,13 @@ void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve
     } catch (...) {
         RayStop(RayWhy::Exception, "after the controller dispatch");
     }
+}
+// At every generation change (Reconfigure, SetEnabled on either edge): the gate's apply streak
+// and the placement streak restart, so the first resolves of the new generation are refused
+// until both are proven again.
+void RayRestart() noexcept {
+    ray_gate.Restart(GetTickCount64());
+    ray_placement = 0;
 }
 bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &in, UINT x, UINT y,
                       UINT z, bool &dispatched) noexcept {
@@ -617,6 +633,7 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
         if (consumed.mask) {
             s.ray_budget |= consumed.mask;
             s.ray_armed = consumed.armed;
+            s.ray_old_mark |= consumed.generation != generation;
         }
         if (s.ray_resolved)
             ray_summary.SameBlock(s.ray_resolve_cb == s.ray_apply_cb);

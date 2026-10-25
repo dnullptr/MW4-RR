@@ -363,6 +363,12 @@ class Gate {
             next_budget = (next_budget + 1) % budgets.size();
         }
     }
+    // A new controller generation (Reconfigure, RR turned off or on): the apply streak restarts,
+    // as at an unproven apply, so no resolve patches before ProofFrames proven applies of the new
+    // generation. The evidence restarts at a new extent (Complete); known Budget identities stay.
+    void Restart(std::uint64_t now) noexcept {
+        Apply(Lists{}, now);
+    }
     bool KnownBudget(std::uint64_t resource, std::uint64_t offset) const noexcept {
         if (!resource)
             return false;

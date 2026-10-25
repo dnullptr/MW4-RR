@@ -350,6 +350,116 @@ struct ControllerCpuTest {
         }
         rrraybudget::mode = rrraybudget::Off;
     }
+    // A retired recording's judgement with its own ray log: the measured frame of `l` (RayMeasured)
+    // with both halves' serials and the executed bits the slot wrote, if any.
+    static void RayJudgeOwn(Controller &c, Controller::Slot &s, const rrraybudget::Lists &l) {
+        auto m = RayMeasured(l);
+        m.log[4] = s.ray_written[0];
+        m.log[5] = s.ray_written[1];
+        m.log[rrraycopy::ResolveSerial.at / 4] = m.log[rrraycopy::ApplySerial.at / 4] =
+            s.ray_serial;
+        s.ray_logged |= m.logged | rrraybudget::LogApplyTarget;
+        s.pre_submitted = true;
+        c.RayJudge(s, m.rates, m.log, Controller::RayLogState::Read);
+        assert(s.ray_done && !c.failed);
+    }
+    // F2: every generation change restarts the proof, the gate's apply streak (Gate::Restart) and
+    // the placement streak. A gate primed at 8x8 refuses the first resolve after Reconfigure, or
+    // after RR was turned off or on (each edge alone), so that recording's 16x16 apply consumes no
+    // Budget armed for 8x8 and its judgement stops nothing. There is no GPU here: had the gate
+    // armed, RayPatched records the patch the GPU would have.
+    static void RayRestart() {
+        using rrraybudget::Why;
+        const auto l8 = RayLists();
+        auto l16 = RayLists();
+        l16.w = l16.h = 16;
+        rrraybudget::mode = rrraybudget::Times2;
+        for (unsigned how = 0; how < 3; ++how) {
+            Controller c;
+            RayPrime(c, l8);
+            c.slots[0] = {};
+            assert(c.ray_placement == rrraybudget::ProofFrames &&
+                   c.ray_gate.Decide(rrraybudget::Times2, GetTickCount64(), nullptr).why ==
+                       Why::None);
+            if (how == 0) {
+                c.QueueReconfigure();
+                assert(c.Reconfigure());
+            } else if (how == 1) {
+                c.SetEnabled(false);
+                c.enabled = true; // back on without the second edge
+            } else {
+                c.enabled = false; // off without the first edge
+                c.SetEnabled(true);
+            }
+            const UINT64 now = GetTickCount64(); // within FreshMs of the last 8x8 apply
+            assert(c.ray_placement == 0);
+            assert(c.ray_gate.Decide(rrraybudget::Times2, now, nullptr).why == Why::ListsUnproven);
+            RayLine(c);
+            auto &s = RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "placement=1");
+            const auto plan = c.ray_gate.Decide(rrraybudget::Times2, now, nullptr);
+            if (plan.why == Why::None) {
+                rrvrrt::RayResolve in;
+                in.budget_resource = l8.budget_resource;
+                in.budget_offset = l8.budget_offset;
+                c.RayPatched(s, plan, in, now, rrraybudget::Times2);
+            }
+            c.RayBudgetApply(nullptr, l16, {});
+            RayJudgeOwn(c, s, l16);
+            assert(!s.ray_patched && !s.ray_budget && c.ray_gate.Stopped() == Why::None);
+        }
+        rrraybudget::mode = rrraybudget::Off;
+    }
+    // M2: a mark outlives a generation change, since the game's Budget keeps what the governor
+    // wrote, so an apply of the new generation that reads it within RayMarkLife resolves is raised.
+    // Its arming snapshot is of the old lists: the frame is counted unverified once, not judged
+    // (judged at another extent it would stop the test with ListsAfterArming, as the control does).
+    static void RayOldMark() {
+        using rrraybudget::Why;
+        auto l16 = RayLists();
+        l16.w = l16.h = 16;
+        for (unsigned how = 0; how < 3; ++how) { // Reconfigure, F8 off and on, control
+            Controller c;
+            auto &s = RayLive(c);
+            rrraybudget::Plan plan;
+            plan.mask = 1;
+            plan.armed = RayArmed(); // 8x8
+            rrvrrt::RayResolve in;
+            in.budget_resource = 0x5000;
+            in.budget_offset = 64;
+            c.RayBudgetResolveSeen(); // the patched resolve
+            c.RayPatched(s, plan, in, 1, rrraybudget::Times2);
+            c.slots[0] = {};
+            if (how == 0) {
+                c.QueueReconfigure();
+                assert(c.Reconfigure());
+            } else if (how == 1) {
+                c.SetEnabled(false);
+                c.SetEnabled(true);
+            }
+            for (unsigned i = 0; i < Controller::RayMarkLife - 1; ++i)
+                c.RayBudgetResolveSeen(); // the mark is still live
+            for (unsigned i = 0; i < rrraybudget::UnverifiedLimit - 2; ++i)
+                c.ray_gate.Unverified();
+            // An apply that reads an unknown Budget takes the union of the live marks, of the old
+            // generation when any of them is.
+            auto &u = RayNext(c);
+            c.RayBudgetApply(nullptr, rrraybudget::Lists{}, {});
+            assert(u.ray_budget == 1 && u.ray_old_mark == (how < 2));
+            auto &r = RayNext(c);
+            c.RayBudgetApply(nullptr, l16, {});
+            assert(r.ray_budget == 1 && r.ray_old_mark == (how < 2));
+            RayJudgeOwn(c, r, l16);
+            if (how == 2) {
+                assert(c.ray_gate.Stopped() == Why::ListsAfterArming);
+                continue;
+            }
+            assert(c.ray_gate.Stopped() == Why::None && !RayWaiting(c));
+            c.ray_gate.Unverified(); // so that frame was counted exactly once
+            assert(RayWaiting(c));
+        }
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -1547,6 +1657,8 @@ struct ControllerCpuTest {
         guide->Release();
         RayBudget();
         RayPlacement();
+        RayRestart();
+        RayOldMark();
     }
 };
 } // namespace rrlive

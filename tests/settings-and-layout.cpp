@@ -420,6 +420,14 @@ static void GateRefusals() {
     assert(g.Streak() == 0 && g.Decide(rb::Times2, now + 1, nullptr).why == rb::Why::ListsView);
     g.Apply(l, now + 2);
     assert(g.Streak() == 1 && g.Decide(rb::Times2, now + 2, nullptr).why == rb::Why::ListsStable);
+    // Restart (a new controller generation) is an unproven apply: the streak restarts and the
+    // Budget identities stay known.
+    g = Primed(l);
+    g.Restart(now);
+    assert(g.Streak() == 0 && g.Decide(rb::Times2, now, nullptr).why == rb::Why::ListsUnproven);
+    assert(g.KnownBudget(l.budget_resource, l.budget_offset));
+    g.Apply(l, now + 1);
+    assert(g.Streak() == 1 && g.Decide(rb::Times2, now + 1, nullptr).why == rb::Why::ListsStable);
     // A proof of an empty or impossible extent is no proof, so a raised frame always has an extent
     // to check (16384 is the largest D3D12 texture side).
     for (auto [w, h] : {std::pair{0u, 1080u},

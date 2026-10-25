@@ -72,12 +72,13 @@ class Controller {
         // ray_serial the recording's ray-log serial (0 until a ray site ran), ray_done that the
         // recording was judged or counted unverified. ray_resolve_budget_* is the Budget identity
         // its resolve proved (0 when not proven): an apply reading it is same-frame (A2).
+        // ray_old_mark: an apply consumed a mark of an older generation (counted unverified).
         rrraybudget::Lists ray_lists;
         UINT64 ray_apply_cb{}, ray_resolve_cb{};
         UINT64 ray_resolve_budget_resource{}, ray_resolve_budget_offset{};
         unsigned ray_logged{}, ray_patched{}, ray_budget{};
         std::array<UINT, 2> ray_written{};
-        bool ray_resolved{}, ray_applied{}, ray_done{};
+        bool ray_resolved{}, ray_applied{}, ray_done{}, ray_old_mark{};
         UINT ray_serial{};
         rrraybudget::Armed ray_armed{}, ray_patch_armed{};
         rrcapture::Capture captured; // The frame recorded on this slot, if any.
@@ -492,6 +493,7 @@ class Controller {
         api = {};
         selected_view = UINT_MAX;
         key = {};
+        RayRestart(); // the ray budget test proves the new generation's lists again
         if (++generation == 0) {
             Failure("RR feature generation overflow");
             return false;
@@ -1541,6 +1543,7 @@ class Controller {
         if (enabled == value)
             return;
         enabled = value;
+        RayRestart(); // either edge: the ray budget test proves its lists again
         // Collecting holds readback buffers; an Armed capture keeps waiting for RR.
         if (!value && capture.state == rrcapture::State::Collecting)
             CaptureFailed("RR was turned off");
