@@ -1,5 +1,6 @@
 #include "../src/rr_trace.h"
 #include "ngx-recording-params.h"
+#include "../src/rr_evaluation_params.h"
 #include <cassert>
 #include <stdexcept>
 static unsigned originals{}, replacements{}, afters{};
@@ -140,8 +141,61 @@ struct ProbeTestAccess {
     }
 };
 } // namespace rrtrace
+// RR creation drops the game's AutoExposure bit, asks NGX to free released features, and keeps
+// the game's own flags in the key that recreation detection compares.
+static void CreationParameters() {
+    rreval::Options o;
+    o.width = 1280;
+    o.height = 720;
+    o.out_width = 2560;
+    o.out_height = 1440;
+    o.quality = 2;
+    o.flags = 75;
+    RecordingParams p;
+    rreval::CreateParameters(p, o, 6);
+    int flags = -1, free_mem = -1, quality = -1, denoise = -1, subrects = -1;
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
+    assert(flags == 11);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, &free_mem)));
+    assert(free_mem == 1);
+    unsigned width = 0, height = 0, out_width = 0, out_height = 0, roughness = 0, depth = 0;
+    unsigned creation_mask = 0, visibility_mask = 0;
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_Width, &width)) && width == 1280);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_Height, &height)) && height == 720);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_OutWidth, &out_width)) && out_width == 2560);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_OutHeight, &out_height)) &&
+           out_height == 1440);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_PerfQualityValue, &quality)) &&
+           quality == 2);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, &subrects)) &&
+           subrects == 0);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, &denoise)) &&
+           denoise == int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, &roughness)) &&
+           roughness == unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_Use_HW_Depth, &depth)) &&
+           depth == unsigned(NVSDK_NGX_DLSS_Depth_Type_HW));
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_CreationNodeMask, &creation_mask)) &&
+           creation_mask == 1);
+    assert(NVSDK_NGX_SUCCEED(p.Get(NVSDK_NGX_Parameter_VisibilityNodeMask, &visibility_mask)) &&
+           visibility_mask == 1);
+    assert(rrpreset::Requested(p, 6));
+    // The stored key still carries the game's flags, so a flag change is still a recreation.
+    assert(o.flags == 75);
+    auto changed = o;
+    changed.flags = 11;
+    assert(!rreval::SameCreation(o, changed));
+    // Bits other than AutoExposure reach RR as the game set them.
+    o.flags = 0x1bf;
+    RecordingParams q;
+    rreval::CreateParameters(q, o);
+    assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
+    assert(flags == 0x1bf);
+}
 int main() {
     rrtrace::ProbeTestAccess::Run();
+    CreationParameters();
     puts("PASS: replacement skips native SR; declines forward once; native history resets and "
          "caller parameters restore.");
+    puts("PASS: RR creation drops AutoExposure, frees released features and keeps the game's key.");
 }

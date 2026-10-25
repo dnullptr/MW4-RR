@@ -46,6 +46,14 @@ inline bool Valid(const Options &v) {
            v.exposure_scale > 0;
 }
 
+// The game creates SR with AutoExposure; RR supports neither exposure nor auto-exposure. Only the
+// creation parameters drop it: Options::flags keeps the game's value for SameCreation.
+inline constexpr int CreationFlags(int game_flags) {
+    return game_flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
+}
+static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) == 64 && CreationFlags(75) == 11);
+static_assert(CreationFlags(11) == 11 && CreationFlags(0x1bf) == 0x1bf && CreationFlags(64) == 0);
+
 inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6) {
     rrpreset::Set(p, preset);
     p.Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
@@ -55,7 +63,9 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_OutWidth, v.out_width);
     p.Set(NVSDK_NGX_Parameter_OutHeight, v.out_height);
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
-    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, v.flags);
+    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, CreationFlags(v.flags));
+    // A released feature frees its VRAM instead of staying cached in NGX (Streamline does too).
+    p.Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));
