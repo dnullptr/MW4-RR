@@ -61,8 +61,8 @@ static void TestTargetHash() {
     assert(!PixelTarget(4, many, hash, table) && hash == 1);
     // The sizes come from the given table too, not from the shipped one.
     const auto small_hash = rrsss::PipelineProof::ByteHash(bytes.data(), 100);
-    const Target small[] = {{small_hash, 100, Kind::Oit}};
-    assert(PixelTarget(4, many, hash, small) == &small[0] && hash == small_hash);
+    const Target one_target[] = {{small_hash, 100, Kind::Oit}};
+    assert(PixelTarget(4, many, hash, one_target) == &one_target[0] && hash == small_hash);
     hash = 1;
     // Right bytes, wrong size: the prefix of the target is not the target.
     ps.code_size = 4811;

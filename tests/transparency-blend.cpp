@@ -597,7 +597,7 @@ static void TestCoverage() {
     scene.DepthOrArraySize = 1;
     scene.MipLevels = 1;
     scene.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-    scene.SampleDesc = {4, D3D12_STANDARD_MULTISAMPLE_PATTERN};
+    scene.SampleDesc = {4, UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)};
     scene.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     scene.Flags =
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -992,9 +992,9 @@ static void TestReport() {
     assert(!strcmp(text, expected));
     assert(n == int(strlen(expected)));
 
-    char small[16];
-    assert(Report(k, small, sizeof(small)) == n);
-    assert(strlen(small) == sizeof(small) - 1 && !strncmp(small, expected, sizeof(small) - 1));
+    char short_text[16];
+    assert(Report(k, short_text, sizeof(short_text)) == n);
+    assert(strlen(short_text) == sizeof(short_text) - 1 && !strncmp(short_text, expected, sizeof(short_text) - 1));
 
     const Counters zero{};
     assert(zero.last == Reason::None);
