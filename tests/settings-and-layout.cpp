@@ -389,6 +389,10 @@ int main() {
             assert(t > 0 && t <= v);
             assert(std::abs(t * rrcontrast::ExpandFactor(t, k) - v) <= 2e-5f * v);
         }
+        // With the brightness test at 16x, the game's largest value still comes back.
+        const float big = 65504.0f * 16;
+        const float tb = big * rrcontrast::CompressFactor(big, k);
+        assert(std::abs(tb * rrcontrast::ExpandFactor(tb, k) - big) <= 1e-4f * big);
         // Sky over needles, 28x in the capture this test was made for.
         const float ratio = (4.67f * rrcontrast::CompressFactor(4.67f, k)) /
                             (0.164f * rrcontrast::CompressFactor(0.164f, k));

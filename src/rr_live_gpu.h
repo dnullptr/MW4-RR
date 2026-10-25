@@ -305,9 +305,9 @@ struct GpuFrame {
         // The hit distance copy is also the conditioning target (a UAV).
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)))
             return 0;
-        auto buffer = rrprivate::Buffer(256);
-        if (!add(buffer))
+        if (!add(rrprivate::Buffer(HeaderBytes)))
             return 0;
+        auto buffer = rrprivate::Buffer(256);
         buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (!add(buffer))
             return 0;
@@ -451,7 +451,7 @@ struct GpuFrame {
         }
         SRV(p, guides[3].Get(), 8);
         specular_hit = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
-        header = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
+        header = Allocate(p, b, rrprivate::Buffer(HeaderBytes), D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RANGE empty{};
         void *m{};
         Check(header->Map(0, &empty, &m), "live association upload map failed");
@@ -988,7 +988,7 @@ struct GpuFrame {
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
                     color_x, color_y, tolerate ? 1u : 0u, strength, 0, 0, 0};
         memcpy(header_map, c, sizeof(c));
-        header_map[16] = 0;
+        header_map[ContrastWord] = 0;
     }
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
@@ -1004,8 +1004,11 @@ struct GpuFrame {
     }
     // Knee of the contrast test, whose compression the gate's Display undoes on RR's
     // output (rrcontrast::ExpandFactor) before OutputScale; 0 = none. Header clears it.
+    // It lives past byte 256: bytes 64-255 are the never-written tail that zeroes stats.
+    static constexpr UINT HeaderBytes = 512, ContrastWord = 64;
+    static_assert(ContrastWord * 4 >= 256 && ContrastWord * 4 + 4 <= HeaderBytes);
     void OutputContrast(float knee) {
-        memcpy(&header_map[16], &knee, sizeof(knee));
+        memcpy(&header_map[ContrastWord], &knee, sizeof(knee));
     }
     // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
     std::array<UINT, 4> ReadStats() {

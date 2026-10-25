@@ -24,7 +24,7 @@ inline constexpr float Knee(unsigned mode) {
 // under 3e-7), where 1 + x would lose digits.
 inline constexpr float SeriesLimit = 0.01f;
 // Expansion input y = t / Knee is capped here; the result is capped at FP16's maximum.
-inline constexpr float MaxExponent = 16.0f;
+inline constexpr float MaxExponent = 18.0f; // 0.05 * e^18 > 65504 * 16
 inline constexpr float MaxOutput = 65504.0f;
 // CPU references of the shaders, same operations in the same order. Factor multiplies
 // every channel of a color whose brightest channel is m.
