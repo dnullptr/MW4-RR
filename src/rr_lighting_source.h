@@ -36,15 +36,16 @@ inline constexpr const char *labels[Count] = {
     "SSS pixels: lobe 2 spatial fill only (test)",
     "SSS pixels: lobe 2 fill gaps, settled + spatial (test)",
     "SSS pixels: history + spatial source view (debug)",
-    "SSS pixels: lobe 2 history first + spatial (test)"};
+    "SSS pixels: lobe 2 history first + spatial (default)"};
 inline constexpr unsigned Valid(unsigned source) {
     return source < Count ? source : Raw;
 }
 // The panel lists these first and the older ones under "Older tests". Sources in neither list
 // were tested and ruled out: hidden, but kept and never renumbered (saved NativeLobe, captures).
-inline constexpr unsigned panel[] = {Raw, SssFill2, SssFill2Spatial, SssSpatial2, SssFill2Settled,
-                                     SssHistory2, SssFillDebug};
-inline constexpr unsigned older[] = {NativeLobe1, FillBoth, SssNative2, SssNative3, SssFill3};
+inline constexpr unsigned panel[] = {Raw, SssHistory2, SssFillDebug};
+inline constexpr unsigned older[] = {NativeLobe1,     FillBoth,    SssNative2,     SssNative3,
+                                     SssFill3,        SssFill2,    SssFill2Spatial, SssSpatial2,
+                                     SssFill2Settled};
 // SSS-masked sources read the guide at t2, which only the private root binds.
 inline constexpr bool SssMasked(unsigned source) {
     return source >= SssNative2 && source < Count;

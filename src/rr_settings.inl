@@ -285,17 +285,13 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("SSS pixels options change lighting only where the previous frame's "
                        "Subsurface Scattering guide is nonzero and keep raw lighting everywhere "
                        "else; they need the SSS guide (F11) and show raw lighting without it. "
-                       "Fill gaps keeps each fresh ray sample unboosted and uses the game's own "
-                       "accumulation only where no ray landed this frame. The (test) options: "
-                       "history + spatial uses the game's accumulation only where it has lobe-2 "
-                       "history and otherwise averages this frame's rays within 2 pixels; "
-                       "settled + spatial also waits for that history to settle; spatial fill "
-                       "only never uses the game's accumulation. The source view (debug) colours "
-                       "each SSS pixel by where history + spatial took it from: blue a fresh "
-                       "ray, green the game's history, yellow the average of nearby rays, red "
-                       "no ray nearby. History first + spatial also uses the game's history where a "
-                       "fresh ray landed, so settled pixels never show a single noisy ray. Older "
-                       "options are under Older tests.");
+                       "History first + spatial (the default) uses the game's own lobe-2 "
+                       "accumulation wherever it has history, a fresh unboosted ray where it has "
+                       "none, and otherwise the average of this frame's rays within 2 pixels. "
+                       "The source view (debug) colours each SSS pixel by where history + "
+                       "spatial took it from: blue a fresh ray, green the game's history, yellow "
+                       "the average of nearby rays, red no ray nearby. Older options are under "
+                       "Older tests.");
     if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
         ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     // Session only: the combo never sets `changed`, so the test is never saved or loaded.

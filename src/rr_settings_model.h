@@ -10,7 +10,7 @@ struct Preferences {
     unsigned preset = 6;
     // SSS noise experiments.
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
-    unsigned native_lobe = 0;      // rrlighting::Source, 0 = raw lighting
+    unsigned native_lobe = 17;     // rrlighting::Source: SssHistory2 (0 = raw lighting)
     bool responsivity = false;            // RR responsivity mask on SSS pixels (preset F)
     float responsivity_strength = -0.5f;  // -1..0, negative = steadier
 };

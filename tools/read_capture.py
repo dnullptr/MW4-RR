@@ -32,7 +32,7 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'SSS pixels: lobe 2 spatial fill only (test)',
             'SSS pixels: lobe 2 fill gaps, settled + spatial (test)',
             'SSS pixels: history + spatial source view (debug)',
-            'SSS pixels: lobe 2 history first + spatial (test)']
+            'SSS pixels: lobe 2 history first + spatial (default)']
 MIXED_LIGHTING = 0xFFFFFFFF  # A frame's lighting_input when it changed within the frame.
 # Per-frame lighting_masked: whether an SSS-masked lighting input had its SSS guide.
 MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
