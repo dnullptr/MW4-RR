@@ -1,13 +1,14 @@
 #pragma once
 #include <reshade.hpp>
 #include <array>
-#include <atomic>
 #include <cstdio>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include "feed_fg_identity.h"
 #include "rr_sss_pipeline_proof.h"
 #include "rr_sss_vertex_proof.h"
@@ -318,6 +319,74 @@ inline bool CoverageFormatSupported(ID3D12Device *device, const char *&status) n
     return true;
 }
 
+// At most 16 registry log lines, except that the first ready line and the
+// first refused line of each pixel shader are always logged.
+class CoverageReportGate {
+    std::mutex mutex;
+    unsigned lines{};
+    std::unordered_map<uint64_t, unsigned> firsts; // hash -> 1 ready, 2 refused
+
+  public:
+    bool Admit(uint64_t hash, bool ready) {
+        std::lock_guard lock(mutex);
+        auto &seen = firsts[hash];
+        const unsigned bit = ready ? 1u : 2u;
+        const bool first = !(seen & bit);
+        seen |= bit;
+        if (lines < 16) {
+            ++lines;
+            return true;
+        }
+        return first;
+    }
+};
+
+// Accepted and refused native PSOs per device and kind, for the status row.
+struct CoverageTally {
+    uint64_t accepted{}, refused{};
+};
+struct CoverageCounts {
+    CoverageTally oit, refraction;
+};
+class CoverageStatus {
+    std::mutex mutex;
+    std::unordered_map<reshade::api::device *, CoverageCounts> devices;
+
+  public:
+    void Record(reshade::api::device *device, Kind kind, bool accepted) {
+        std::lock_guard lock(mutex);
+        auto &counts = devices[device];
+        auto &tally = kind == Kind::Oit ? counts.oit : counts.refraction;
+        ++(accepted ? tally.accepted : tally.refused);
+    }
+    void Forget(reshade::api::device *device) {
+        std::lock_guard lock(mutex);
+        devices.erase(device);
+    }
+    CoverageCounts Counts(reshade::api::device *device) {
+        std::lock_guard lock(mutex);
+        const auto i = devices.find(device);
+        return i != devices.end() ? i->second : CoverageCounts{};
+    }
+    // Summed over the live devices.
+    CoverageCounts Counts() {
+        std::lock_guard lock(mutex);
+        CoverageCounts sum;
+        for (const auto &[device, c] : devices) {
+            sum.oit.accepted += c.oit.accepted;
+            sum.oit.refused += c.oit.refused;
+            sum.refraction.accepted += c.refraction.accepted;
+            sum.refraction.refused += c.refraction.refused;
+        }
+        return sum;
+    }
+    // Every OIT (a36d) PSO on the live devices was refused, and none accepted.
+    bool OitUnavailable() {
+        const auto c = Counts();
+        return c.oit.refused > 0 && c.oit.accepted == 0;
+    }
+};
+
 // The native PSO keeps its variant alive (SetPrivateDataInterface), so the
 // game's PSO lifetime covers both. The registry is an identity lookup only.
 inline constexpr GUID CoverageAlternateId = {
@@ -334,21 +403,25 @@ class CoveragePipelineRegistry {
     };
 
   private:
+    // What Create made or found, kept until the outcome is logged.
+    struct Outcome {
+        unsigned problem = ~0u;  // the refused subobject type
+        uint64_t detail = ~0ull; // the refused pixel-stage value
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> native, variant;
+        std::shared_ptr<const Entry> entry;
+    };
+    std::span<const Target> targets;
     std::mutex mutex;
     std::unordered_map<uint64_t, std::shared_ptr<const Entry>> entries;
     std::unordered_map<reshade::api::device *, bool> signature_hooks;
-    uint64_t accepted{}, refused{};
     const char *last_refusal{};
-    std::atomic<unsigned> reports{};
+    CoverageStatus status;
+    CoverageReportGate reports;
     static inline thread_local bool creating{};
 
-    void Report(const std::string &text) noexcept {
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
-            try {
-                if (logger)
-                    logger(text.c_str());
-            } catch (...) {
-            }
+    void Log(const std::string &text) {
+        if (logger)
+            logger(text.c_str());
     }
     static std::string Hex(uint64_t value) {
         char text[24];
@@ -365,49 +438,53 @@ class CoveragePipelineRegistry {
         return rrsss::PipelineProof::NativeDescription(native);
     }
     // One line per native PSO. why is a static string; an unknown native PSO is
-    // described as "unobserved".
-    void Refused(uint64_t hash, const char *why, unsigned problem, uint64_t detail,
-                 ID3D12PipelineState *native) noexcept {
+    // described as "unobserved". A variant that was made is described too.
+    void Refused(reshade::api::device *device, Kind kind, uint64_t hash, const char *why,
+                 const Outcome &outcome) noexcept {
         try {
             {
                 std::lock_guard lock(mutex);
-                ++refused;
                 last_refusal = why;
             }
+            status.Record(device, kind, false);
+            if (!reports.Admit(hash, false))
+                return;
             std::string text = "Transparency albedo blend refused PSO " + Hex(hash) + ": " +
                                Label(Reason::NoPipeline) + ": " + why;
-            if (problem != ~0u)
-                text += " subobject=" + std::to_string(problem);
-            if (detail != ~0ull)
-                text += " detail=" + Hex(detail);
-            text += " (" + Description(native) + ")";
-            Report(text);
+            if (outcome.problem != ~0u)
+                text += " subobject=" + std::to_string(outcome.problem);
+            if (outcome.detail != ~0ull)
+                text += " detail=" + Hex(outcome.detail);
+            text += " (" + Description(outcome.native.Get()) + ")";
+            if (outcome.variant)
+                text += " variant=(" + Description(outcome.variant.Get()) + ")";
+            Log(text);
         } catch (...) {
         }
     }
-    void Accepted(uint64_t hash, const Entry &entry, ID3D12PipelineState *native) noexcept {
+    void Accepted(reshade::api::device *device, uint64_t hash, const Outcome &outcome) noexcept {
         try {
-            {
-                std::lock_guard lock(mutex);
-                ++accepted;
-            }
-            Report("Transparency albedo blend: pipeline ready for " + Hex(hash) +
-                   " (kind=" + Name(entry.kind) + " dsv=" + Name(entry.depth) +
-                   " refractionAlpha=" + (entry.refraction_alpha ? "1" : "0") + "; " +
-                   Description(native) + ")");
+            const auto &entry = *outcome.entry;
+            status.Record(device, entry.kind, true);
+            if (!reports.Admit(hash, true))
+                return;
+            Log("Transparency albedo blend: pipeline ready for " + Hex(hash) +
+                " (kind=" + Name(entry.kind) + " dsv=" + Name(entry.depth) +
+                " refractionAlpha=" + (entry.refraction_alpha ? "1" : "0") + "; " +
+                Description(outcome.native.Get()) + ")");
         } catch (...) {
         }
     }
-    // Returns nullptr and sets out when the variant is ready, else the refusal.
+    // Returns nullptr and sets out.entry when the variant is ready, else the refusal.
     const char *Create(reshade::api::device *device, reshade::api::pipeline_layout layout,
                        unsigned n, const reshade::api::pipeline_subobject *objects,
-                       reshade::api::pipeline original, const Target &pixel,
-                       ID3D12PipelineState *native, unsigned &problem, uint64_t &detail,
-                       std::shared_ptr<const Entry> &out) {
+                       reshade::api::pipeline original, const Target &pixel, Outcome &out) {
         using namespace rrsss;
         if (!original.handle || !layout.handle)
             return "missing-pipeline-or-layout-handle";
-        Forget(original.handle); // a recycled address never keeps an earlier variant
+        out.native = fg::NativeObject<ID3D12PipelineState>(
+            reinterpret_cast<ID3D12PipelineState *>(original.handle));
+        ID3D12PipelineState *native = out.native.Get();
         auto native_device =
             fg::NativeObject<ID3D12Device>(reinterpret_cast<ID3D12Device *>(device->get_native()));
         if (!native || !native_device)
@@ -429,7 +506,7 @@ class CoveragePipelineRegistry {
             return "native-depth-stencil-written";
         CoveragePatch patch;
         if (!patch.Prepare(n, objects, pixel, observed.blend, depth)) {
-            problem = patch.problem;
+            out.problem = patch.problem;
             return patch.status;
         }
         const char *why = nullptr;
@@ -438,7 +515,8 @@ class CoveragePipelineRegistry {
         // The replay runs both stages again, so both must be read-only.
         if (!VertexReplayProof(patch.vertex->code, patch.vertex->code_size, why))
             return why;
-        if (!PixelReplayProof(patch.pixel_shader->code, patch.pixel_shader->code_size, why, detail))
+        if (!PixelReplayProof(patch.pixel_shader->code, patch.pixel_shader->code_size, why,
+                              out.detail))
             return why;
         {
             std::lock_guard lock(mutex);
@@ -454,61 +532,65 @@ class CoveragePipelineRegistry {
             }
         } guard;
         const auto expected = Expected(observed, pixel.kind, depth);
-        Microsoft::WRL::ComPtr<ID3D12PipelineState> variant;
         {
             PipelineProof::QualityScope quality(native_device.Get(), expected);
             reshade::api::pipeline made{};
             if (!device->create_pipeline(layout, patch.count, patch.objects.data(), &made) ||
                 !made.handle)
                 return "variant-creation-failed";
-            variant = fg::NativeObject<ID3D12PipelineState>(
+            out.variant = fg::NativeObject<ID3D12PipelineState>(
                 reinterpret_cast<ID3D12PipelineState *>(made.handle));
             device->destroy_pipeline(made); // the ComPtr keeps the object
+            // ApplyQuality runs Equivalent on the legacy desc before creating it.
+            if (!quality.attempted)
+                return "variant-not-created-through-legacy-path";
             if (!quality.applied)
-                return "variant-sample-desc-not-applied";
+                return "variant-state-mismatch-before-create";
         }
         NativePipelineObservation actual;
-        if (!variant || !NativePipelineProven(variant.Get()) ||
-            !PipelineProof::NativeObservation(variant.Get(), actual))
+        if (!out.variant || !NativePipelineProven(out.variant.Get()) ||
+            !PipelineProof::NativeObservation(out.variant.Get(), actual))
             return "variant-unproven";
         if (!PipelineProof::Equivalent(expected, actual))
             return "variant-state-mismatch";
-        if (FAILED(native->SetPrivateDataInterface(CoverageAlternateId, variant.Get())))
+        if (FAILED(native->SetPrivateDataInterface(CoverageAlternateId, out.variant.Get())))
             return "variant-lifetime-attachment-failed";
-        out = std::make_shared<const Entry>(Entry{device, std::move(variant), depth, pixel.kind,
-                                                  observed.sample,
-                                                  RefractionAlpha(observed.blend, pixel.kind)});
+        out.entry = std::make_shared<const Entry>(
+            Entry{device, std::move(out.variant), depth, pixel.kind, observed.sample,
+                  RefractionAlpha(observed.blend, pixel.kind)});
+        std::shared_ptr<const Entry> replaced; // released after the lock
         std::lock_guard lock(mutex);
-        entries.insert_or_assign(original.handle, out);
+        replaced = std::exchange(entries[original.handle], out.entry);
         return nullptr;
     }
 
   public:
     void (*logger)(const char *){};
+    // targets: the pixel shaders to build variants for (a test passes its own).
+    explicit CoveragePipelineRegistry(std::span<const Target> targets = Targets)
+        : targets(targets) {}
     void Initialize(reshade::api::device *device, reshade::api::pipeline_layout layout, unsigned n,
                     const reshade::api::pipeline_subobject *objects,
                     reshade::api::pipeline original) noexcept {
         if (creating || !device || device->get_api() != reshade::api::device_api::d3d12)
             return;
         uint64_t hash = 0;
-        Microsoft::WRL::ComPtr<ID3D12PipelineState> native;
+        const Target *pixel = nullptr;
         try {
-            const auto *pixel = PixelTarget(n, objects, hash);
+            // A recycled handle never keeps the variant of the PSO it named before.
+            if (original.handle)
+                Forget(original.handle);
+            pixel = PixelTarget(n, objects, hash, targets);
             if (!pixel)
                 return;
-            if (original.handle)
-                native = fg::NativeObject<ID3D12PipelineState>(
-                    reinterpret_cast<ID3D12PipelineState *>(original.handle));
-            unsigned problem = ~0u;
-            uint64_t detail = ~0ull;
-            std::shared_ptr<const Entry> entry;
-            if (const char *why = Create(device, layout, n, objects, original, *pixel, native.Get(),
-                                         problem, detail, entry))
-                Refused(hash, why, problem, detail, native.Get());
+            Outcome outcome;
+            if (const char *why = Create(device, layout, n, objects, original, *pixel, outcome))
+                Refused(device, pixel->kind, hash, why, outcome);
             else
-                Accepted(hash, *entry, native.Get());
+                Accepted(device, hash, outcome);
         } catch (...) {
-            Refused(hash, "pipeline-preparation-exception", ~0u, ~0ull, nullptr);
+            if (pixel)
+                Refused(device, pixel->kind, hash, "pipeline-preparation-exception", {});
         }
     }
     // The variant of a native PSO on this device, or nullptr.
@@ -517,27 +599,50 @@ class CoveragePipelineRegistry {
         const auto i = entries.find(original);
         return i != entries.end() && i->second->device == device ? i->second : nullptr;
     }
+    // Erased entries are released after the lock: a variant's last release can
+    // reach OnDestroyPipeline, which calls Forget.
     void Forget(uint64_t original) {
+        std::shared_ptr<const Entry> gone;
         std::lock_guard lock(mutex);
-        entries.erase(original);
+        if (const auto i = entries.find(original); i != entries.end()) {
+            gone = std::move(i->second);
+            entries.erase(i);
+        }
     }
     void ForgetDevice(reshade::api::device *device) {
-        std::lock_guard lock(mutex);
-        signature_hooks.erase(device);
-        for (auto i = entries.begin(); i != entries.end();)
-            if (i->second->device == device)
-                i = entries.erase(i);
-            else
-                ++i;
+        std::vector<std::shared_ptr<const Entry>> gone;
+        {
+            std::lock_guard lock(mutex);
+            signature_hooks.erase(device);
+            size_t count = 0;
+            for (const auto &[handle, entry] : entries)
+                count += entry->device == device;
+            try {
+                gone.reserve(count);
+            } catch (...) {
+                // Without the memory, the entries are released under the lock.
+            }
+            for (auto i = entries.begin(); i != entries.end();)
+                if (i->second->device != device) {
+                    ++i;
+                } else {
+                    if (gone.size() < gone.capacity())
+                        gone.push_back(std::move(i->second));
+                    i = entries.erase(i);
+                }
+        }
+        status.Forget(device);
     }
-    // Status row: a variant was ever made, or every candidate PSO was refused.
-    bool AnyAccepted() {
-        std::lock_guard lock(mutex);
-        return accepted > 0;
+    // Status row: accepted and refused PSOs per kind, for one device or summed
+    // over the live ones, and whether the OIT capture is unavailable.
+    CoverageCounts Counts(reshade::api::device *device) {
+        return status.Counts(device);
     }
-    bool AllRefused() {
-        std::lock_guard lock(mutex);
-        return refused > 0 && accepted == 0;
+    CoverageCounts Counts() {
+        return status.Counts();
+    }
+    bool OitUnavailable() {
+        return status.OitUnavailable();
     }
     // The last refusal reason (a static string), or nullptr.
     const char *LastRefusal() {

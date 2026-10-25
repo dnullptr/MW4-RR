@@ -59,6 +59,11 @@ static void TestTargetHash() {
     many[2].data = &other;
     hash = 1;
     assert(!PixelTarget(4, many, hash, table) && hash == 1);
+    // The sizes come from the given table too, not from the shipped one.
+    const auto small_hash = rrsss::PipelineProof::ByteHash(bytes.data(), 100);
+    const Target small[] = {{small_hash, 100, Kind::Oit}};
+    assert(PixelTarget(4, many, hash, small) == &small[0] && hash == small_hash);
+    hash = 1;
     // Right bytes, wrong size: the prefix of the target is not the target.
     ps.code_size = 4811;
     hash = 1;
@@ -892,6 +897,12 @@ static void TestPixelProof() {
     assert(!PixelReplayProof(garbage, sizeof(garbage), status, detail));
     assert(!strcmp(status, "pixel-dxc-companion-unavailable") ||
            !strcmp(status, "pixel-dxil-reflection-unavailable"));
+    // The vertex proof keeps its own statuses on the shared loader.
+    assert(!rrsss::VertexReplayProof(nullptr, 64, status));
+    assert(!strcmp(status, "vertex-bytecode-invalid"));
+    assert(!rrsss::VertexReplayProof(garbage, sizeof(garbage), status));
+    assert(!strcmp(status, "vertex-dxc-companion-unavailable") ||
+           !strcmp(status, "vertex-dxil-reflection-unavailable"));
 }
 
 static std::vector<std::string> logged;
@@ -899,18 +910,186 @@ static void Log(const char *text) {
     logged.push_back(text);
 }
 
+// A ReShade device that only reports its API: the registry refuses before
+// it reads anything else.
+namespace fake {
+using namespace reshade::api;
+struct Device final : reshade::api::device {
+    device_api api = device_api::d3d12;
+    uint64_t get_native() const override {
+        return 0;
+    }
+    void get_private_data(const uint8_t[16], uint64_t *data) const override {
+        *data = 0;
+    }
+    void set_private_data(const uint8_t[16], const uint64_t) override {}
+    device_api get_api() const override {
+        return api;
+    }
+    bool check_capability(device_caps) const override {
+        return {};
+    }
+    bool check_format_support(format, resource_usage) const override {
+        return {};
+    }
+    bool create_sampler(const sampler_desc &, sampler *) override {
+        return {};
+    }
+    void destroy_sampler(sampler) override {}
+    bool create_resource(const resource_desc &, const subresource_data *, resource_usage,
+                         resource *, void **) override {
+        return {};
+    }
+    void destroy_resource(resource) override {}
+    resource_desc get_resource_desc(resource) const override {
+        return {};
+    }
+    bool create_resource_view(resource, resource_usage, const resource_view_desc &,
+                              resource_view *) override {
+        return {};
+    }
+    void destroy_resource_view(resource_view) override {}
+    resource get_resource_from_view(resource_view) const override {
+        return {};
+    }
+    resource_view_desc get_resource_view_desc(resource_view) const override {
+        return {};
+    }
+    bool map_buffer_region(resource, uint64_t, uint64_t, map_access, void **) override {
+        return {};
+    }
+    void unmap_buffer_region(resource) override {}
+    bool map_texture_region(resource, uint32_t, const subresource_box *, map_access,
+                            subresource_data *) override {
+        return {};
+    }
+    void unmap_texture_region(resource, uint32_t) override {}
+    void update_buffer_region(const void *, resource, uint64_t, uint64_t) override {}
+    void update_texture_region(const subresource_data &, resource, uint32_t,
+                               const subresource_box *) override {}
+    bool create_pipeline(pipeline_layout, uint32_t, const pipeline_subobject *,
+                         pipeline *) override {
+        assert(!"a refused pipeline creates no variant");
+        return false;
+    }
+    void destroy_pipeline(pipeline) override {}
+    bool create_pipeline_layout(uint32_t, const pipeline_layout_param *,
+                                pipeline_layout *) override {
+        return {};
+    }
+    void destroy_pipeline_layout(pipeline_layout) override {}
+    bool allocate_descriptor_tables(uint32_t, pipeline_layout, uint32_t,
+                                    descriptor_table *) override {
+        return {};
+    }
+    void free_descriptor_tables(uint32_t, const descriptor_table *) override {}
+    void get_descriptor_heap_offset(descriptor_table, uint32_t, uint32_t, descriptor_heap *,
+                                    uint32_t *) const override {}
+    void copy_descriptor_tables(uint32_t, const descriptor_table_copy *) override {}
+    void update_descriptor_tables(uint32_t, const descriptor_table_update *) override {}
+    bool create_query_heap(query_type, uint32_t, query_heap *) override {
+        return {};
+    }
+    void destroy_query_heap(query_heap) override {}
+    bool get_query_heap_results(query_heap, query_type, uint32_t, uint32_t, void *,
+                                uint32_t) override {
+        return {};
+    }
+    void set_resource_name(resource, const char *) override {}
+    void set_resource_view_name(resource_view, const char *) override {}
+    bool create_fence(uint64_t, fence_flags, fence *, void **) override {
+        return {};
+    }
+    void destroy_fence(fence) override {}
+    uint64_t get_completed_fence_value(fence) const override {
+        return {};
+    }
+    bool wait(fence, uint64_t, uint64_t) override {
+        return {};
+    }
+    bool signal(fence, uint64_t) override {
+        return {};
+    }
+    bool get_property(device_properties, void *) const override {
+        return {};
+    }
+    uint64_t get_resource_view_gpu_address(resource_view) const override {
+        return {};
+    }
+    void get_acceleration_structure_size(acceleration_structure_type,
+                                         acceleration_structure_build_flags, uint32_t,
+                                         const acceleration_structure_build_input *, uint64_t *,
+                                         uint64_t *, uint64_t *) const override {}
+    bool get_pipeline_shader_group_handles(pipeline, uint32_t, uint32_t, void *) override {
+        return {};
+    }
+};
+} // namespace fake
+
+static void TestReportGate() {
+    CoverageReportGate gate;
+    // The first line of each kind for a shader, then the cap.
+    for (int i = 0; i < 16; ++i)
+        assert(gate.Admit(0xa, false));
+    assert(!gate.Admit(0xa, false));
+    assert(gate.Admit(0xa, true) && !gate.Admit(0xa, true));
+    assert(gate.Admit(0xb, false) && gate.Admit(0xb, true));
+    assert(!gate.Admit(0xb, false) && !gate.Admit(0xb, true));
+    // Under the cap every line is logged, first or not.
+    CoverageReportGate under;
+    for (int i = 0; i < 8; ++i)
+        assert(under.Admit(0xc, true) && under.Admit(0xd, false));
+    assert(!under.Admit(0xc, true) && !under.Admit(0xd, false) && under.Admit(0xe, true));
+}
+
+static void TestStatus() {
+    auto *a = reinterpret_cast<api::device *>(uintptr_t(0x2000));
+    auto *b = reinterpret_cast<api::device *>(uintptr_t(0x3000));
+    CoverageStatus status;
+    auto none = status.Counts();
+    assert(!none.oit.accepted && !none.oit.refused && !none.refraction.accepted &&
+           !none.refraction.refused && !status.OitUnavailable());
+    status.Record(a, Kind::Oit, false);
+    status.Record(a, Kind::Oit, false);
+    status.Record(a, Kind::Refraction, true);
+    auto c = status.Counts(a);
+    assert(c.oit.refused == 2 && !c.oit.accepted && c.refraction.accepted == 1 &&
+           !c.refraction.refused);
+    // Every OIT PSO was refused: unavailable, whatever refraction did.
+    assert(status.OitUnavailable());
+    status.Record(b, Kind::Oit, true);
+    status.Record(b, Kind::Refraction, false);
+    c = status.Counts(b);
+    assert(c.oit.accepted == 1 && !c.oit.refused && c.refraction.refused == 1 &&
+           !c.refraction.accepted);
+    c = status.Counts();
+    assert(c.oit.refused == 2 && c.oit.accepted == 1 && c.refraction.accepted == 1 &&
+           c.refraction.refused == 1);
+    assert(!status.OitUnavailable());
+    // A forgotten device's counts are gone.
+    status.Forget(b);
+    c = status.Counts(b);
+    assert(!c.oit.accepted && !c.refraction.refused);
+    assert(status.Counts().oit.accepted == 0 && status.OitUnavailable());
+    status.Forget(a);
+    assert(!status.Counts().oit.refused && !status.OitUnavailable());
+    // Only refused refraction PSOs do not make the OIT capture unavailable.
+    status.Record(a, Kind::Refraction, false);
+    assert(!status.OitUnavailable());
+}
+
 static void TestRegistry() {
     CoveragePipelineRegistry registry;
     registry.logger = &Log;
     auto *device = reinterpret_cast<api::device *>(uintptr_t(0x2000));
     auto *other = reinterpret_cast<api::device *>(uintptr_t(0x3000));
-    assert(!registry.AnyAccepted() && !registry.AllRefused() && !registry.LastRefusal());
+    assert(!registry.Counts().oit.refused && !registry.OitUnavailable() && !registry.LastRefusal());
     assert(!registry.Find(device, 0x10));
     // A null device is ignored before anything is read.
     Native n(Oit,
              ReShadeNative(api::blend_factor::one, api::blend_factor::one_minus_source1_color));
     registry.Initialize(nullptr, {0x1000}, n.Count(), n.objects.data(), {0x10});
-    assert(logged.empty() && !registry.AllRefused());
+    assert(logged.empty() && !registry.OitUnavailable());
     // The command signature hook result is kept per device.
     assert(!registry.SignatureHooked(device) && !registry.SignatureHooked());
     registry.SignatureHook(device, true);
@@ -924,6 +1103,78 @@ static void TestRegistry() {
     assert(!registry.SignatureHooked(device) && !registry.SignatureHooked());
     registry.Forget(0x10);
     assert(!registry.Find(device, 0x10));
+}
+
+static bool Contains(const std::string &text, const std::string &part) {
+    return text.find(part) != std::string::npos;
+}
+
+// Refusals through Initialize, with targets built from the test's own shaders.
+static void TestRegistryRefusals() {
+    Native oit(Oit,
+               ReShadeNative(api::blend_factor::one, api::blend_factor::one_minus_source1_color));
+    Native refraction(Refraction, ReShadeNative(api::blend_factor::one,
+                                                api::blend_factor::one_minus_source_alpha));
+    Native unknown(
+        Oit, ReShadeNative(api::blend_factor::one, api::blend_factor::one_minus_source1_color));
+    unknown.ps[0] ^= 1;
+    std::vector<unsigned char> third_ps(4780, 0x3c);
+    const uint64_t oit_hash = rrsss::PipelineProof::ByteHash(oit.ps.data(), oit.ps.size());
+    const uint64_t refraction_hash =
+        rrsss::PipelineProof::ByteHash(refraction.ps.data(), refraction.ps.size());
+    const uint64_t third_hash = rrsss::PipelineProof::ByteHash(third_ps.data(), third_ps.size());
+    const Target targets[] = {{oit_hash, Oit.bytes, Kind::Oit},
+                              {refraction_hash, Refraction.bytes, Kind::Refraction},
+                              {third_hash, 4780, Kind::Refraction}};
+    CoveragePipelineRegistry registry(targets);
+    registry.logger = &Log;
+    logged.clear();
+    fake::Device device, second, vulkan;
+    vulkan.api = api::device_api::vulkan;
+
+    // Not a target, or not D3D12: nothing is counted or logged.
+    registry.Initialize(&device, {0x1000}, unknown.Count(), unknown.objects.data(), {0});
+    registry.Initialize(&vulkan, {0x1000}, oit.Count(), oit.objects.data(), {0});
+    assert(logged.empty() && !registry.Counts().oit.refused && !registry.LastRefusal());
+
+    // A refusal is counted for its device and kind and logged with its shader.
+    registry.Initialize(&device, {0x1000}, oit.Count(), oit.objects.data(), {0});
+    assert(logged.size() == 1);
+    char hex[24];
+    snprintf(hex, sizeof(hex), "0x%016llx", static_cast<unsigned long long>(oit_hash));
+    assert(logged[0] == std::string("Transparency albedo blend refused PSO ") + hex +
+                            ": no-pipeline: missing-pipeline-or-layout-handle "
+                            "(nativeObservation{unobserved})");
+    assert(!strcmp(registry.LastRefusal(), "missing-pipeline-or-layout-handle"));
+    auto c = registry.Counts(&device);
+    assert(c.oit.refused == 1 && !c.oit.accepted && !c.refraction.refused);
+    assert(registry.OitUnavailable());
+    registry.Initialize(&device, {0}, refraction.Count(), refraction.objects.data(), {0x20});
+    c = registry.Counts(&device);
+    assert(c.oit.refused == 1 && c.refraction.refused == 1);
+    snprintf(hex, sizeof(hex), "0x%016llx", static_cast<unsigned long long>(refraction_hash));
+    assert(logged.size() == 2 && Contains(logged[1], hex));
+    // Per device, summed over the live ones, and reset when a device goes.
+    registry.Initialize(&second, {0x1000}, oit.Count(), oit.objects.data(), {0});
+    assert(registry.Counts(&second).oit.refused == 1 && registry.Counts().oit.refused == 2);
+    registry.ForgetDevice(&device);
+    c = registry.Counts(&device);
+    assert(!c.oit.refused && !c.refraction.refused);
+    assert(registry.Counts().oit.refused == 1 && registry.OitUnavailable());
+    registry.ForgetDevice(&second);
+    assert(!registry.Counts().oit.refused && !registry.OitUnavailable());
+
+    // At most 16 lines, but the first refusal of another shader is still logged.
+    for (int i = 0; i < 30; ++i)
+        registry.Initialize(&device, {0x1000}, oit.Count(), oit.objects.data(), {0});
+    assert(logged.size() == 16 && registry.Counts(&device).oit.refused == 30);
+    refraction.ps_desc = {third_ps.data(), third_ps.size()};
+    registry.Initialize(&device, {0x1000}, refraction.Count(), refraction.objects.data(), {0});
+    snprintf(hex, sizeof(hex), "0x%016llx", static_cast<unsigned long long>(third_hash));
+    assert(logged.size() == 17 && Contains(logged[16], hex));
+    registry.Initialize(&device, {0x1000}, refraction.Count(), refraction.objects.data(), {0});
+    assert(logged.size() == 17 && registry.Counts(&device).refraction.refused == 2);
+    registry.ForgetDevice(&device);
 }
 
 int main() {
@@ -949,8 +1200,11 @@ int main() {
                  DepthClass::NoDsv);
     TestFormatSupport();
     TestPixelProof();
+    TestReportGate();
+    TestStatus();
     TestRegistry();
+    TestRegistryRefusals();
     puts("PASS: transparency coverage variant target hash, blend factor mapping, subobject "
          "patch and refusals, expected observation equivalence, format support, pixel replay "
-         "proof, registry");
+         "proof, report cap, status counts, registry");
 }
