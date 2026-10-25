@@ -6,6 +6,8 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
+Test passes that change RR's inputs (color_scale, depth_floor): undo them with
+tools/analyze_sky_edges.py undo_tests(manifest, frames).
 """
 import argparse
 import json
@@ -25,6 +27,10 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'Raw, cap bright samples (4x)', 'Raw, AO fix A (fill gaps)', 'Raw, AO fix B (native)',
             'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
             'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
+# Per-frame test settings and their off values; the summary shows only the ones that are on.
+FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
+               'hit_distance_test': 0, 'linear_depth': False, 'water_masks': False,
+               'water_guide': 0}
 
 
 def small_float(bits, mantissa_bits):
@@ -104,17 +110,25 @@ def summary(manifest, frames):
     m = manifest
     lines = [f'{m["frame_count"]} frames, render {m["render_width"]}x{m["render_height"]}, '
              f'output {m["output_width"]}x{m["output_height"]}, quality {m["quality"]}, '
-             f'preset {m["preset"]}, settings {json.dumps(m["settings"], separators=(",", ":"))}']
+             f'preset {m["preset"]}, create_flags {m.get("create_flags", "?")}, '
+             f'settings {json.dumps(m["settings"], separators=(",", ":"))}']
     lobe = m['settings'].get('lighting_input')
     if type(lobe) is int:
         lines.append(f'lighting input {lobe}: '
                      f'{LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else "unknown"}')
+    setups = {tuple(f.get(k) for k in ('lighting_input', *FRAME_TESTS)) for f in m['frames']}
+    if len(setups) > 1:
+        lines.append('warning: the frames differ in lighting input or test settings')
     for frame, arrays in zip(m['frames'], frames):
         names = [n for bit, n in m['reset_reason_bits'].items() if frame['reset_reasons'] & int(bit)]
         reasons = f'({"|".join(names)})' if names else ''
+        tests = ''.join(f' {k}={frame[k]}' for k, off in FRAME_TESTS.items()
+                        if k in frame and frame[k] != off)
+        lighting = f' lighting_input={frame["lighting_input"]}' if 'lighting_input' in frame else ''
         lines.append(f'frame {frame["index"]} serial={frame["serial"]} sl_frame={frame["sl_frame"]} '
                      f'delivered={frame["delivered"]} reset={frame["reset"]} '
-                     f'reset_reasons={frame["reset_reasons"]}{reasons} jitter={frame["jitter"]}')
+                     f'reset_reasons={frame["reset_reasons"]}{reasons} jitter={frame["jitter"]}'
+                     f'{lighting}{tests}')
         for name, array in arrays.items():
             if name == 'status':
                 counts = [int((array == v).sum()) for v in range(5)]  # any dtype, no big allocation
@@ -174,7 +188,8 @@ def self_test():
                                 'height': h, 'bytes_per_pixel': array.nbytes // (w * h)}
             frames_json.append({'index': i, 'serial': 10 + i, 'sl_frame': 20 + i, 'delivered': True,
                                 'reset': bool(i), 'reset_reasons': 3 * i, 'jitter': [0.25, -0.125],
-                                'inputs': inputs})
+                                'lighting_input': 12, 'color_scale': [1, 4][i], 'guide_test': 0,
+                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs})
         manifest = {'format': 'mw4-rr-capture', 'version': 1, 'frame_count': 2,
                     'render_width': width, 'render_height': height, 'output_width': 8,
                     'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True,
@@ -221,6 +236,11 @@ def self_test():
         expect('  status: 0=0 1=1 2=0 3=0 4=0 other=2' in floats, 'status histogram on floats')
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
+        expect('jitter=[0.25, -0.125] lighting_input=12\n' in text, 'frame 0 lighting, tests off')
+        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge\n' in text,
+               'frame 1 tests that are on')
+        expect('warning: the frames differ in lighting input or test settings' in text,
+               'mixed test settings warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
