@@ -34,6 +34,11 @@ Assumptions (the report repeats the ones that were decided from data):
   are misaligned without compensation, and must beat no compensation clearly; the choice and the
   residuals are reported. If the jitter changes but nothing can be decided, the two animation hints
   report fires=None ("jitter not compensated").
+- Edges: a pixel is left out of the residuals when any bilinear tap it reads lands on a surface whose
+  view depth differs by more than DISOCCLUSION_TOLERANCE; for the box-filtered colour and delta so
+  are the pixels within COLOUR_GUARD of such a pixel, of sky or other non-ordinary pixels and of the
+  frame border: a hard edge cannot be resampled exactly, so its neighbourhood would read as
+  animation. Draw the region inside the water where possible.
 - Resampling floor: warping with a fractional shift blurs sharp textures, which alone makes a
   static surface look like it changes. Per pair the round trip |warp(warp(frame i, +f), -f) -
   frame i| / 2, f = frac(mv + jitter offset), measures that on frame i itself (guides, colour and
@@ -82,9 +87,10 @@ HINT_RESIDUAL_RATIO = 3.0       # animates beyond the motion vectors: region res
 MIN_RESIDUAL = 1e-3             # ... and above this absolute floor (so 0 vs 1e-9 noise does not count)
 MIN_RELATIVE_COLOUR = 0.01      # colour hint: ... and above this fraction of the region's mean luminance
 HINT_FLOOR_RATIO = 2.0          # ... and above this x the region's own resampling floor (see temporal_stats)
-DISOCCLUSION_TOLERANCE = 0.05   # reprojected source depth may differ from the pixel's by this fraction
+DISOCCLUSION_TOLERANCE = 0.05   # a bilinear tap's source depth may differ from the pixel's by this fraction
 BOX_SIZE = 5                    # box filter that suppresses lighting noise before comparing colour
 CONTROL_MARGIN = 4              # automatic control keeps this many pixels away from the region
+COLOUR_GUARD = BOX_SIZE // 2 + 1    # colour/delta residuals this near an unusable pixel are left out
 MV_TINY_PIXELS = 0.05           # mean |mv_px| below this while the camera moved: try other scalings
 ALT_IMPROVEMENT = 0.8           # an alternative (MV scaling, jitter sign) must drop the residual below this x
 MIN_HINT_PIXELS = 50            # hints need at least this many valid pixels in region and control
@@ -151,8 +157,7 @@ def make_taps(mv, offset=(0.0, 0.0)):
             'shift': mv + np.asarray(offset, np.float32),
             'index': [(y0 * width + x0).ravel(), (y0 * width + x1).ravel(),
                       (y1 * width + x0).ravel(), (y1 * width + x1).ravel()],
-            'weight': [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy],
-            'nearest': (np.rint(sy).astype(np.intp) * width + np.rint(sx).astype(np.intp)).ravel()}
+            'weight': [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy]}
 
 
 def warp(image, taps):
@@ -375,9 +380,17 @@ def pair_maps(prev, cur, taps, prev_item, cur_item, floor=False):
     floor=True also '<name>_floor' maps: the resampling-only baseline of frame i at the same shift."""
     height, width = taps['shape']
     with np.errstate(invalid='ignore'):
-        source_depth = prev_item['depth'].ravel()[taps['nearest']].reshape(height, width)
-        agree = np.abs(source_depth - cur_item['depth']) <= DISOCCLUSION_TOLERANCE * np.abs(cur_item['depth'])
+        agree = np.ones((height, width), bool)
+        tolerance = DISOCCLUSION_TOLERANCE * np.abs(cur_item['depth'])
+        for index, weight in zip(taps['index'], taps['weight']):    # every tap that contributes
+            source_depth = prev_item['depth'].ravel()[index].reshape(height, width)
+            agree &= (np.abs(source_depth - cur_item['depth']) <= tolerance) | \
+                (weight.reshape(height, width) <= 0)
         valid = cur_item['ordinary'] & taps['inside'] & agree
+        # The colour and delta are box filtered: a window that reaches an unusable pixel (sky, a depth
+        # step, off screen) mixes surfaces, and a hard edge cannot be resampled exactly, so leave
+        # those pixels out as well.
+        colour_valid = valid & (box_sum((~valid).astype(np.float64), 2 * COLOUR_GUARD + 1) < 0.5)
         maps = {}
         for name, channels in (('normal_roughness', 4), ('diffuse_albedo', 3)):
             maps[name] = np.abs(warp(prev[name][..., :channels], taps) -
@@ -392,8 +405,8 @@ def pair_maps(prev, cur, taps, prev_item, cur_item, floor=False):
             maps['colour_floor'] = resampling_floor(cur_item['colour'], taps['shift'])
             if 'transparency_delta' in maps:
                 maps['transparency_delta_floor'] = resampling_floor(cur_item['delta'], taps['shift'])
-    return {k: np.where(valid & np.isfinite(v), v, np.nan).astype(np.float32)
-            for k, v in maps.items()}, valid
+    return {k: np.where((valid if k.startswith(('normal', 'diffuse')) else colour_valid) & np.isfinite(v),
+                        v, np.nan).astype(np.float32) for k, v in maps.items()}, valid
 
 
 def first_usable_pair(metas):
@@ -1605,6 +1618,20 @@ def self_test():
             undecided = hint(lost, name)
             expect(undecided['fires'] is None and 'jitter not compensated' in undecided['detail'] and
                    undecided['statement'].startswith('not evaluated'), f'{name} needs a decided jitter')
+
+        # A region that covers the whole water rectangle includes its hard edges (colour and guides
+        # step, and the edge is crossed by the taps without the nearest texel changing): static water
+        # must still not animate, whichever y jitter and renderer signs.
+        for label, options in (('x jitter', dict()), ('flipped y jitter', dict(jitter_y=0.4, flip_y=True)),
+                               ('same-sign y jitter', dict(jitter_y=0.4))):
+            write_capture(tmp / f'rectangle-{label}'.replace(' ', '_'), scroll=0, jitter=0.5, **options)
+            whole = run_probe(tmp / f'rectangle-{label}'.replace(' ', '_'), region=SYN_REGION, out_dir=out)
+            temporal = region_of(whole, 'region')['temporal']
+            expect(all(hint(whole, name)['fires'] is False
+                       for name in ('guides_animate', 'colour_animates')) and
+                   temporal['colour_residual_relative'] < MIN_RELATIVE_COLOUR / 2 and
+                   temporal['guide_residual'] < 1.5 * temporal['guide_resampling_floor'],
+                   f'{label}: static water rectangle with its hard edges must not animate: {temporal}')
 
         # Sharp texture (8x12 px wavelength): bilinear resampling alone leaves a residual above
         # MIN_RESIDUAL. The static pattern must not fire guides_animate (without the floor rule it
