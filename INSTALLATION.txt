@@ -127,6 +127,7 @@ Open ReShade and select its Add-ons panel. Find MW4 Ray Reconstruction.
 - F8: toggle Ray Reconstruction.
 - F9: toggle the Transparency Guide.
 - F11: toggle the Subsurface Scattering Guide.
+- F8, F9, and F11 do nothing while Ctrl or Alt is held.
 
 The status panel shows whether each feature is working:
 - Off: disabled.

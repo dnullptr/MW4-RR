@@ -40,6 +40,11 @@ static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");
+static_assert(rrsettings::HotkeyToggles(true, false, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, true, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, true, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, false, false));
+static_assert(!rrsettings::HotkeyToggles(false, false, false, true));
 // The readback frame keeps its 41 words and appends extra rays (bytes 228, 232) and the apply
 // target (bytes 236, 240); the stats buffer holds 4 * Count bytes from Offset.
 static_assert(rrdensity::Limits == 34 && rrdensity::RateSettings == 38 && rrdensity::Extra == 41 &&
