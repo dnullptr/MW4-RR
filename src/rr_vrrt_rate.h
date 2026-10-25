@@ -10,11 +10,14 @@ using UInt=unsigned;
 #else
 typedef uint UInt;
 #endif
-struct Rate {bool supported;UInt denominator;UInt extra;};
+// raw: request code before the budget transform (0 when not requested).
+// extra: rays beyond one this pixel gets (final code-16 when the code is above 16).
+struct Rate {bool supported;UInt denominator;UInt raw;UInt extra;};
 inline Rate InverseRate(UInt packedRequest,int enabled,int promote,int clampRate,int threshold,int boundary,int ring){
- Rate result;result.supported=true;result.denominator=0;result.extra=0;
+ Rate result;result.supported=true;result.denominator=0;result.raw=0;result.extra=0;
  packedRequest&=65535u;if(packedRequest==65535u)return result;
  int code=int(packedRequest&255u);
+ result.raw=UInt(code);
  if(enabled!=0){
   if(threshold==INT_MIN){result.supported=false;return result;}
   const int magnitude=threshold<0?-threshold:threshold;
@@ -25,6 +28,8 @@ inline Rate InverseRate(UInt packedRequest,int enabled,int promote,int clampRate
  }
  const int inverse=code>=16?1:16-code;
  if(inverse<1||inverse>255){result.supported=false;return result;}
- result.denominator=UInt(inverse);result.extra=code>=16?UInt(code-16):0;return result;
+ result.denominator=UInt(inverse);
+ result.extra=code>16?UInt(code-16):0u;
+ return result;
 }
 }
