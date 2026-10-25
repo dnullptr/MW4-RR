@@ -476,9 +476,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "blue-noise share of those pixels every frame (strength = the share where "
                        "the glass fully refracts) and brightens the rest so the average stays "
                        "the same. The mask view tints the covered pixels red instead. Judge it "
-                       "with frame "
-                       "generation off. Needs the transparency albedo blend's refraction "
-                       "capture; the color brightness test turns it off.");
+                       "with frame generation off. Reads the refraction coverage that the "
+                       "transparency albedo blend captures, so it needs that blend on; the "
+                       "color brightness and contrast tests turn it off.");
     ImGui::Separator();
     auto preset = LiveRR().PresetStatus();
     int selected = 3;

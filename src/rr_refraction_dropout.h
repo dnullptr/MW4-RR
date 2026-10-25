@@ -75,8 +75,8 @@ inline constexpr uint32_t Offset(uint32_t serial) {
     return (h & TileMask) | (((h >> 16) & TileMask) << 16);
 }
 
-// The copy replaces RR's color; the color brightness test, which also replaces
-// it, takes precedence.
+// The copy replaces RR's color; the color brightness and contrast tests, which
+// share another copy, take precedence.
 inline bool Wanted(const Tuning &t, bool color_test) {
     return t.enabled && !color_test;
 }
@@ -170,7 +170,7 @@ inline const char *Label(Report r) {
     case Report::Off:
         return "off";
     case Report::ColorTest:
-        return "off while the color brightness test is on";
+        return "off while the color brightness or contrast test is on";
     case Report::Waiting:
         return "waiting for RR";
     case Report::Blocked:
@@ -178,7 +178,7 @@ inline const char *Label(Report r) {
     case Report::Unavailable:
         return "unavailable (see ReShade.log)";
     case Report::NoSource:
-        return "on, waiting for the glass capture (transparency albedo blend)";
+        return "on, no glass capture this frame (needs the transparency albedo blend on)";
     case Report::NoRefraction:
         return "on, no refracting glass in view";
     case Report::Active:

@@ -1410,6 +1410,9 @@ struct ControllerCpuTest {
         c.dropout_report = 99;
         assert(!c.DropoutUse(slot, rrdropout::Read(), true, DXGI_FORMAT_R11G11B10_FLOAT) &&
                !c.dropout_test.active && !c.dropout_report); // the 10 s window restarts
+        // A slot without this frame's glass capture gives the pass no coverage.
+        const auto coverage = c.DropoutCoverageOf(slot, rreval::Options{});
+        assert(!coverage.target && !coverage.admitted && !coverage.source && !coverage.ready);
         c.dropout_test = {};
         rrdropout::enabled = false;
         c.budget.limit = Budget::Minimum + 50;

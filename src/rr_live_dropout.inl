@@ -15,15 +15,26 @@ bool dropout_source{}, dropout_covered{};
 UINT64 dropout_report{};
 unsigned dropout_frames{}, dropout_covered_frames{}, dropout_before_frames{};
 
-// The glass capture's refraction coverage for this slot's frame. Empty until
-// the transparency albedo blend's coverage capture is present.
+// The glass capture's refraction coverage for this slot's frame
+// (rr_live_coverage.inl). Present only when CoverageBlend recorded the blend on
+// this list just before (blend_used): then the target was cleared and written
+// by this frame's captures, and SealCoverage writes the admitted word at
+// submission, which the shader checks. The coverage is in render pixels from
+// the origin, so a color read at an offset gets none.
 struct DropoutCoverage {
     ID3D12Resource *target{};
     D3D12_GPU_VIRTUAL_ADDRESS admitted{};
     bool source{}, ready{};
 };
-DropoutCoverage DropoutCoverageOf(const Slot &) const {
-    return {};
+DropoutCoverage DropoutCoverageOf(const Slot &s, const rreval::Options &o) const {
+    const auto &t = s.coverage;
+    const auto &g = s.gpu.coverage;
+    DropoutCoverage c{g.target.Get(), g.ControlAddress()};
+    const bool target = c.target && c.admitted && g.Ready() && s.blend_used &&
+                        rrblend::Extent(g.desc, s.gpu.w, s.gpu.h) && !o.color_x && !o.color_y;
+    c.source = rrdropout::CoverageSource(target, t.cleared, t.Live());
+    c.ready = rrdropout::CoverageReady(target, t.cleared, t.Live(), t.captures_refr_alpha);
+    return c;
 }
 void DropoutSummaryReset() {
     dropout_report = 0;
@@ -62,10 +73,11 @@ bool DropoutUse(Slot &s, const rrdropout::Tuning &t, bool color_test, DXGI_FORMA
     }
     return UseTest(dropout_test, true, changes, s.gpu.w, s.gpu.h, format, "Refraction dropout");
 }
-// After the transparency Resolve, so the color before transparency is written.
+// After CoverageBlend and the transparency Resolve, so this frame's coverage
+// is known and the color before transparency is written.
 void DropoutRecord(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Options &o,
                    const rrdropout::Tuning &t) {
-    const auto coverage = DropoutCoverageOf(s);
+    const auto coverage = DropoutCoverageOf(s, o);
     const bool before = rrdropout::DropBeforeTransparency(
         t, s.transparency_used && s.gpu.transparency.guide, dropout_pipeline.typed_load);
     rrdropout::Inputs in{s.gpu.sr[0].Get(), dropout_test.texture.Get(),
