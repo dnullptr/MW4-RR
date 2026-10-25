@@ -290,8 +290,15 @@ static void CoverageDraw(reshade::api::command_list *list,
         CoverageLog(path, CoverageNote::Exception, "draw exception");
     }
 }
-// Hidden tuning keys, read once with the other settings and never written.
-// Missing or unparsable keys keep their defaults; values are clamped.
+// The tuning last given to the controller; the panel's pattern checkbox edits
+// it under settings_mutex, as LoadBlendTuning does.
+static rrblend::Tuning &BlendTuning() noexcept {
+    static rrblend::Tuning tuning;
+    return tuning;
+}
+// Hidden tuning keys, read once with the other settings and never written,
+// except TransparencyBlendPattern, which the panel saves. Missing or
+// unparsable keys keep their defaults; values are clamped.
 static void LoadBlendTuning(const char *section) noexcept {
     try {
         rrblend::Tuning t;
@@ -302,18 +309,20 @@ static void LoadBlendTuning(const char *section) noexcept {
         reshade::get_config_value(nullptr, section, "TransparencyBlendSky", t.sky);
         reshade::get_config_value(nullptr, section, "TransparencyBlendFilter", t.filter);
         reshade::get_config_value(nullptr, section, "TransparencyBlendDebug", t.debug);
+        reshade::get_config_value(nullptr, section, "TransparencyBlendPattern", t.pattern);
         t = rrblend::Clamp(t);
         LiveRR().SetTransparencyBlendTuning(t);
+        BlendTuning() = t;
         const rrblend::Tuning d;
         if (t.diffuse != d.diffuse || t.specular != d.specular || t.roughness != d.roughness ||
             t.strength != d.strength || t.sky != d.sky || t.filter != d.filter ||
-            t.debug != d.debug) {
+            t.debug != d.debug || t.pattern != d.pattern) {
             char line[256];
             snprintf(line, sizeof(line),
                      "Transparency albedo blend tuning: diffuse=%.3f specular=%.3f roughness=%.3f "
-                     "strength=%.3f sky=%d filter=%d debug=%d",
+                     "strength=%.3f sky=%d filter=%d debug=%d pattern=%d",
                      t.diffuse, t.specular, t.roughness, t.strength, int(t.sky), int(t.filter),
-                     int(t.debug));
+                     int(t.debug), int(t.pattern));
             WriteLog(line);
         }
     } catch (...) {

@@ -1272,6 +1272,18 @@ struct ControllerCpuTest {
         assert(Recorded("dispatch 240 135 1") && g.Described());
         const auto *k = reinterpret_cast<const rrblend::Control *>(g.control_map);
         assert(k->admitted == 0 && k->width == 1920 && k->height == 1080 && k->diffuse[0] == 0.25f);
+        // No colour input in this rig: the pattern is off for that dispatch.
+        assert(!(k->flags & rrblend::PatternFlag) && (k->flags & rrblend::FilterFlag));
+        // RR's colour at the render origin turns it on; a colour subrect turns it off.
+        {
+            FakeResource color("color", Texture(1920, 1080, DXGI_FORMAT_R11G11B10_FLOAT));
+            s.gpu.sr[0] = &color;
+            c.CoverageBlend(s, &r.sr, 1920, 1080);
+            assert(s.blend_used && (k->flags & rrblend::PatternFlag));
+            c.CoverageBlend(s, &r.sr, 1920, 1080, false);
+            assert(s.blend_used && !(k->flags & rrblend::PatternFlag));
+            s.gpu.sr[0].Reset();
+        }
 
         // The submission-time seal: word 0 only, frame acceptance untouched.
         c.SealCoverage(s, 0, 1, 2, true);

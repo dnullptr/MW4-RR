@@ -71,9 +71,9 @@ struct Pipeline {
                 unavailable = Reason::Typed;
                 return false;
             }
-            // [0] b0 control, [1] t0 coverage, t1 status, u0-u2 guides, [2] u3 stats.
-            D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
-                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 2}};
+            // [0] b0 control, [1] t0 coverage, t1 status, t2 colour, u0-u2 guides, [2] u3 stats.
+            D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 3}};
             D3D12_ROOT_PARAMETER args[3]{};
             args[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             args[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -101,8 +101,9 @@ static_assert(sizeof(PassStats) == 16);
 // of this slot may still be in flight; the slot's fence (it is reused only
 // after it retired and completed, as for rrtrans::Gpu) guarantees that.
 struct Gpu {
-    static constexpr UINT HeapSize = 5; // [0] t0 coverage, [1] t1 status, [2..4] u0-u2 guides
-    ComPtr<ID3D12Resource> target;      // R10G10B10A2_UNORM 2DMS transmittance, COMMON at rest
+    // [0] t0 coverage, [1] t1 status, [2] t2 colour, [3..5] u0-u2 guides
+    static constexpr UINT HeapSize = 6;
+    ComPtr<ID3D12Resource> target; // R10G10B10A2_UNORM 2DMS transmittance, COMMON at rest
     ComPtr<ID3D12Resource> control, stats, readback;
     ComPtr<ID3D12DescriptorHeap> rtv, heap;
     D3D12_RESOURCE_DESC desc{}; // the target's description, set with target
@@ -110,8 +111,9 @@ struct Gpu {
     UINT stride{};
     UINT *control_map{};
     UINT *readback_map{}; // the GPU copies PassStats here; Record clears those words
-    std::array<ID3D12Resource *, 4> described{}; // guides behind heap [1..4] (identity only)
+    std::array<ID3D12Resource *, 4> described{}; // guides behind heap [1], [3..5] (identity only)
     bool ready{}, recorded{};
+    bool colored{}; // heap [2] holds a real colour SRV; otherwise WriteControl clears PatternFlag
 
     // A scene target the coverage target can mirror: 2D with 4 samples in the
     // 0 or standard pattern. Its format and flags do not matter.
@@ -271,21 +273,52 @@ struct Gpu {
         ready = true;
         return true;
     }
-    // Heap [1] Status SRV and [2..4] guide UAVs, written once per slot after
+    // A colour the pattern can read through a Texture2D SRV: RR's float colour
+    // input, single-sampled, covering the guides (the render size).
+    static bool ColorUsable(const D3D12_RESOURCE_DESC &d, const D3D12_RESOURCE_DESC &guide) {
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize == 1 &&
+               d.SampleDesc.Count == 1 && d.Width >= guide.Width && d.Height >= guide.Height &&
+               (d.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+                d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                d.Format == DXGI_FORMAT_R32G32B32A32_FLOAT);
+    }
+    // Heap [1] Status SRV and [3..5] guide UAVs, written once per slot after
     // the guides exist (GpuFrame::guides: normal/roughness, diffuse, specular,
     // status). They stay unchanged until the slot is released, so a later call
     // only checks that it names the same guides.
+    // Heap [2] is the colour SRV (t2), rewritten on every call because RR's
+    // colour input (GpuFrame::sr[0]) may change between frames. Safe for the
+    // same reason as WriteControl: this slot's previous dispatch has completed.
+    // color is null when there is none at the render origin; then, or when it
+    // is not ColorUsable, [2] is a null SRV and colored is false, so
+    // WriteControl clears PatternFlag for this dispatch.
     template <class Pipelines>
-    void WriteDescriptors(Pipelines &p, const std::array<ComPtr<ID3D12Resource>, 4> &guides) {
+    void WriteDescriptors(Pipelines &p, const std::array<ComPtr<ID3D12Resource>, 4> &guides,
+                          ID3D12Resource *color) {
         using rrprivate::Require;
         Require(ready, "coverage blend resources not prepared");
         std::array<ID3D12Resource *, 4> resources{};
         for (unsigned i = 0; i < 4; ++i)
             resources[i] = guides[i].Get();
-        if (Described()) {
+        if (Described())
             Require(resources == described, "coverage blend guides changed before retirement");
-            return;
-        }
+        else
+            DescribeGuides(p, resources);
+        const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        colored = color && ColorUsable(color->GetDesc(), resources[0]->GetDesc());
+        if (colored)
+            srv.Format = color->GetDesc().Format;
+        p.device->CreateShaderResourceView(colored ? color : nullptr, &srv,
+                                           {cpu.ptr + SIZE_T(2) * stride});
+    }
+    template <class Pipelines>
+    void DescribeGuides(Pipelines &p, const std::array<ID3D12Resource *, 4> &resources) {
+        using rrprivate::Require;
         for (unsigned i = 0; i < 4; ++i) {
             Require(resources[i], "coverage blend guide missing");
             const auto d = resources[i]->GetDesc();
@@ -307,7 +340,7 @@ struct Gpu {
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         for (unsigned i = 0; i < 3; ++i)
             p.device->CreateUnorderedAccessView(resources[i], nullptr, &uav,
-                                                {cpu.ptr + SIZE_T(2 + i) * stride});
+                                                {cpu.ptr + SIZE_T(3 + i) * stride});
         described = resources;
     }
     bool Described() const {
@@ -330,13 +363,16 @@ struct Gpu {
                           D3D12_RESOURCE_STATE_COMMON);
     }
     // The whole control buffer, except that Control::zero, the source Record
-    // clears the stats from, stays zero whatever c holds.
+    // clears the stats from, stays zero whatever c holds, and PatternFlag is
+    // cleared unless the last WriteDescriptors wrote a real colour SRV.
     void WriteControl(const Control &c) noexcept {
         if (!control_map)
             return;
-        memcpy(control_map, &c, sizeof(c));
-        memset(reinterpret_cast<unsigned char *>(control_map) + offsetof(Control, zero), 0,
-               sizeof(Control::zero));
+        auto k = c;
+        if (!colored)
+            k.flags &= ~PatternFlag;
+        memset(k.zero, 0, sizeof(k.zero));
+        memcpy(control_map, &k, sizeof(k));
     }
     // Submission-time gate: word 0 only.
     void Seal(bool admitted) noexcept {

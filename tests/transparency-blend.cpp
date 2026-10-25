@@ -652,11 +652,12 @@ static void TestControl() {
     static_assert(offsetof(Control, params) == 32);
     static_assert(offsetof(Control, reserved) == 48);
     static_assert(offsetof(Control, zero) == 64);
-    static_assert(SkyFlag == 1 && RoughnessFlag == 2 && FilterFlag == 4 && DebugFlag == 8);
+    static_assert(SkyFlag == 1 && RoughnessFlag == 2 && FilterFlag == 4 && DebugFlag == 8 &&
+                  PatternFlag == 16);
 
     const auto c = Make(Tuning{}, 1920, 1088);
     assert(c.admitted == 0 && c.width == 1920 && c.height == 1088);
-    assert(c.flags == (SkyFlag | FilterFlag));
+    assert(c.flags == (SkyFlag | FilterFlag | PatternFlag));
     assert(c.diffuse[0] == 0.5f && c.diffuse[1] == 0.5f && c.diffuse[2] == 0.5f);
     assert(c.diffuse[3] == 0.f);
     assert(c.params[0] == 0.f && c.params[1] == 0.f && c.params[2] == 1.f);
@@ -674,6 +675,7 @@ static void TestControl() {
     t.sky = false;
     t.filter = false;
     t.debug = true;
+    t.pattern = false;
     const auto e = Make(t, 640, 368);
     assert(e.flags == (RoughnessFlag | DebugFlag));
     assert(e.diffuse[0] == 1.f && e.diffuse[1] == 1.f && e.diffuse[2] == 1.f);
@@ -689,6 +691,7 @@ static void TestClamp() {
     const Tuning defaults;
     assert(defaults.diffuse == 0.5f && defaults.specular == 0.f && defaults.roughness == -1.f);
     assert(defaults.strength == 1.f && defaults.sky && defaults.filter && !defaults.debug);
+    assert(defaults.pattern && Clamp(defaults).pattern);
     const auto same = Clamp(defaults);
     assert(same.diffuse == 0.5f && same.specular == 0.f && same.roughness == -1.f);
     assert(same.strength == 1.f && same.sky && same.filter && !same.debug);
@@ -972,6 +975,202 @@ static void TestReference() {
     }
 }
 
+using Color = float[5][5][3];
+static void FillColor(Color &c, float r, float g, float b) {
+    for (auto &row : c)
+        for (auto &tap : row) {
+            tap[0] = r;
+            tap[1] = g;
+            tap[2] = b;
+        }
+}
+static void FillColor(Color &c, float value) {
+    FillColor(c, value, value, value);
+}
+
+// Pattern: on covered pixels the diffuse target is Diffuse * colour / mean luma
+// of the colour over the 5x5 box (taps inside the extent).
+static void TestPattern() {
+    Tuning plain;
+    plain.filter = false;
+    assert(plain.pattern);
+    float t[3][3][3];
+    Fill(t, 0.f); // fully covered: c = 1, so the diffuse guide becomes the target
+    Color color;
+
+    // A flat region sits at its local mean: the target is Diffuse.
+    FillColor(color, 0.2f);
+    auto g = Sample();
+    Reference(Admitted(plain), 3, 3, 1, t, g, &color);
+    for (int i = 0; i < 3; ++i) {
+        assert(Near(g.diffuse[i], 0.5f));
+        assert(Near(g.specular[i], 0.f));
+    }
+    assert(g.roughness == 0.6f);
+    // Twice the local mean: twice Diffuse. 24 taps of 0.23 and 0.48: mean 0.24.
+    FillColor(color, 0.23f);
+    for (int ch = 0; ch < 3; ++ch)
+        color[2][2][ch] = 0.48f;
+    Tuning quarter = plain;
+    quarter.diffuse = 0.25f;
+    g = Sample();
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    for (int i = 0; i < 3; ++i)
+        assert(Near(g.diffuse[i], 0.5f));
+    g = Sample();
+    Reference(Admitted(plain), 3, 3, 1, t, g, &color);
+    for (int i = 0; i < 3; ++i)
+        assert(Near(g.diffuse[i], 1.f) && g.diffuse[i] <= 1.f);
+    // Three times the mean saturates: 0.5 * 3 -> 1.
+    FillColor(color, 0.22f);
+    for (int ch = 0; ch < 3; ++ch)
+        color[2][2][ch] = 0.72f;
+    g = Sample();
+    Reference(Admitted(plain), 3, 3, 1, t, g, &color);
+    for (int i = 0; i < 3; ++i)
+        assert(g.diffuse[i] == 1.f);
+    // A darker pixel goes below Diffuse, with the colour's chroma.
+    FillColor(color, 0.4f, 0.2f, 0.1f);
+    const float luma = 0.4f * 0.299f + 0.2f * 0.587f + 0.1f * 0.114f;
+    g = Sample();
+    Reference(Admitted(plain), 3, 3, 1, t, g, &color);
+    assert(Near(g.diffuse[0], 0.5f * 0.4f / luma) && Near(g.diffuse[1], 0.5f * 0.2f / luma) &&
+           Near(g.diffuse[2], 0.5f * 0.1f / luma));
+
+    // Partial coverage lerps toward the pattern target with the same weight.
+    {
+        FillColor(color, 0.23f);
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.48f;
+        Fill(t, 0.5f);
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        const float c = (0.5f - OpacityFloor) / (1.f - OpacityFloor);
+        assert(Near(g.diffuse[0], 0.9f + c * (0.5f - 0.9f)));
+        assert(Near(g.specular[2], 0.06f + c * (0.f - 0.06f)));
+        // Uncovered pixels are untouched whatever the colour.
+        Fill(t, 1.f);
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        assert(Same(g, Sample()));
+        Fill(t, 0.f);
+    }
+
+    // Non-finite colour or mean falls back to Diffuse.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    for (float bad : {nan, inf, -inf}) {
+        FillColor(color, 0.2f);
+        color[2][2][1] = bad; // the pixel itself
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        for (int i = 0; i < 3; ++i)
+            assert(g.diffuse[i] == 0.25f);
+        FillColor(color, 0.4f);
+        color[0][4][2] = bad; // a box tap: the mean is not finite
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        for (int i = 0; i < 3; ++i)
+            assert(g.diffuse[i] == 0.25f);
+    }
+    // A finite sum that overflows is not finite either.
+    FillColor(color, 3e38f);
+    g = Sample();
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    assert(g.diffuse[0] == 0.25f);
+    // Too dark to scale by (mean below 1e-4): Diffuse, never a black material.
+    for (float dark : {0.f, 5e-5f}) {
+        FillColor(color, dark);
+        color[2][2][0] = 2.f * dark;
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+        for (int i = 0; i < 3; ++i)
+            assert(g.diffuse[i] == 0.25f);
+    }
+    // At the floor the pattern applies again.
+    FillColor(color, 2e-4f);
+    g = Sample();
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    assert(Near(g.diffuse[0], 0.25f));
+    FillColor(color, 2e-4f);
+    for (int dy = 0; dy < 5; ++dy)
+        for (int dx = 0; dx < 5; ++dx)
+            color[dy][dx][0] = color[dy][dx][1] = color[dy][dx][2] = (dx + dy) % 2 ? 1e-4f : 2e-4f;
+    color[2][2][0] = color[2][2][1] = color[2][2][2] = 1e-4f;
+    g = Sample(); // mean 1.48e-4: above the floor, the pixel is darker than it
+    Reference(Admitted(quarter), 3, 3, 1, t, g, &color);
+    assert(g.diffuse[0] < 0.25f && g.diffuse[0] > 0.1f);
+
+    // The box is clamped to the extent: out-of-bounds taps are ignored.
+    {
+        FillColor(color, 100.f); // out-of-bounds taps would dominate the mean
+        for (int dy = 0; dy <= 2; ++dy)
+            for (int dx = 0; dx <= 2; ++dx)
+                for (int ch = 0; ch < 3; ++ch)
+                    color[dy + 2][dx + 2][ch] = 0.2f;
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.4f; // nine taps in bounds: mean 2/9
+        g = Sample();
+        Reference(Admitted(plain), 0, 0, 1, t, g, &color);
+        assert(Near(g.diffuse[0], 0.5f * 0.4f * 9.f / 2.f));
+        // The opposite corner of a 5x3 extent: taps dx in [-2, 0], dy in [-2, 0].
+        FillColor(color, 100.f);
+        for (int dy = -2; dy <= 0; ++dy)
+            for (int dx = -2; dx <= 0; ++dx)
+                for (int ch = 0; ch < 3; ++ch)
+                    color[dy + 2][dx + 2][ch] = 0.2f;
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.4f;
+        g = Sample();
+        Reference(Admitted(plain, 5, 3), 4, 2, 1, t, g, &color);
+        assert(Near(g.diffuse[0], 0.9f));
+        // Edge: x = 1 of an 8-wide extent drops the dx = -2 column only (20 taps).
+        FillColor(color, 0.2f);
+        for (int dy = 0; dy < 5; ++dy)
+            for (int ch = 0; ch < 3; ++ch)
+                color[dy][0][ch] = 100.f;
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.4f;
+        g = Sample();
+        Reference(Admitted(plain), 1, 3, 1, t, g, &color);
+        const float mean = (19.f * 0.2f + 0.4f) / 20.f;
+        assert(Near(g.diffuse[0], 0.5f * 0.4f / mean));
+        // A one-pixel extent: the mean is the pixel itself.
+        FillColor(color, 100.f);
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.3f;
+        g = Sample();
+        Reference(Admitted(plain, 1, 1), 0, 0, 1, t, g, &color);
+        assert(Near(g.diffuse[0], 0.5f));
+    }
+
+    // Without the flag, or without a colour input, the target is Diffuse.
+    {
+        FillColor(color, 0.23f);
+        for (int ch = 0; ch < 3; ++ch)
+            color[2][2][ch] = 0.48f;
+        Tuning off = quarter;
+        off.pattern = false;
+        assert(!(Make(off, 8, 8).flags & PatternFlag));
+        g = Sample();
+        Reference(Admitted(off), 3, 3, 1, t, g, &color);
+        assert(g.diffuse[0] == 0.25f);
+        g = Sample();
+        Reference(Admitted(quarter), 3, 3, 1, t, g);
+        assert(g.diffuse[0] == 0.25f);
+    }
+
+    // Debug still shows the opacity; roughness still follows its flag.
+    {
+        Tuning debug = plain;
+        debug.debug = true;
+        debug.roughness = 0.2f;
+        g = Sample();
+        Reference(Admitted(debug), 3, 3, 1, t, g, &color);
+        assert(g.diffuse[0] == 1.f && g.specular[0] == 0.f && Near(g.roughness, 0.2f));
+    }
+}
+
 static void TestReport() {
     Counters k{};
     k.frames = 600;
@@ -1041,8 +1240,9 @@ int main() {
     TestControl();
     TestClamp();
     TestReference();
+    TestPattern();
     TestReport();
     TestStatus();
     puts("PASS: transparency blend admission, targets, blend/depth/signature classification, "
-         "coverage extent, control layout, tuning, reference math, report and status");
+         "coverage extent, control layout, tuning, reference math, pattern, report and status");
 }

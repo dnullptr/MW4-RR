@@ -1440,7 +1440,7 @@ class Controller {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
                                    history.Get());
             }
-            CoverageBlend(*s, cl.Get(), o.width, o.height);
+            CoverageBlend(*s, cl.Get(), o.width, o.height, !o.color_x && !o.color_y);
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
             if (s->water_used)
