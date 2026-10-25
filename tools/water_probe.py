@@ -21,9 +21,10 @@ the report says which. report.txt starts with a SUMMARY of the hints and the jit
 is missing the tiles are saved as tile_<name>.npy.
 
 Assumptions (the report repeats the ones that were decided from data):
-- Static statistics are from frame 0 over status==1 pixels (the histogram and depth range cover the
-  whole window); temporal statistics average all consecutive frame pairs i-1 -> i, skipping pairs
-  whose frame i has the reset flag.
+- Static statistics are from frame 0 over surface pixels, status 1 (ordinary) or 3 (special: the
+  game's mirror-like water and depth-override surfaces; running water is status 3); the histogram and
+  depth range cover the whole window. Temporal statistics average all consecutive frame pairs
+  i-1 -> i, skipping pairs whose frame i has the reset flag.
 - Motion: mv_px = motion * motion_vector_scale (per axis) is the offset in render pixels from a pixel
   in the current frame to where that surface was in the previous frame (DLSS convention): the
   previous frame is sampled at pixel + mv_px. If that is tiny while the camera moved, motion *
@@ -131,6 +132,7 @@ CONTROL_DEPTH_BIN = 0.05        # ... and prefers the depth closest to the regio
 COLOUR_GUARD = BOX_SIZE // 2 + 1    # colour/delta residuals this near an unusable pixel are left out
 MV_TINY_PIXELS = 0.05           # mean |mv_px| below this while the camera moved: try other scalings
 ALT_IMPROVEMENT = 0.8           # an alternative (MV scaling, jitter sign) must drop the residual below this x
+SURFACE_STATUSES = (1, 3)       # status values measured: ordinary and special (running water is special)
 MIN_HINT_PIXELS = 50            # hints need at least this many valid pixels in region and control
 JITTER_MIN_PIXELS = 1e-6        # jitter differences below this need no compensation
 TILE_WIDTH = 640                # panel tile width in pixels
@@ -211,11 +213,18 @@ def warp(image, taps):
 def valid_rows(array, mask):
     """array[mask] as float64 rows (N x C) without rows that hold a non-finite value."""
     rows = array[mask].astype(np.float64)
-    rows = rows.reshape(len(rows), -1)
+    if rows.ndim == 1:
+        rows = rows[:, None]
     return rows[np.isfinite(rows).all(axis=1)]
 
 
 def ordinary_mask(frame):
+    """Surface pixels: status 1 (ordinary) or 3 (special, which includes running water)."""
+    return np.isin(frame['status'], SURFACE_STATUSES) & np.isfinite(frame['depth'])
+
+
+def plain_mask(frame):
+    """Status 1 only: the automatic control and the jitter decision never use special pixels."""
     return (frame['status'] == 1) & np.isfinite(frame['depth'])
 
 
@@ -292,7 +301,7 @@ def choose_layout(c2v, depth, ordinary, fov, view_to_clip=None):
     index = np.flatnonzero(ordinary)
     if index.size == 0:
         return {'layout': structure or LAYOUTS[0], 'ambiguous': structure is None,
-                'source': 'structure of view_to_clip' if structure else 'default (no status==1 pixels)',
+                'source': 'structure of view_to_clip' if structure else 'default (no status 1 or 3 pixels)',
                 'structure_layout': structure, 'data_layout': None, 'data_ambiguous': True, 'scores': {}}
     index = index[::max(1, index.size // 20000)]
     py, px = np.divmod(index, width)
@@ -377,7 +386,8 @@ def prepare(frames, metas, notes):
     for i, (frame, meta, matrix) in enumerate(zip(frames, metas, matrices)):
         depth = frame['depth'] if layout is None else view_depth(frame['depth'], matrix, layout['layout'])
         exposure = pre_exposure(meta)
-        item = {'ordinary': ordinary_mask(frame), 'depth': depth.astype(np.float32), 'delta': None,
+        item = {'ordinary': ordinary_mask(frame), 'plain': plain_mask(frame),
+                'depth': depth.astype(np.float32), 'delta': None,
                 'pre_exposure': exposure, 'jitter_delta': jitter_delta(metas, i),
                 'colour': box_filter(luminance(frame['color']) / exposure).astype(np.float32)}
         if 'color_before_transparency' in frame:
@@ -628,7 +638,7 @@ def choose_jitter(frames, metas, derived, windows):
                                       'sign': 0, 'decided_on': None, 'status': None, 'windows': {}}
         for window_name, (window, exclude) in where.items():
             base = guide_map(pair, (0, 0))
-            use = np.ones(base.shape, bool)
+            use = derived[pair]['plain'].copy()   # special pixels (water) never decide the jitter
             if exclude is not None:
                 use[exclude[1]:exclude[3], exclude[0]:exclude[2]] = False
             x0, y0, x1, y1 = window
@@ -792,7 +802,7 @@ def channel_stats(rows):
 
 
 def plane_stats(frame, ordinary, window, matrix, layout):
-    """Least-squares plane through the view-space positions of the window's status==1 pixels."""
+    """Least-squares plane through the view-space positions of the window's status 1 and 3 pixels."""
     if layout is None:
         return None
     x0, y0, x1, y1 = window
@@ -845,7 +855,7 @@ def window_stats(frame, item, delta, matrix, layout, window):
 
 
 def window_motion(item, window):
-    """Mean |mv| (render pixels) over the status==1 pixels of the window, or None."""
+    """Mean |mv| (render pixels) over the status 1 and 3 pixels of the window, or None."""
     x0, y0, x1, y1 = window
     magnitude = np.linalg.norm(item['mv'][y0:y1, x0:x1].astype(np.float64), axis=-1)
     values = magnitude[item['ordinary'][y0:y1, x0:x1] & np.isfinite(magnitude)]
@@ -891,7 +901,7 @@ def temporal_stats(frames, metas, derived, windows, jitter_signs):
             for name, window in windows.items():
                 still = [window_motion(derived[j], window) for j in (i, i - 1)]
                 if None in still:
-                    gap_reasons[name].add('no status==1 pixels')
+                    gap_reasons[name].add('no status 1 or 3 pixels')
                 elif max(still) >= GAP_STATIC_MV:
                     gap_reasons[name].add(f'camera or content moves in the window (mean |mv| >= '
                                           f'{GAP_STATIC_MV} px): the two-frame composition is not trusted')
@@ -1119,7 +1129,7 @@ def make_hints(region, control, jitter_undecided=False):
     angle = dig(region, 'normals', 'mean_angle_deg')
     if rms is None or angle is None:
         add('flat_surface', None, 'not evaluated: region depth/guides flat or rough',
-            'needs a plane fit and normals on status==1 pixels')
+            'needs a plane fit and normals on status 1 or 3 pixels')
     elif few(static[0]):
         add('flat_surface', None, 'not evaluated: region depth/guides flat or rough', few(static[0]), True)
     else:
@@ -1427,13 +1437,13 @@ def analyse(manifest, frames, region, control, mv_tiny_pixels=MV_TINY_PIXELS):
                     region[1] < control[3] and control[1] < region[3]):
                 notes.append('control overlaps the region')
         else:
-            picked = pick_control(region, derived[0]['ordinary'], delta,
+            picked = pick_control(region, derived[0]['plain'], delta,
                                   usable_pixels(frames, metas, derived), derived[0]['depth'])
             if picked is None:
                 notes.append('no control window of the region size fits clear of the region; give --control')
             else:
                 control_info = {'window': picked['window'], 'selection': (
-                    f'picked automatically: same size as the region, {picked["ordinary_pixels"]} status==1 '
+                    f'picked automatically: same size as the region, {picked["ordinary_pixels"]} status 1 '
                     f'pixels ({picked["usable_pixels"]} pass the temporal tests), '
                     f'{picked["changed_pixels"]} pixels with transparency delta > {DELTA_THRESHOLD}; closest '
                     'in depth, then nearest, to the region among equals')}
@@ -1450,7 +1460,8 @@ def analyse(manifest, frames, region, control, mv_tiny_pixels=MV_TINY_PIXELS):
              for name, window in windows.items()}
     for name, window_stat in stats.items():
         if window_stat['ordinary_pixels'] == 0:
-            notes.append(f'{name} has no status==1 pixels (see its status histogram): guide, depth-plane, '
+            notes.append(f'{name} has no status 1 or 3 pixels (see its status histogram): guide, '
+                         'depth-plane, '
                          'motion and delta statistics are empty')
     temporal, first = temporal_stats(frames, metas, derived, windows, jitter_signs) if len(frames) > 1 \
         else ({name: None for name in windows}, None)
@@ -1537,8 +1548,9 @@ def render_text(report):
     capture = report['capture']
     lines = [f'water_probe: {capture["folder"]}: {capture["frame_count"]} frames, render '
              f'{capture["render_size"][0]}x{capture["render_size"][1]}',
-             'Static statistics are from frame 0 over status==1 pixels (status 0 padding, 1 ordinary, '
-             '2 sky, 3 special, 4 invalid); temporal statistics average the consecutive frame pairs.']
+             'Static statistics are from frame 0 over status 1 and 3 pixels (status 0 padding, 1 ordinary, '
+             '2 sky, 3 special, 4 invalid; running water is special); the automatic control and the jitter '
+             'decision use status 1 only. Temporal statistics average the consecutive frame pairs.']
     if report['region'] is None:
         lines.append('No --region given: only the pictures and a whole-frame summary were made. Give '
                      '--region X0 Y0 X1 Y1 (render pixels) around running water to compare it with a '
@@ -1643,7 +1655,8 @@ def scene_jitter(t, jitter, jitter_y=0.0, start=0, series=None):
 
 def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, flip_y=False,
                     period=SYN_WATER_PERIOD, noise=0.0, jitter_start=0, flat_x=False, flush=False,
-                    ground_period=None, layer_noise=0.0, dither=0.0, water_box=SYN_REGION, series=None):
+                    ground_period=None, layer_noise=0.0, dither=0.0, water_box=SYN_REGION, series=None,
+                    special_water=False):
     """Frame t of the synthetic scene as float arrays, rendered at the frame's jitter.
 
     Default: static camera, zero motion; sky rows on top; a ground plane (control); a static
@@ -1660,7 +1673,8 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, fli
     normal texture of this (x, y) wavelength (a sharp control). layer_noise: colour noise inside the
     water only, new every frame and not in the colour before transparency (reflection noise of a layer
     drawn after the snapshot). dither: per-frame noise on the water's normals. water_box: the water
-    rectangle (a narrow one is a river). series: explicit per-frame jitter, see scene_jitter."""
+    rectangle (a narrow one is a river). series: explicit per-frame jitter, see scene_jitter.
+    special_water: the water is status 3 (special), as running water is in the game."""
     yy, xx = np.mgrid[0:SYN_H, 0:SYN_W].astype(np.float64)
     fy = 1 / math.tan(SYN_FOV / 2)
     jx, jy = scene_jitter(t, jitter, jitter_y, jitter_start, series)
@@ -1715,7 +1729,8 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, fli
     motion[..., 0] = drift / SYN_W
     return {'color': color, 'before': before, 'depth': np.where(sky, 0.0, SYN_NEAR / z),
             'normal': normal, 'albedo': albedo, 'specular': specular, 'motion': motion,
-            'status': np.where(sky, 2, 1).astype('<u4'), 'hit': np.where(water, 1.0, 3.0)}
+            'status': np.where(sky, 2, np.where(water & special_water, 3, 1)).astype('<u4'),
+            'hit': np.where(water, 1.0, 3.0)}
 
 
 def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.25, sign=1,
@@ -1723,7 +1738,7 @@ def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.2
     """Write a synthetic capture that follows capture-format.md (manifest.json last). Odd frames
     have pre_exposure `exposure` (colours scaled to match) and jitter `jitter`; scene_options
     (jitter_y, flip_y, period, noise, jitter_start, flat_x, flush, ground_period, layer_noise, dither,
-    water_box, series) go to synthetic_scene."""
+    water_box, series, special_water) go to synthetic_scene."""
     projection, c2v = synthetic_projection()
     folder.mkdir(parents=True, exist_ok=True)
     manifest_frames = []
@@ -2293,6 +2308,21 @@ def self_test():
                        for name in ('guides_animate', 'colour_animates')),
                    f'flush water, {motion}: {flush["conventions"]["jitter"]["sign"]} '
                    f'{region_of(flush, "region")["temporal"]}')
+
+        # Running water is status 3 (special) in the game. It is still measured; the automatic
+        # control and the jitter decision use status 1 only.
+        for motion, scroll in (('static', 0), ('scrolling', 1.0)):
+            write_capture(tmp / f'special-{motion}', scroll=scroll, jitter=0.5, jitter_y=0.4, flip_y=True,
+                          special_water=True)
+            special = run_probe(tmp / f'special-{motion}', region=(52, 24, 76, 48), out_dir=out)
+            water, control = region_of(special, 'region'), region_of(special, 'control')
+            # ordinary_pixels: one water texel of frame 0 has an infinite depth
+            expect(water['ordinary_pixels'] == 24 * 24 - 1 and water['status']['3'] == 24 * 24 and
+                   control['status']['3'] == 0 and special['conventions']['jitter']['sign'] == [-1, 1] and
+                   water['temporal']['valid_pixels'] >= MIN_HINT_PIXELS and
+                   hint(special, 'guides_animate')['fires'] is (motion == 'scrolling'),
+                   f'special water, {motion}: {water["status"]} control {control["status"]} '
+                   f'{special["conventions"]["jitter"]["sign"]} {water["temporal"]}')
 
         # A small region at the corner of the water: the guides keep 50+ pixels but the edge guard
         # leaves the colour fewer; colour_animates says so instead of "needs a control window".
