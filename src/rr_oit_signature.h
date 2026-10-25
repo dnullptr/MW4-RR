@@ -119,19 +119,41 @@ class CreationHook {
         return false;
     }
 
+    static void Log(void (*log)(const char *), const char *text) noexcept {
+        if (log)
+            try {
+                log(text);
+            } catch (...) {
+            }
+    }
+
   public:
-    // tracker supplies the root-constant word counts from its Define layouts.
-    static bool Attach(ID3D12Device *object, rrcompute::Tracker &tracker) noexcept {
+    // tracker supplies the root-constant word counts from its Define layouts. The
+    // first tracker passed is kept; Attach refuses any other. log may be null.
+    static bool Attach(ID3D12Device *object, rrcompute::Tracker &tracker,
+                       void (*log)(const char *)) noexcept {
         Error error;
         try {
             auto device = fg::NativeObject<ID3D12Device>(object);
             if (!device)
                 return false;
             std::lock_guard lock(install_mutex);
+            rrcompute::Tracker *bound{};
+            if (!layouts.compare_exchange_strong(bound, &tracker) && bound != &tracker) {
+                Log(log, "RR command signature hook refused: a different root signature tracker");
+                return false;
+            }
             const auto initialized = MH_Initialize();
             if (initialized != MH_OK && initialized != MH_ERROR_ALREADY_INITIALIZED)
                 return false;
-            layouts.store(&tracker, std::memory_order_release);
+            // The detours stay installed for the process, so this module must too.
+            HMODULE self{};
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                    reinterpret_cast<LPCWSTR>(&OnCreate<0>), &self)) {
+                Log(log, "RR command signature hook not installed: self pin failed");
+                return false;
+            }
             // SDK ID3D12DeviceVtbl: IUnknown 0-2, ID3D12Object 3-6, then
             // ID3D12Device from GetNodeCount (7); CreateCommandSignature is 41.
             return Hook((*reinterpret_cast<void ***>(device.Get()))[41]);
@@ -160,8 +182,9 @@ class CreationHook {
         }
     }
 };
-inline bool Attach(ID3D12Device *native, rrcompute::Tracker &layouts) noexcept {
-    return CreationHook::Attach(native, layouts);
+inline bool Attach(ID3D12Device *native, rrcompute::Tracker &layouts,
+                   void (*log)(const char *)) noexcept {
+    return CreationHook::Attach(native, layouts, log);
 }
 // False means status "signature hook not installed".
 inline bool Attached() noexcept {
