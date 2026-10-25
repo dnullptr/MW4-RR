@@ -255,7 +255,7 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
     switch (why) {
     case RayWhy::Governor:
         for (unsigned l = 0; l < 2; ++l)
-            if ((c.budget >> l & 1) && !rrraybudget::SafeThreshold(int(f[Limits + 2 * l]))) {
+            if ((raised >> l & 1) && !rrraybudget::SafeThreshold(int(f[Limits + 2 * l]))) {
                 std::snprintf(out, size, "lobe%u threshold=%d", l + 1, int(f[Limits + 2 * l]));
                 return;
             }
@@ -296,15 +296,19 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
     case RayWhy::Unsupported:
         std::snprintf(out, size, "pixels=%u", unsigned(f[rrdensity::Unsupported]));
         return;
-    case RayWhy::StatsMismatch:
+    case RayWhy::StatsMismatch: {
+        // A raised frame that reached this check has its own usable proof (ChangedAfterArming).
+        const auto pixels = rrraybudget::FramePixels(c, {});
         for (unsigned l = 0; l < 2; ++l)
-            if ((raised >> l & 1) && !rrraybudget::StatsCover(c, l)) {
-                std::snprintf(out, size, "lobe%u x=%u rawRays=%u", l + 1,
+            if ((raised >> l & 1) && !rrraybudget::StatsCover(c, l, pixels)) {
+                std::snprintf(out, size, "lobe%u x=%u rawRays=%u max=%llu", l + 1,
                               unsigned(c.log[rrraybudget::LogWordStats + l]),
-                              unsigned(f[RawRays + l]));
+                              unsigned(f[RawRays + l]),
+                              static_cast<unsigned long long>(rrraybudget::MaxPixelRays * pixels));
                 return;
             }
         break;
+    }
     case RayWhy::Overflow:
         for (unsigned l = 0; l < 2; ++l)
             if ((raised >> l & 1) &&
@@ -396,17 +400,20 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
         // Complete runs only for a frame whose reader rates and log halves are its own. Rates of
         // a recording whose prepass list was not submitted, or whose apply half did not run as
         // recorded (a stale apply serial), are not this frame's; nor is the arming snapshot of a
-        // frame that consumed a mark of an older generation. A patch is verified against its own
-        // resolve half: one that was predicated away, skipped or not read back verifies nothing.
-        // Such a frame, raised, is unverified (an unraised one measures nothing: no Complete, no
-        // Summary::Completed), after the PatchMismatch check when its resolve half did verify.
+        // frame that consumed a mark of an older generation, or raised Budgets of two plans (no
+        // one snapshot judges both). A patch is verified against its own resolve half: one that
+        // was predicated away, skipped or not read back verifies nothing. Such a frame, raised, is
+        // unverified (an unraised one measures nothing: no Complete, no Summary::Completed), after
+        // the PatchMismatch check when its resolve half did verify.
         using rrraybudget::LogApplyHalf;
         const bool read = state == RayLogState::Read;
         const bool resolve_own =
             read && s.ray_serial && log[rrraybudget::LogWordResolveSerial] == s.ray_serial;
-        const bool apply_stale = read && (s.ray_logged & LogApplyHalf) &&
-                                 log[rrraybudget::LogWordApplySerial] != s.ray_serial;
-        if (!s.pre_submitted || s.ray_old_mark || apply_stale || (s.ray_patched && !resolve_own)) {
+        const bool apply_recorded = read && (s.ray_logged & LogApplyHalf);
+        const bool apply_stale =
+            apply_recorded && log[rrraybudget::LogWordApplySerial] != s.ray_serial;
+        if (!s.pre_submitted || s.ray_old_mark || s.ray_mixed_armed || apply_stale ||
+            (s.ray_patched && !resolve_own)) {
             if (s.ray_patched && resolve_own)
                 for (unsigned l = 0; l < 2; ++l)
                     if ((s.ray_patched >> l & 1) && !rrraybudget::Executed(c, l)) {
@@ -419,6 +426,11 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
             RayUnverified(s);
             return;
         }
+        // A raised frame whose apply half was not recorded (a logging wait, logging off, apply
+        // constants outside an upload heap) has no proof that the reader's rates are its own: the
+        // log and list checks run, then it counts as unverified (Complete on an uncounted frame).
+        if (raised && !apply_recorded)
+            c.rates = {};
         ray_summary.Completed(c);
         const auto why = ray_gate.Complete(c);
         s.ray_done = true;
@@ -544,6 +556,10 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         ray_announced = false;
     }
     try {
+        // This resolve writes its Budget natively unless the patch below succeeds (A4), wherever
+        // it runs: a proven identity loses its mark (a patch sets it again).
+        if (in.budget_resource)
+            RayClearMark(in.budget_resource, in.budget_offset);
         Slot *match{};
         bool ambiguous{}, after_sr{};
         for (auto &s : slots) {
@@ -566,10 +582,9 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         s.ray_resolved = true;
         s.ray_resolve_cb = in.settings.address;
         RaySerial(s);
-        // This resolve writes its Budget natively unless the patch below succeeds (A4). Its
-        // identity, whatever the refusal below, is what a same-frame apply must read (A2).
+        // Its Budget identity, whatever the refusal below, is what a same-frame apply must read
+        // (A2).
         if (in.budget_resource) {
-            RayClearMark(in.budget_resource, in.budget_offset);
             s.ray_resolve_budget_resource = in.budget_resource;
             s.ray_resolve_budget_offset = in.budget_offset;
         }
@@ -675,8 +690,13 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
         Slot *match{};
         for (auto &s : slots)
             if (RawSlot(s, cl)) {
-                if (match)
-                    return; // more than one RR recording on this list
+                if (match) {
+                    // More than one RR recording on this list: an unproven apply (A3), which
+                    // also breaks the placement streak.
+                    ray_gate.Apply(rrraybudget::Lists{}, now);
+                    ray_placement = 0;
+                    return;
+                }
                 match = &s;
             }
         if (!match)
@@ -709,6 +729,9 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
         // A raised Budget stays raised for the recording even if a later apply reads another.
         const auto consumed = RayConsumed(lists.budget_resource, lists.budget_offset);
         if (consumed.mask) {
+            // A3: each raised frame is judged against its own plan's snapshot; a recording whose
+            // applies read raised Budgets of two plans has none (counted unverified).
+            s.ray_mixed_armed |= s.ray_budget && !(s.ray_armed == consumed.armed);
             s.ray_budget |= consumed.mask;
             s.ray_armed = consumed.armed;
             s.ray_old_mark |= consumed.generation != generation;

@@ -803,6 +803,114 @@ struct ControllerCpuTest {
             assert(!c.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched) && !c.ray_early);
         }
     }
+    // The cross-thread review of 0581a2e (scratchpad sdd/more-rays/xreview-fix-report.md).
+    static void RayXreview() {
+        using rrraybudget::Why;
+        const auto l = RayLists();
+        auto mark = [](Controller &c, Controller::Slot &s, UINT64 resource, UINT64 offset,
+                       const rrraybudget::Armed &armed, unsigned mask) {
+            rrraybudget::Plan plan;
+            plan.mask = mask;
+            plan.armed = armed;
+            rrvrrt::RayResolve in;
+            in.budget_resource = resource;
+            in.budget_offset = offset;
+            c.RayBudgetResolveSeen(); // the patched resolve
+            c.RayPatched(s, plan, in, 1, rrraybudget::Times2);
+        };
+        // (4) Two applies of one recording read raised Budgets of two plans: no one snapshot
+        // judges both lobes (A3), so the frame is counted unverified, not judged. Plan A's
+        // snapshot (u2 armed at 8 bytes, the frame's is 4) would stop the test; judged by plan
+        // B's alone it would pass. The control reads two Budgets of plans with one snapshot.
+        for (const bool two_plans : {true, false}) {
+            Controller c;
+            auto strict = RayArmed();
+            strict.counter = 8;
+            mark(c, RayLive(c), 0x5000, 64, two_plans ? strict : RayArmed(), 1);
+            mark(c, RayNext(c), 0x6000, 0, RayArmed(), 2);
+            for (unsigned i = 0; i < rrraybudget::UnverifiedLimit - 1; ++i)
+                c.ray_gate.Unverified();
+            auto &s = RayNext(c);
+            auto other = l;
+            other.budget_resource = 0x6000;
+            other.budget_offset = 0;
+            c.RayBudgetApply(nullptr, l, {});
+            c.RayBudgetApply(nullptr, other, {});
+            assert(s.ray_budget == 3 && s.ray_mixed_armed == two_plans);
+            RayJudgeOwn(c, s, l);
+            assert(c.ray_gate.Stopped() == Why::None && RayWaiting(c) == two_plans);
+        }
+        // (5) A raised frame whose apply half was not recorded (a logging wait, logging off,
+        // apply constants outside an upload heap) has no proof that the reader's rates are its
+        // own: unverified, after the log and list checks. The control has the apply half.
+        for (const bool apply_half : {false, true}) {
+            Controller c;
+            mark(c, RayLive(c), 0x5000, 64, RayArmed(), 1);
+            for (unsigned i = 0; i < rrraybudget::UnverifiedLimit - 1; ++i)
+                c.ray_gate.Unverified();
+            auto &s = RayNext(c);
+            c.RayBudgetApply(nullptr, l, {});
+            assert(s.ray_budget == 1);
+            auto m = RayMeasured(l);
+            m.log[rrraycopy::ResolveSerial.at / 4] = s.ray_serial;
+            if (apply_half)
+                m.log[rrraycopy::ApplySerial.at / 4] = s.ray_serial;
+            else
+                m.logged &= ~rrraybudget::LogApplyHalf;
+            s.ray_logged = m.logged;
+            s.pre_submitted = true;
+            c.RayJudge(s, m.rates, m.log, Controller::RayLogState::Read);
+            assert(s.ray_done && c.ray_gate.Stopped() == Why::None && RayWaiting(c) == !apply_half);
+            // The list checks still run on such a frame: one at another extent stops the test.
+            auto &t = RayNext(c);
+            auto l16 = l;
+            l16.w = l16.h = 16;
+            c.RayBudgetApply(nullptr, l16, {});
+            assert(t.ray_budget == 1);
+            m = RayMeasured(l16);
+            m.logged &= ~rrraybudget::LogApplyHalf;
+            m.log[rrraycopy::ResolveSerial.at / 4] = t.ray_serial;
+            t.ray_logged = m.logged;
+            t.pre_submitted = true;
+            c.RayJudge(t, m.rates, m.log, Controller::RayLogState::Read);
+            assert(c.ray_gate.Stopped() == Why::ListsAfterArming);
+        }
+        // (3) The Governor stop's details name a patched lobe whose mark was lost.
+        {
+            rrraybudget::Completed lost;
+            lost.patched = 2;
+            lost.rates[rrdensity::Limits + 2] = std::uint32_t(-17);
+            char details[Controller::RayDetailsBytes];
+            Controller::RayStopDetails(Why::Governor, lost, details, sizeof(details));
+            assert(std::string(details) == "lobe2 threshold=-17");
+        }
+        // Conservative: a second resolve in a recording (Repeated) writes its Budget natively, so
+        // that Budget's mark goes and the apply after it is not raised. Control: no such resolve.
+        for (const bool repeated : {true, false}) {
+            Controller c;
+            auto &s = RayLive(c);
+            mark(c, s, 0x5000, 64, RayArmed(), 1);
+            s.ray_resolved = true;
+            if (repeated)
+                RayResolve(c, 0x5000, 64);
+            c.RayBudgetApply(nullptr, l, {});
+            assert(s.ray_budget == (repeated ? 0u : 1u));
+        }
+        // Conservative: an apply on a list with two RR recordings is an unproven one (A3): the
+        // gate's streak and the placement streak restart.
+        {
+            Controller two;
+            RayPrime(two, l);
+            assert(two.ray_gate.Streak() >= rrraybudget::ProofFrames &&
+                   two.ray_placement == rrraybudget::ProofFrames);
+            RayNext(two);
+            two.slots[1].generation = two.generation;
+            two.slots[1].pre_live = true;
+            two.RayBudgetApply(nullptr, l, {});
+            assert(two.ray_gate.Streak() == 0 && two.ray_placement == 0 &&
+                   !two.slots[0].ray_applied);
+        }
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -1002,8 +1110,14 @@ struct ControllerCpuTest {
             s.ray_budget = 1;
             s.ray_armed = RayArmed();
             s.ray_lists = RayLists();
-            s.pre_submitted = true; // the reader's rates are this recording's
-            r.RayJudge(s, RayRates(), {}, Controller::RayLogState::None);
+            // The reader's rates are this recording's: its prepass list was submitted and its
+            // apply half ran as recorded.
+            s.pre_submitted = true;
+            s.ray_serial = 5;
+            s.ray_logged = rrraybudget::LogApplyTarget;
+            std::array<std::uint32_t, rrraybudget::LogWords> own{};
+            own[rrraycopy::ApplySerial.at / 4] = 5;
+            r.RayJudge(s, RayRates(), own, Controller::RayLogState::Read);
             assert(s.ray_done && r.ray_gate.Stopped() == Why::None);
             r.RayUnverified(s);
             for (unsigned i = 0; i < 7; ++i)
@@ -2177,6 +2291,7 @@ struct ControllerCpuTest {
         RayReserve();
         RayStatus();
         RayChecks();
+        RayXreview();
     }
 };
 } // namespace rrlive

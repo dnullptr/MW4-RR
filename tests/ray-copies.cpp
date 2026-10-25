@@ -44,7 +44,7 @@ constexpr bool Reads(const List &l, const Avail &a) {
 
 // ---- ray_cb: the private b1 the patched resolve and the governor run with ----
 static_assert(GameBytes == 38 * 16 && GovernorBytes == 4 * 4 && CbBytes == 65536,
-              "the governor declares Game[38] then Mask, Headroom0, Headroom1, Pad");
+              "the governor declares Game[38] then Mask, Limit0, Limit1, Area");
 static_assert(ValuesTargets == 0 && ValuesSerial == 16 && ValuesGovernor == 32 &&
                   ValuesGovernor + GovernorBytes <= ValuesBytes && ValuesBytes == 256,
               "ray_values: targets 0..7, serial 16..19, governor constants 32..47 of 256 bytes");
@@ -144,18 +144,20 @@ constexpr void Run(const List &l, Images &m) {
         }
     }
 }
-// The governor's cbuffer (shaders/rr_vrrt_governor.hlsl): uint4 Game[38], then Mask, Headroom0,
-// Headroom1, Pad.
-constexpr std::uint32_t GovernorMask = 38 * 16, GovernorHeadroom0 = GovernorMask + 4,
-                        GovernorHeadroom1 = GovernorMask + 8, GovernorPad = GovernorMask + 12;
+// The governor's cbuffer (shaders/rr_vrrt_governor.hlsl): uint4 Game[38], then Mask, Limit0,
+// Limit1, Area.
+constexpr std::uint32_t GovernorMask = 38 * 16, GovernorLimit0 = GovernorMask + 4,
+                        GovernorLimit1 = GovernorMask + 8, GovernorArea = GovernorMask + 12;
 // ray_values as WriteRayPlan and WriteRaySerial leave it, then the patch: ray_cb has the game's
 // bytes except the raised lobes' register 2 words, which are the plan's bits, and the governor
-// reads the plan's mask and headrooms; the executed copy logs the register 2 the resolve runs with.
+// reads the plan's mask, limits and area; the executed copy logs the register 2 the resolve runs
+// with.
 constexpr bool PatchImage(unsigned mask) {
     rb::Plan plan;
     plan.mask = mask;
     plan.bits = {0x3f000000u, 0x3e99999au};
-    plan.headroom = {0x00012345u, 0x00054321u};
+    plan.limit = {0x00012345u, 0x00054321u};
+    plan.area = 0x00067890u;
     Images m;
     for (std::size_t i = 0; i < m.b1.size(); ++i)
         m.b1[i] = static_cast<unsigned char>(i * 7 + 3);
@@ -179,8 +181,9 @@ constexpr bool PatchImage(unsigned mask) {
             WordAt(m.log, Executed.at + 4 * lobe) != word)
             return false;
     }
-    return WordAt(m.cb, GovernorMask) == mask && WordAt(m.cb, GovernorHeadroom0) == 0x00012345u &&
-           WordAt(m.cb, GovernorHeadroom1) == 0x00054321u && WordAt(m.cb, GovernorPad) == 0 &&
+    return WordAt(m.cb, GovernorMask) == mask && WordAt(m.cb, GovernorLimit0) == 0x00012345u &&
+           WordAt(m.cb, GovernorLimit1) == 0x00054321u &&
+           WordAt(m.cb, GovernorArea) == 0x00067890u &&
            WordAt(m.log, Executed.at + 8) == WordAt(m.b1, 40) &&
            WordAt(m.log, Executed.at + 12) == WordAt(m.b1, 44);
 }

@@ -33,7 +33,7 @@ struct List {
     unsigned bits{};
 };
 // ray_values (UPLOAD 256 B): 0..7 target bits per lobe, 16..19 serial, 32..47 governor constants
-// (mask, headroom lobe 0, headroom lobe 1, 0)
+// (mask, limit lobe 0, limit lobe 1, armed area)
 inline constexpr std::uint32_t ValuesTargets = 0, ValuesSerial = 16, ValuesGovernor = 32,
                                ValuesBytes = 256;
 // ray_cb (DEFAULT) holds the game's first GameBytes of b1 then the governor's constants; ray_log
@@ -66,9 +66,9 @@ ValuesImage(const rrraybudget::Plan &plan) noexcept {
     v[ValuesTargets / 4] = plan.bits[0];
     v[ValuesTargets / 4 + 1] = plan.bits[1];
     v[ValuesGovernor / 4] = plan.mask;
-    v[ValuesGovernor / 4 + 1] = plan.headroom[0];
-    v[ValuesGovernor / 4 + 2] = plan.headroom[1];
-    v[ValuesGovernor / 4 + 3] = 0;
+    v[ValuesGovernor / 4 + 1] = plan.limit[0];
+    v[ValuesGovernor / 4 + 2] = plan.limit[1];
+    v[ValuesGovernor / 4 + 3] = plan.area;
     return v;
 }
 // The copies behind each Log bit. A bit is copied only when its source holds every byte its copies

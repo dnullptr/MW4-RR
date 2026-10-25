@@ -75,13 +75,14 @@ class Controller {
         // ray_serial the recording's ray-log serial (0 until a ray site ran), ray_done that the
         // recording was judged or counted unverified. ray_resolve_budget_* is the Budget identity
         // its resolve proved (0 when not proven): an apply reading it is same-frame (A2).
-        // ray_old_mark: an apply consumed a mark of an older generation (counted unverified).
+        // ray_old_mark: an apply consumed a mark of an older generation (counted unverified);
+        // ray_mixed_armed: applies consumed raised Budgets of two plans (counted unverified).
         rrraybudget::Lists ray_lists;
         UINT64 ray_apply_cb{}, ray_resolve_cb{};
         UINT64 ray_resolve_budget_resource{}, ray_resolve_budget_offset{};
         unsigned ray_logged{}, ray_patched{}, ray_budget{};
         std::array<UINT, 2> ray_written{};
-        bool ray_resolved{}, ray_applied{}, ray_done{}, ray_old_mark{};
+        bool ray_resolved{}, ray_applied{}, ray_done{}, ray_old_mark{}, ray_mixed_armed{};
         UINT ray_serial{};
         rrraybudget::Armed ray_armed{}, ray_patch_armed{};
         rrcapture::Capture captured; // The frame recorded on this slot, if any.

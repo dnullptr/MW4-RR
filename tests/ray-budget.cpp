@@ -206,6 +206,65 @@ static void GovernorBounds() {
         }
 }
 
+// A2: the governor bounds the frame that consumes the Budget by that frame's own extent (the
+// resolve's b3 register 86), not only the one proven when the plan armed: with dynamic resolution
+// the extent can grow between the two, and a bound from the armed W*H alone would let a taller
+// frame schedule up to capacity - slack + (W'H' - WH) entries.
+static void GovernorExtent(const rb::Plan &p, std::uint64_t capacity) {
+    assert(p.mask == 3 && p.limit[0] == capacity - rb::ConsumerSlack && p.limit[1] == p.limit[0]);
+    const std::uint32_t armed_w = p.armed.w, armed_h = p.armed.h;
+    assert(p.area == armed_w * armed_h);
+    // The old rule's headroom: capacity - armed W*H - slack.
+    const std::uint32_t old = std::uint32_t(p.limit[0] - p.area);
+    for (const std::uint32_t h :
+         {armed_h, armed_h - 80, armed_h + 20, armed_h + 120, 2160u, 16384u})
+        for (const std::uint32_t x : {0u, 1u, old / 2, old - 1, old, old + 1, 0xFFFFFFFFu})
+            for (const int t : {rb::NegativeLimit, -17, 9, IntMin}) {
+                const int g =
+                    rb::GovernedThreshold(t, x, p.limit[0], p.area, float(armed_w), float(h));
+                assert(rb::SafeThreshold(g));
+                const std::uint64_t frame =
+                    (std::max)(std::uint64_t(armed_w) * h, std::uint64_t(p.area));
+                // A raised threshold stays exactly when the frame's bound fits.
+                assert((g != rb::FallbackThreshold) == (frame + x <= p.limit[0]));
+            }
+    // The case the old rule let through: 20 more rows and an x at the old headroom.
+    const float taller = float(armed_h + 20);
+    assert(std::uint64_t(armed_w) * (armed_h + 20) + old > p.limit[0]);
+    assert(rb::GovernedThreshold(-16, old, p.limit[0], p.area, float(armed_w), taller) ==
+           rb::FallbackThreshold);
+    // A smaller frame keeps the armed W*H (conservative); a fractional extent rounds up.
+    assert(rb::GovernedThreshold(-16, old, p.limit[0], p.area, 1280.0f, 720.0f) == -16);
+    assert(rb::GovernedThreshold(-16, old + 1, p.limit[0], p.area, 1280.0f, 720.0f) == 17);
+    const std::uint32_t room = p.limit[0] - std::uint32_t(armed_w) * (armed_h + 1);
+    assert(rb::GovernedThreshold(-16, room, p.limit[0], p.area, float(armed_w),
+                                 float(armed_h) + 0.5f) == -16);
+    assert(rb::GovernedThreshold(-16, room + 1, p.limit[0], p.area, float(armed_w),
+                                 float(armed_h) + 0.5f) == 17);
+    assert(rb::GovernedThreshold(-16, room, p.limit[0], p.area, float(armed_h) + 0.5f,
+                                 float(armed_w)) == -16);
+    assert(rb::GovernedThreshold(-16, room + 1, p.limit[0], p.area, float(armed_h) + 0.5f,
+                                 float(armed_w)) == 17);
+    // An extent that is negative, -0, above 16384, infinite or NaN falls back whatever x is.
+    const float bad[] = {-1.0f,
+                         -0.0f,
+                         16384.5f,
+                         1e30f,
+                         std::numeric_limits<float>::infinity(),
+                         std::numeric_limits<float>::quiet_NaN()};
+    for (const float v : bad) {
+        assert(rb::GovernedThreshold(0, 0, p.limit[0], p.area, v, 1080.0f) == 17);
+        assert(rb::GovernedThreshold(0, 0, p.limit[0], p.area, 1920.0f, v) == 17);
+    }
+    assert(rb::GovernedThreshold(0, 0, p.limit[0], p.area, 16384.0f, 0.0f) == 0);
+    // A lobe with no room past the frame's W*H falls back at any x above 0, and at any x when
+    // the W*H alone exceeds the limit.
+    assert(rb::GovernedThreshold(-16, 1, 1000, 1000, 10.0f, 10.0f) == 17);
+    assert(rb::GovernedThreshold(-16, 0, 1000, 1000, 10.0f, 10.0f) == -16);
+    assert(rb::GovernedThreshold(-16, 0, 1000, 1001, 10.0f, 10.0f) == 17);
+    assert(rb::GovernedThreshold(-16, 0, 1000, 0, 10.0f, 100.1f) == 17);
+}
+
 // A proven apply: dispatch groups cover the extent, both ray lists hold `entries` entries and the
 // pixel list 4 bytes per pixel of the extent.
 static rb::Lists Proven(std::uint64_t entries, std::uint32_t w = 1920, std::uint32_t h = 1080) {
@@ -404,8 +463,10 @@ static void GateRefusals() {
     assert(e.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
     auto stats_only = Measured(l);
     stats_only.logged &= ~rb::LogApplyScene253;
-    for (unsigned i = 1; i < rb::ProofFrames; ++i)
+    for (unsigned i = 1; i < rb::ProofFrames; ++i) // the plain frames started the count over
         e.Complete(stats_only);
+    assert(e.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    e.Complete(stats_only);
     assert(e.Decide(rb::Times2, now, nullptr).why == rb::Why::RemapUnknown);
     for (unsigned i = 0; i < rb::ProofFrames; ++i)
         e.Complete(zero); // nor for the second segment
@@ -527,7 +588,7 @@ static void GateRefusals() {
     g.Complete(bare);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
     // The statistics count: a frame whose x is lower than the raw rays (either lobe) starts it
-    // over, a frame without the copy leaves it, an x equal to the raw rays is enough.
+    // over, and so does a counted frame without the copy; an x equal to the raw rays is enough.
     auto lag = Measured(l);
     lag.rates[rrdensity::RawRays + 1] = 7;
     lag.log[rb::LogWordStats + 1] = 6;
@@ -540,13 +601,59 @@ static void GateRefusals() {
     auto no_stats = Measured(l);
     no_stats.logged &= ~rb::LogResolveStats;
     no_stats.rates[rrdensity::RawRays] = 100; // not compared: no copy
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(equal);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    g.Complete(no_stats);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
     for (unsigned i = 1; i < rb::ProofFrames; ++i)
         g.Complete(equal);
-    for (unsigned i = 0; i < 50; ++i)
-        g.Complete(no_stats);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
     g.Complete(equal);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    // A cumulative t0 (A7: not proven to be zeroed each frame) covers the raw rays too, until its
+    // sum wraps. No single frame sums more than 16 rays per pixel of its extent: an x above that
+    // is not this frame's and starts the count over, long before a wrap.
+    const auto most = 16ull * l.Pixels();
+    auto cumulative = Measured(l);
+    cumulative.rates[rrdensity::RawRays] = 1000;
+    cumulative.log[rb::LogWordStats] = std::uint32_t(most);
+    g.Complete(cumulative);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    cumulative.log[rb::LogWordStats] = std::uint32_t(most + 1);
+    g.Complete(cumulative);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(equal);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    cumulative.log[rb::LogWordStats] = 1000;
+    cumulative.log[rb::LogWordStats + 1] = std::uint32_t(most + 1); // either lobe
+    g.Complete(cumulative);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(equal);
+    // A frame without a usable proof of its own falls back to the last one; with neither, its x
+    // cannot be bounded and the count starts over.
+    auto own_unproven = equal;
+    own_unproven.lists = rb::Lists{};
+    g.Complete(own_unproven);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    {
+        // After Restart such a frame neither resets the evidence at the unchanged extent nor
+        // counts towards it.
+        rb::Gate restarted = Primed(l);
+        restarted.Restart(now);
+        restarted.Complete(own_unproven);
+        for (unsigned i = 0; i < rb::ProofFrames; ++i)
+            restarted.Apply(l, now + 1);
+        assert(restarted.Decide(rb::Times2, now + 1, nullptr).why == rb::Why::StatsUnverified);
+        restarted = Primed(l, rb::ProofFrames, rb::ProofFrames - 1);
+        restarted.Restart(now);
+        restarted.Complete(own_unproven);
+        for (unsigned i = 0; i < rb::ProofFrames; ++i)
+            restarted.Apply(l, now + 1);
+        assert(restarted.Decide(rb::Times2, now + 1, nullptr).why == rb::Why::Evidence);
+    }
     lag = Measured(l);
     lag.rates[rrdensity::RawRays] = 7;
     lag.log[rb::LogWordStats] = 6;
@@ -592,14 +699,16 @@ static void GatePlans() {
     assert(p.bits[0] == std::bit_cast<std::uint32_t>(p.target[0]) &&
            p.bits[1] == std::bit_cast<std::uint32_t>(p.target[1]));
     // It carries what the governor and the completed-frame checks need: the extent, each list's
-    // capacity and, per raised lobe, the headroom (capacity - W*H - slack) and the margin.
+    // capacity and, per raised lobe, the limit (capacity - slack; the governor subtracts this
+    // frame's W*H) and the margin, and the armed W*H.
     // Its snapshot holds the u3/u2 sizes Decide checked, the streak's smallest.
-    assert(p.armed.w == 1920 && p.armed.h == 1080);
+    assert(p.armed.w == 1920 && p.armed.h == 1080 && p.area == pixels);
     assert(p.armed.capacity[0] == l.Entries(0) && p.armed.capacity[1] == l.Entries(1));
     assert(p.armed.pixels == l.v[2].bytes && p.armed.counter == l.v[3].bytes);
-    assert(l.Entries(0) == 2188960 && p.headroom[0] == 2188960 - pixels - rb::ConsumerSlack &&
-           p.headroom[1] == p.headroom[0] && p.headroom[0] == 114848);
+    assert(l.Entries(0) == 2188960 && p.limit[0] == 2188960 - rb::ConsumerSlack &&
+           p.limit[1] == p.limit[0] && p.limit[0] - pixels == 114848);
     assert(p.armed.margin[0] == 0 && p.armed.margin[1] == 0);
+    GovernorExtent(p, l.Entries(0));
     auto bigger = l; // a later apply with larger u3/u2 does not raise the snapshot
     bigger.v[2].bytes += 64;
     bigger.v[3].bytes += 64;
@@ -664,7 +773,7 @@ static void GatePlans() {
     g = Primed(l, rb::ProofFrames, rb::ProofFrames, 0.998f);
     assert(g.Decide(rb::Times2, now, nullptr).mask == 2);
     // Lobes are decided one by one: the first reason is kept only when no lobe arms. A lobe left
-    // alone gets no headroom (the governor leaves it alone), but its capacity is still known.
+    // alone gets no limit (the governor leaves it alone), but its capacity is still known.
     g = Primed(l);
     auto mixed = Measured(l);
     mixed.log[rb::LogWordResolveTarget] =
@@ -674,7 +783,7 @@ static void GatePlans() {
     p = g.Decide(rb::Times2, now, nullptr);
     assert(p.why == rb::Why::None && p.mask == 2 && p.target[0] == 0 &&
            Near(p.target[1], 0.4f * 2));
-    assert(p.headroom[0] == 0 && p.headroom[1] == 114848 && p.armed.capacity[0] == l.Entries(0));
+    assert(p.limit[0] == 0 && p.limit[1] - pixels == 114848 && p.armed.capacity[0] == l.Entries(0));
     assert(p.armed.margin[0] == 0 && p.armed.w == 1920);
     mixed.log[rb::LogWordResolveTarget + 1] = std::bit_cast<std::uint32_t>(0.0f);
     for (unsigned i = 0; i < rb::TargetFrames; ++i)
@@ -689,16 +798,15 @@ static void GatePlans() {
     auto exact = Proven(pixels + rb::ConsumerSlack); // W*H + slack: just enough
     assert(exact.Pixels() == pixels && std::uint64_t(exact.gx) * 16 * exact.gy * 16 > pixels);
     p = Primed(exact).Decide(rb::Times2, now, nullptr);
-    assert(p.mask == 3 && p.headroom[0] == 0 && p.headroom[1] == 0);
+    assert(p.mask == 3 && p.limit[0] == pixels && p.limit[1] == pixels); // no room past W*H
     exact = Proven(pixels + rb::ConsumerSlack - 1);
     assert(Primed(exact).Decide(rb::Times2, now, nullptr).why == rb::Why::ListsSmall);
-    // The headroom saturates at the governor's 32 bits.
-    p = Primed(Proven(pixels + rb::ConsumerSlack + 0xFFFFFFFEull)).Decide(rb::Times2, now, nullptr);
-    assert(p.mask == 3 && p.headroom[0] == 0xFFFFFFFEu);
-    p = Primed(Proven(pixels + rb::ConsumerSlack + 0x100000000ull))
-            .Decide(rb::Times2, now, nullptr);
-    assert(p.mask == 3 && p.headroom[0] == 0xFFFFFFFFu && p.headroom[1] == 0xFFFFFFFFu);
-    assert(p.armed.capacity[0] == pixels + rb::ConsumerSlack + 0x100000000ull);
+    // The limit saturates at the governor's 32 bits.
+    p = Primed(Proven(rb::ConsumerSlack + 0xFFFFFFFEull)).Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.limit[0] == 0xFFFFFFFEu);
+    p = Primed(Proven(rb::ConsumerSlack + 0x100000000ull)).Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.limit[0] == 0xFFFFFFFFu && p.limit[1] == 0xFFFFFFFFu);
+    assert(p.armed.capacity[0] == rb::ConsumerSlack + 0x100000000ull && p.area == pixels);
     // The smallest list of the streak counts, not the last one.
     g = Primed(l, rb::ProofFrames - 1);
     g.Apply(Proven(pixels + rb::ConsumerSlack - 1), now);
@@ -730,7 +838,7 @@ static void GatePlans() {
     assert(g.Hard(0) && g.Hard(1) && !g.Hard(2));
     p = g.Decide(rb::Times2, now, nullptr);
     assert(p.mask == 3 && p.armed.margin[0] == 24 && p.armed.margin[1] == 6 &&
-           p.headroom[0] == 114848);
+           p.limit[0] - pixels == 114848);
     auto tight = Proven(pixels + rb::ConsumerSlack + 23); // one entry short of the margin
     g = Primed(tight, rb::ProofFrames, 0);
     for (unsigned i = 0; i < rb::ProofFrames; ++i) {
@@ -740,7 +848,7 @@ static void GatePlans() {
     }
     assert(g.Margin(0) == 24 && !g.Hard(0) && g.Hard(1));
     p = g.Decide(rb::Times2, now, nullptr);
-    assert(p.why == rb::Why::None && p.mask == 2 && p.armed.margin[0] == 0 && p.headroom[0] == 0);
+    assert(p.why == rb::Why::None && p.mask == 2 && p.armed.margin[0] == 0 && p.limit[0] == 0);
     // The maximum decays: each block of BlockFrames frames halves it before new frames count.
     g = Primed(l, rb::ProofFrames, 0);
     auto burst = Measured(l);
@@ -804,7 +912,7 @@ static void GatePlans() {
     assert(g.Capacity(0) == 2100000 && g.Capacity(1) == 2100000 && g.Capacity(2) == 0);
     p = g.Decide(rb::Times2, now, nullptr);
     assert(p.mask == 3 && p.armed.capacity[0] == 2100000 && p.armed.capacity[1] == 2100000 &&
-           p.headroom[0] == 2100000 - pixels - rb::ConsumerSlack);
+           p.limit[0] == 2100000 - rb::ConsumerSlack);
     remap.log[rb::LogWordScene253] = 2100001; // the smallest one is kept
     g.Complete(remap);
     assert(g.Capacity(0) == 2100000);
@@ -855,9 +963,9 @@ static void GateStops() {
     assert(g.Stopped() == rb::Why::None && g.Decide(rb::Times2, now, nullptr).mask == 3);
     // The governor left a raised lobe's threshold below -16, or at INT_MIN.
     c.rates[rrdensity::Limits + 2] = std::bit_cast<std::uint32_t>(IntMin);
-    c.budget = 1; // lobe 2's apply read the game's own Budget: its threshold is the game's business
+    c.patched = c.budget = 1; // lobe 2 not raised: its threshold is the game's business
     assert(g.Complete(c) == rb::Why::None && g.Stopped() == rb::Why::None);
-    c.budget = 3;
+    c.patched = c.budget = 3;
     assert(g.Complete(c) == rb::Why::Governor && g.Stopped() == rb::Why::Governor);
     assert(g.Complete(c) == rb::Why::None); // only the frame that newly stops reports
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Stopped);
@@ -865,6 +973,17 @@ static void GateStops() {
     c.rates[rrdensity::Limits + 2] = 9;
     c.rates[rrdensity::Limits] = std::uint32_t(-17);
     assert(g.Complete(c) == rb::Why::Governor);
+    // A patched lobe whose mark was lost before its own apply (another recording's native resolve
+    // of that Budget, expiry, eviction) still has its threshold checked.
+    for (const unsigned budget : {0u, 2u}) { // no mark, or one that names the other lobe only
+        g = Armed(l, plan);
+        c.budget = budget;
+        assert(g.Complete(c) == rb::Why::Governor);
+    }
+    g = Armed(l, plan);
+    c.patched = c.budget = 0; // neither patched nor read raised: the game's own threshold
+    assert(g.Complete(c) == rb::Why::None && g.Stopped() == rb::Why::None);
+    c.patched = c.budget = plan.mask;
     // The constants the controller executed differ from the ones written.
     g = Primed(l);
     const auto q = g.Decide(rb::Times15, now, nullptr);
@@ -984,15 +1103,15 @@ static void GateStops() {
     g.Apply(smaller, now + 1);
     const auto later = g.Decide(rb::Times2, now + 1, nullptr);
     assert(later.mask == 3 && later.armed.capacity[1] == first.armed.capacity[1] - 50000 &&
-           later.headroom[1] == first.headroom[1] - 50000);
+           later.limit[1] == first.limit[1] - 50000);
     auto earlier = Raised(l, first);
-    earlier.rates[rrdensity::Extra + 1] = first.headroom[1];
+    earlier.rates[rrdensity::Extra + 1] = std::uint32_t(first.limit[1] - l.Pixels());
     assert(g.Complete(earlier) == rb::Why::None);
     // Ping-pong Budgets written by the two plans: each frame carries its own plan's snapshot.
     for (unsigned i = 0; i < 8; ++i) {
         const auto &by = i & 1 ? later : first;
         auto frame = Raised(i & 1 ? smaller : l, by);
-        frame.rates[rrdensity::Extra + 1] = by.headroom[1];
+        frame.rates[rrdensity::Extra + 1] = std::uint32_t(by.limit[1] - l.Pixels());
         assert(g.Complete(frame) == rb::Why::None);
     }
     assert(g.Stopped() == rb::Why::None);
@@ -1088,6 +1207,13 @@ static void GateStops() {
     assert(changed([](rb::Completed &f) {
                f.rates[rrdensity::RawRays] = 10;
                f.log[rb::LogWordStats] = 10;
+           }) == rb::Why::None);
+    // Nor may it exceed what one frame can sum (16 rays per pixel): a cumulative t0.
+    assert(changed([](rb::Completed &f) {
+               f.log[rb::LogWordStats + 1] = std::uint32_t(16 * f.lists.Pixels() + 1);
+           }) == rb::Why::StatsMismatch);
+    assert(changed([](rb::Completed &f) {
+               f.log[rb::LogWordStats + 1] = std::uint32_t(16 * f.lists.Pixels());
            }) == rb::Why::None);
     assert(changed([](rb::Completed &f) {
                f.rates[rrdensity::RawRays] = 10; // not copied in this frame

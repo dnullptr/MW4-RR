@@ -155,11 +155,14 @@ static rrvrrt::RayResolve ProveRayResolve(reshade::api::command_list *list,
         in.constants = true;
         // The patch copies the game's first GameBytes of b1 (A6); logging needs 48.
         Why why = in.settings.avail < rrraycopy::GameBytes ? Why::Constants : Why::None;
+        // b3 register 86 (W, H) is the governor's extent for this frame (A2): a patch needs it.
         const auto b3 = ComputeState().RootCBV(native, pipeline, root, 3);
         rrvrrt::RayConstant scene;
         if (b3.valid &&
             RayConstantProof(device, state, l, 3, b3.parameter, b3.address, 1392, scene))
-            in.scene = scene; // optional: logging only
+            in.scene = scene;
+        else if (why == Why::None)
+            why = Why::Constants;
         RayStatsProof(device, state, native, l, pipeline, root, in.stats);
         // Proven whatever the refusal: its identity clears the Budget's mark (A4).
         rrbindings::Location u0;

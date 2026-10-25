@@ -37,6 +37,9 @@ inline constexpr std::uint64_t ListHeader = 144, EntryBytes = 4, PixelEntryBytes
 inline constexpr int NegativeLimit = -16;
 // The threshold the governor writes for a lobe whose rays would exceed its headroom.
 inline constexpr int FallbackThreshold = 17;
+// The most deterministic rays a pixel asks for in a lobe (r <= 16, A7): one frame's x, the sum of
+// r over a lobe's pixels, is at most MaxPixelRays * W * H.
+inline constexpr std::uint32_t MaxPixelRays = 16;
 // UnverifiedLimit: raised recordings in a row that retired without reader stats (Decide waits);
 // UnverifiedStop: raised recordings without them since the last measured raised frame (a stop).
 inline constexpr unsigned ProofFrames = 120, TargetFrames = 4, UnverifiedLimit = 8,
@@ -244,6 +247,7 @@ struct Armed {
     std::uint32_t w{}, h{};
     std::array<std::uint64_t, 2> capacity{}, margin{};
     std::uint64_t pixels{}, counter{};
+    bool operator==(const Armed &) const = default;
 };
 // A retired recording, as the controller reports it to Gate::Complete and Summary::Completed.
 struct Completed {
@@ -291,25 +295,59 @@ inline bool Executed(const Completed &c, unsigned lobe) noexcept {
     return (c.patched >> lobe & 1) && (c.logged & LogExecuted) &&
            c.log[LogWordExecuted + lobe] == c.written[lobe];
 }
-// The controller's x covers the reader's raw rays of the lobe (meaningful with LogResolveStats).
-inline bool StatsCover(const Completed &c, unsigned lobe) noexcept {
-    lobe &= 1;
-    return c.log[LogWordStats + lobe] >= c.rates[rrdensity::RawRays + lobe];
-}
 // The lists a completed frame is measured against: its own apply's proof, else `last`.
 inline const Lists &FrameLists(const Completed &c, const Lists &last) noexcept {
     return Usable(c.lists) ? c.lists : last;
 }
+// The controller's x is this frame's for the lobe (meaningful with LogResolveStats): it covers
+// the reader's raw rays, and no single frame of `pixels` (the frame's extent, 0 when not known)
+// could have summed more. A cumulative or wrapping t0 (A7 leaves open whether it is zeroed each
+// frame) fails the second test long before its 32-bit sum wraps.
+inline bool StatsCover(const Completed &c, unsigned lobe, std::uint64_t pixels) noexcept {
+    lobe &= 1;
+    const std::uint32_t x = c.log[LogWordStats + lobe];
+    return x >= c.rates[rrdensity::RawRays + lobe] && x <= MaxPixelRays * pixels;
+}
+inline std::uint64_t FramePixels(const Completed &c, const Lists &last) noexcept {
+    const auto &lists = FrameLists(c, last);
+    return Usable(lists) ? lists.Pixels() : 0;
+}
+// The governor's rule for a raised lobe (shaders/rr_vrrt_governor.hlsl does exactly this on the
+// GPU; A1, A2): threshold `t` from the Budget, this frame's x, the plan's `limit` (the lobe's
+// capacity - ConsumerSlack) and `area` (the armed W*H), and the resolve's own extent `w`, `h`
+// (b3 register 86, floats). The frame's area is the larger of the two extents' (an unknown or
+// impossible extent falls back); a raised threshold stays only when area + x <= limit, the most
+// rays the frame then schedules.
+// The extent is checked on its bits: larger ones than 16384.0f's are negative, above MaxExtent,
+// infinite or NaN.
+inline constexpr std::uint32_t MaxExtentBits = 0x46800000u;
+static_assert(std::bit_cast<std::uint32_t>(float(MaxExtent)) == MaxExtentBits);
+constexpr int GovernedThreshold(int t, std::uint32_t x, std::uint32_t limit, std::uint32_t area,
+                                float w, float h) noexcept {
+    const int g = t < NegativeLimit ? NegativeLimit : t;
+    if (std::bit_cast<std::uint32_t>(w) > MaxExtentBits ||
+        std::bit_cast<std::uint32_t>(h) > MaxExtentBits)
+        return FallbackThreshold;
+    std::uint32_t wi = std::uint32_t(w), hi = std::uint32_t(h);
+    wi += float(wi) < w;
+    hi += float(hi) < h;
+    const std::uint32_t frame = (std::max)(wi * hi, area);
+    const std::uint32_t headroom = limit > frame ? limit - frame : 0;
+    return frame > limit || x > headroom ? FallbackThreshold : g;
+}
 // What Decide armed. The controller writes `bits` into register 2 of its b1 copy and, after the
-// game's 608 bytes, the governor's constants (mask, headroom[0], headroom[1]); it keeps `bits` for
+// game's 608 bytes, the governor's constants (mask, limit[0], limit[1], area); it keeps `bits` for
 // the Completed of the patched recording and `armed` for every recording this plan raised.
 struct Plan {
     unsigned mask{}; // raised lobes
     std::array<float, 2> native{}, target{};
     std::array<std::uint32_t, 2> bits{};
-    // Per raised lobe capacity - W*H - ConsumerSlack, saturated to 32 bits: the governor sets the
-    // threshold to 17 when this frame's x exceeds it. 0 for a lobe not raised.
-    std::array<std::uint32_t, 2> headroom{};
+    // Per raised lobe capacity - ConsumerSlack, saturated to 32 bits (0 for a lobe not raised),
+    // and the armed W*H. The governor subtracts the larger of `area` and this frame's own W*H
+    // (the resolve's b3 register 86) and sets the threshold to 17 when this frame's x exceeds
+    // what is left (GovernedThreshold).
+    std::array<std::uint32_t, 2> limit{};
+    std::uint32_t area{};
     // Set whenever a lobe is raised (else all 0): the extent, the capacity of both lobes,
     // Gate::Margin of each raised lobe, the streak's smallest u3 and u2 at this Decide.
     rrraybudget::Armed armed;
@@ -336,7 +374,7 @@ class Gate {
     std::array<std::uint32_t, 2> target_bits{};
     unsigned target_streak{};
     bool vrrt_enabled{};
-    unsigned stats_streak{};     // frames whose copied x covered the reader's raw rays (both lobes)
+    unsigned stats_streak{};     // counted frames in a row whose copied x is theirs (StatsCover)
     unsigned remap_frames{};     // frames at this extent that copied cb3 register 253
     std::uint32_t remap_min{};   // its smallest nonzero .x (0: none seen)
     unsigned unverified{};       // raised recordings in a row retired without reader stats
@@ -480,7 +518,7 @@ class Gate {
             return Why::None;
         auto fail = [&](Why w) { return Stop(w) ? w : Why::None; };
         for (unsigned l = 0; l < 2; ++l) {
-            if (counted && (c.budget >> l & 1) && !SafeThreshold(int(f[Limits + 2 * l])))
+            if (counted && (raised >> l & 1) && !SafeThreshold(int(f[Limits + 2 * l])))
                 return fail(Why::Governor);
             if ((c.patched >> l & 1) && !Executed(c, l))
                 return fail(Why::PatchMismatch);
@@ -490,19 +528,22 @@ class Gate {
         if (!counted)
             return Unverified();
         unverified = 0;
+        const auto &lists = FrameLists(c, last);
+        const auto pixels = FramePixels(c, last);
         if (raised) {
             if (f[Unsupported])
                 return fail(Why::Unsupported);
             for (unsigned l = 0; l < 2; ++l)
-                if ((raised >> l & 1) && (c.logged & LogResolveStats) && !StatsCover(c, l))
+                if ((raised >> l & 1) && (c.logged & LogResolveStats) && !StatsCover(c, l, pixels))
                     return fail(Why::StatsMismatch);
             for (unsigned l = 0; l < 2; ++l)
                 if ((raised >> l & 1) && Scheduled(f, l) + ConsumerSlack > c.armed.capacity[l])
                     return fail(Why::Overflow);
             unverified_since = 0; // a measured raised frame that passed every check
         }
-        const auto &lists = FrameLists(c, last);
-        if (lists.w != ew || lists.h != eh) {
+        // A frame with no usable proof of its own and none before it (after Restart or an
+        // unproven apply) neither resets the evidence nor counts towards it.
+        if (pixels && (lists.w != ew || lists.h != eh)) {
             ew = lists.w;
             eh = lists.h;
             clean = 0;
@@ -512,7 +553,7 @@ class Gate {
             remap_min = 0;
         }
         vrrt_enabled = f[Settings1] != 0;
-        ++clean;
+        clean += pixels != 0;
         if (cur.frames >= BlockFrames) {
             prev = cur;
             cur = {};
@@ -532,8 +573,12 @@ class Gate {
             target_streak = bits == target_bits ? target_streak + 1 : 1;
             target_bits = bits;
         }
-        if (c.logged & LogResolveStats)
-            stats_streak = StatsCover(c, 0) && StatsCover(c, 1) ? stats_streak + 1 : 0;
+        // In a row: a counted frame without the copy breaks the streak, so no run of frames goes
+        // unchecked while a cumulative t0 could wrap.
+        stats_streak =
+            (c.logged & LogResolveStats) && StatsCover(c, 0, pixels) && StatsCover(c, 1, pixels)
+                ? stats_streak + 1
+                : 0;
         if (c.logged & LogApplyScene253) {
             ++remap_frames;
             if (c.log[LogWordScene253] && (!remap_min || c.log[LogWordScene253] < remap_min))
@@ -607,14 +652,16 @@ class Gate {
             armed.h = last.h;
             armed.pixels = min_pixels;
             armed.counter = min_counter;
+            p.area = std::uint32_t(pixels); // below 2^32 / MaxRawRays (Resolution)
             for (unsigned l = 0; l < 2; ++l) {
                 armed.capacity[l] = Capacity(l);
                 if (!(p.mask >> l & 1))
                     continue;
-                // Hard(l) holds, so the capacity covers the pixels and the slack.
-                const auto used = pixels + ConsumerSlack;
-                const auto room = armed.capacity[l] > used ? armed.capacity[l] - used : 0;
-                p.headroom[l] = std::uint32_t((std::min)(room, std::uint64_t(0xFFFFFFFFu)));
+                // Hard(l) holds, so the capacity covers the pixels and the slack. The governor
+                // subtracts this frame's W*H on the GPU (A2): the extent can change between this
+                // proof and the frame that consumes the Budget.
+                const auto room = armed.capacity[l] - ConsumerSlack;
+                p.limit[l] = std::uint32_t((std::min)(room, std::uint64_t(0xFFFFFFFFu)));
                 armed.margin[l] = Margin(l);
             }
         }
@@ -1091,7 +1138,8 @@ class Summary {
             return;
         }
         if (c.logged & LogResolveStats)
-            w.stats.Add(StatsCover(c, 0) && StatsCover(c, 1));
+            w.stats.Add(StatsCover(c, 0, FramePixels(c, last)) &&
+                        StatsCover(c, 1, FramePixels(c, last)));
         for (unsigned l = 0; l < 2; ++l) {
             w.raw_rays_max[l] = (std::max)(w.raw_rays_max[l], f[RawRays + l]);
             w.margin_exceeded[l] += (raised >> l & 1) && f[RawRays + l] > c.armed.margin[l];
