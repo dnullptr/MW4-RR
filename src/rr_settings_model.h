@@ -5,6 +5,7 @@ struct Preferences {
     bool rr = true;
     bool sss = true;
     bool glass = true;
+    bool blend = true;
     bool hit = true;
     bool weapon_depth = true; // linear depth for RR, the weapon kept in front (rr_weapon_depth.h)
     bool water = true;        // water responsivity mask (rr_water.h), preset F only

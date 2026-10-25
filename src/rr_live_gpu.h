@@ -13,6 +13,7 @@
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
 #include "rr_transparency_guide.h"
+#include "rr_transparency_coverage.h"
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
 #include "rr_specular_distance.h"
@@ -252,6 +253,7 @@ struct GpuFrame {
     }
     rrsss::Gpu sss;
     rrtrans::Gpu transparency;
+    rrblend::Gpu coverage;
     std::array<ComPtr<ID3D12Resource>, 4> sources, guides;
     std::array<ComPtr<ID3D12Resource>, 2> constants;
     std::array<UINT64, 2> offsets{};
@@ -803,6 +805,7 @@ struct GpuFrame {
             header->Unmap(0, nullptr);
         Require(b.bytes >= bytes, "live allocation ledger underflow");
         b.bytes -= bytes;
+        coverage.Release();
         *this = {};
     }
 };
