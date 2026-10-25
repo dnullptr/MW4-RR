@@ -52,6 +52,10 @@ class Controller {
         bool responsivity_used{}; // RR was given a responsivity mask (sky edge test, water or SSS)
         GpuFrame gpu;
         bool busy{};
+        // This frame's coverage captures. The window-noise pass reads its counts and
+        // cleared after CoverageBlend in AfterSR, so it is reset only with the slot.
+        rrblend::Ticket coverage;
+        bool blend_used{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
         bool pre_live{}, sr_live{}, pending_sr{}, recorded{}, sealed{}, inference_ok{}, reported{},
             poisoned{};
@@ -432,10 +436,11 @@ class Controller {
             return true;
         for (const auto &s : slots)
             if (!rrpreset::CanRetire(
-                    s.poisoned, s.pre_live, s.sr_live, s.sss.live, s.transparency.Live(),
-                    s.pending_sr, s.recorded && !s.sealed && s.sr_live,
+                    s.poisoned, s.pre_live, s.sr_live, s.sss.live,
+                    s.transparency.Live() || s.coverage.Live(), s.pending_sr,
+                    s.recorded && !s.sealed && s.sr_live,
                     (s.pre_submitted || s.sss.submitted || s.transparency.prep_submitted ||
-                     s.transparency.anchor_submitted) &&
+                     s.transparency.anchor_submitted || s.coverage.submitted) &&
                         !s.fence_value,
                     Complete(s)))
                 return false;
@@ -498,6 +503,7 @@ class Controller {
         transparency_pipeline = {};
         transparency_source.Reset();
         transparency_composition = {};
+        CoverageReconfigured();
         initialized = history_queued = false;
         signaled = 0;
         runtime = nullptr;
@@ -968,6 +974,7 @@ class Controller {
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
 #include "rr_live_transparency.inl"
+#include "rr_live_coverage.inl"
 #include "rr_live_dropout.inl"
 
     bool SssEnabled() {
@@ -2458,6 +2465,7 @@ class Controller {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
                                    history.Get());
             }
+            CoverageBlend(*s, cl.Get(), o.width, o.height);
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
             if (s->water_used)
@@ -2582,6 +2590,7 @@ class Controller {
                 s.transparency.prep_live = false;
             if (s.transparency.anchor.Get() == cl)
                 s.transparency.anchor_live = false;
+            CoverageReset(s, cl);
             if (s.sr.Get() == cl) {
                 s.sr_live = false;
                 s.pending_sr = false;
@@ -2600,7 +2609,7 @@ class Controller {
         submissions.back().locked = true;
         submissions.back().touched.resize(slots.size());
         std::vector<int> pre(slots.size(), -1), producer(pre), consumer(pre), glass_pre(pre),
-            glass_anchor(pre);
+            glass_anchor(pre), cover(pre);
         bool any = false;
         auto index = [&](ID3D12CommandList *c) { return rrsss::RecordingIndex(n, lists, c); };
         for (unsigned k = 0; k < slots.size(); ++k) {
@@ -2610,9 +2619,10 @@ class Controller {
             consumer[k] = s.sr_live ? index(s.sr.Get()) : -1;
             glass_pre[k] = s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
             glass_anchor[k] = s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
+            cover[k] = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
             if (rrsss::Present(pre[k]) || rrsss::Present(producer[k]) ||
                 rrsss::Present(consumer[k]) || rrsss::Present(glass_pre[k]) ||
-                rrsss::Present(glass_anchor[k])) {
+                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k])) {
                 submissions.back().touched[k] = true;
                 any = true;
             }
@@ -2679,6 +2689,8 @@ class Controller {
                     !s.transparency_accepted) {
                     transparency_producer_suspended = true;
                 }
+                // Never part of acceptance: an unadmitted blend only reads no coverage.
+                SealCoverage(s, a, cover[k], b, baseline);
                 const bool accepted = baseline && (!s.sss_used || sss_accept) &&
                                       (!s.transparency_used || s.transparency_accepted);
                 s.gpu.Accept(accepted);
@@ -2707,6 +2719,8 @@ class Controller {
                 s.transparency.prep_submitted = true;
             if (rrsss::Present(glass_anchor[k]))
                 s.transparency.anchor_submitted = true;
+            if (rrsss::Present(cover[k]))
+                s.coverage.submitted = true;
         }
     }
     void After(ID3D12CommandQueue *q) {
@@ -2748,7 +2762,7 @@ class Controller {
             CaptureFailed("RR shut down");
         for (const auto &s : slots)
             if (s.poisoned || s.pre_live || s.sr_live || s.sss.live || s.transparency.Live() ||
-                s.pending_sr) {
+                s.coverage.Live() || s.pending_sr) {
                 Log("RR shutdown deferred: an RR command recording remains replayable; "
                     "reset/dispose required");
                 return false;

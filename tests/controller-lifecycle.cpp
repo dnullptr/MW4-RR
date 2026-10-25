@@ -2091,6 +2091,21 @@ struct ControllerCpuTest {
         c.Options();
         c.Status();
         c.PresetStatus();
+        // The transparency albedo blend row with no driver or device: RR is on and
+        // nothing ran yet. Toggling it restarts history.
+        assert(std::string(rrstatus::Label(c.TransparencyBlendState(true, false))) ==
+               "ON / waiting");
+        assert(std::string(rrstatus::Label(c.TransparencyBlendState(false, false))) ==
+               "unavailable");
+        c.policy.Next(20, c.generation, false);
+        assert(!c.policy.Next(21, c.generation, false));
+        c.SetTransparencyBlendEnabled(false);
+        assert(!c.TransparencyBlendEnabled() &&
+               std::string(rrstatus::Label(c.TransparencyBlendState(true, false))) == "OFF");
+        assert(c.policy.Next(22, c.generation, false));
+        c.SetTransparencyBlendEnabled(true);
+        c.SetTransparencyBlendTuning({});
+        assert(c.TransparencyBlendEnabled() && c.policy.Next(23, c.generation, false));
         assert(f->queries == before_queries && releases == 0 &&
                destroys == 0); // UI never calls driver.
         bool *held[] = {&s.pre_live,
@@ -2098,6 +2113,7 @@ struct ControllerCpuTest {
                         &s.sss.live,
                         &s.transparency.prep_live,
                         &s.transparency.anchor_live,
+                        &s.coverage.live,
                         &s.pending_sr,
                         &s.poisoned};
         f->completed = 9;
