@@ -36,6 +36,7 @@
 #include <vector>
 
 constexpr rrsettings::Preferences defaults;
+static_assert(defaults.blend);
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
               defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::SssHistory2);

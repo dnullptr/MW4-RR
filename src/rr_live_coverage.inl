@@ -48,6 +48,7 @@ void CoverageReset(Slot &s, ID3D12GraphicsCommandList *cl) {
     // holds nothing of this frame.
     if (!s.coverage.submitted) {
         s.coverage.cleared = false;
+        s.coverage.capture.Reset();
         s.coverage.captures_oit = s.coverage.captures_refr = s.coverage.captures_refr_alpha = 0;
     }
 }
@@ -368,4 +369,10 @@ void CoverageFailed(CoverageToken &&token, const char *what) {
     const auto held = std::move(token);
     if (held)
         BlendFailed(what);
+}
+// The render glue refused an OIT resolve whose command signature is not
+// Replayable (unknown, partial root constants or unsupported): no capture.
+void CoverageSignatureRefused() {
+    std::lock_guard lock(mutex);
+    CoverageRefused(rrblend::Reason::Signature);
 }

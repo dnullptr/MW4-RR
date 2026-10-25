@@ -21,6 +21,7 @@ static unsigned config_warnings{}; // settings that differ from INSTALLATION.txt
 static rrsettings::Preferences preferences;
 static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
+static bool &requested_blend = preferences.blend;
 static bool &requested_glass = preferences.glass;
 static bool &requested_tolerate = preferences.tolerate_isolated;
 static unsigned &requested_lobe = preferences.native_lobe;
@@ -32,6 +33,7 @@ static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::set_config_value(nullptr, SettingsSection, "SSS", requested_sss);
+    reshade::set_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
     reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::set_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
                               requested_tolerate);
@@ -64,6 +66,7 @@ static void ApplyEnabled(bool allowed) {
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
+    LiveRR().SetTransparencyBlendEnabled(requested_blend);
     LiveRR().SetSpecularHitEnabled(requested_hit);
     AlbedoInspector().observe_transitions = requested_glass;
     LiveRR().SetTolerateIsolated(requested_tolerate);
@@ -80,9 +83,11 @@ static void LoadSettings() {
     if (settings_loaded)
         return;
     settings_loaded = true;
+    LoadBlendTuning(SettingsSection);
     unsigned preset = preferences.preset;
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
+    reshade::get_config_value(nullptr, SettingsSection, "TransparencyBlend", requested_blend);
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     // Always on now: its panel checkbox is gone; the saved key reads on from the next save.
     requested_tolerate = true;
@@ -214,6 +219,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
+    changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     {
         // Session-only A/B tests of what RR is told; not saved.
@@ -539,6 +545,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     StatusRow("RR", status.rr);
     StatusRow("Transparency", status.glass);
     StatusRow("Subsurface Scattering", status.sss);
+    StatusRow("Transparency albedo blend",
+              LiveRR().TransparencyBlendState(rrsig::Attached() && CoveragePipelines().SignatureHooked(),
+                                              CoveragePipelines().OitUnavailable()));
     StatusRow("Specular hit distance", status.hit);
     ImGui::Text("Reconstruction path: %s", rrstatus::RouteLabel(status.route));
     ImGui::TextWrapped("Waiting means enabled but not delivered in recent completed frames. A "

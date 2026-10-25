@@ -1398,7 +1398,7 @@ struct ControllerCpuTest {
         r.c.Reset(&r.list);
         assert(s.busy && !s.coverage.Live() && !s.transparency.Live());
         assert(!s.coverage.cleared && !s.coverage.captures_oit && !s.coverage.captures_refr &&
-               !s.coverage.captures_refr_alpha);
+               !s.coverage.captures_refr_alpha && !s.coverage.capture);
         // The list is recorded again: its first capture clears again.
         t = r.Capture(r.list);
         assert(t && t.first);
@@ -1477,6 +1477,19 @@ struct ControllerCpuTest {
         assert(logs.size() == 1);
     }
 
+    // The render glue's signature refusal names the reason in the 10 s line,
+    // and only while the blend is on, as the controller's own refusals do.
+    static void SignatureRefusal() {
+        Controller c;
+        c.CoverageSignatureRefused();
+        assert(c.blend_counters.last == rrblend::Reason::Signature);
+        assert(!c.blend_failed && c.blend_unavailable == rrblend::Reason::None);
+        c.blend_counters = {};
+        c.SetTransparencyBlendEnabled(false);
+        c.CoverageSignatureRefused();
+        assert(c.blend_counters.last == rrblend::Reason::None);
+    }
+
     static void Run() {
         PoolExtra();
         State();
@@ -1489,6 +1502,7 @@ struct ControllerCpuTest {
         Shutdown();
         ResetUnsubmitted();
         Report();
+        SignatureRefusal();
     }
 };
 } // namespace rrlive

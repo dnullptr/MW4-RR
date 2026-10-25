@@ -190,7 +190,7 @@ static void TestClassify() {
         assert(std::fabs(composite - in.dest[0] * in.src[0]) > 1e-3f);
     }
     // Only the listed source factors are accepted; undefined values are refused.
-    for (int value : {0, 12, 13, 22, 255})
+    for (int value : {0, 12, 13, 22, 31})
         assert(Classify(Native(D3D12_BLEND_INV_SRC1_COLOR, static_cast<D3D12_BLEND>(value)), 1) ==
                BlendClass::Factor);
     auto rgb_only = Native(D3D12_BLEND_INV_SRC1_COLOR);
@@ -1019,7 +1019,9 @@ static void TestStatus() {
     assert(StatusOf(true, true, false, true, true, false, true) == State::ParentOff);
     assert(StatusOf(true, false, false, true, false, true, true) == State::ParentOff);
     assert(StatusOf(true, true, true, true, false, false, true) == State::Error);
-    assert(StatusOf(true, false, true, true, false, false, true) == State::Unavailable);
+    // Unavailable OIT capture still shows ON while refraction blends (fresh_ran).
+    assert(StatusOf(true, false, true, true, false, false, true) == State::Active);
+    assert(StatusOf(true, false, true, true, false, false, false) == State::Unavailable);
     assert(StatusOf(true, false, false, true, false, false, true) == State::Active);
     assert(StatusOf(true, false, false, true, false, false, false) == State::Waiting);
     assert(!strcmp(rrstatus::Label(StatusOf(true, false, true, true, false, false, false)),

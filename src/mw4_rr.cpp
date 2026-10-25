@@ -50,10 +50,13 @@ static rrlive::Controller &LiveRR() {
     return *p;
 }
 static bool SharedOutputCoverage(ID3D12GraphicsCommandList *);
+static void CoverageAfterIndirect(const rrcompute::IndirectCall &call) noexcept;
 static rrcompute::Tracker &ComputeState() {
     static auto *p = []() {
         auto *v = new rrcompute::Tracker;
         v->UseSharedOutputContext(&SharedOutputCoverage);
+        if (!v->SetAfterIndirect(&CoverageAfterIndirect, &WriteLog))
+            WriteLog("Transparency albedo blend unavailable: indirect draw observer not installed");
         return v;
     }();
     return *p;
@@ -693,14 +696,17 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
     }
 }
 #include "rr_glass_render.inl"
+#include "rr_blend_render.inl"
 static bool AuditDraw(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                       uint32_t fi) {
     GlassDraw(l, false, c, i);
+    CoverageDraw(l, {false, c, i, f, 0, fi});
     return SssOwnedDraw(l, {false, c, i, f, 0, fi});
 }
 static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                              int32_t b, uint32_t fi) {
     GlassDraw(l, true, c, i);
+    CoverageDraw(l, {true, c, i, f, b, fi});
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
 }
 static void ConditionSpecularDistance(reshade::api::command_list *list,
@@ -1028,6 +1034,7 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)
         OitSceneDraw(l);
+    CoverageIndirectArm(l, t);
     WithGraphicsBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     return false;
