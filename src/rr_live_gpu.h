@@ -844,12 +844,14 @@ struct GpuFrame {
         memcpy(&c[3], &strength, sizeof(strength));
         TestPass(cl, p, p.sky_edge_root.Get(), p.sky_edge.Get(), 8, mask, SkyEdgeTarget, c, 4);
     }
-    // RR's color scaled by a power of two (R32G32B32A32_FLOAT, w x h), read from
-    // the color subrect at (x, y). RR then reads it at subrect origin 0.
+    // RR's color scaled by a power of two and, when knee > 0, compressed by the contrast
+    // test (R32G32B32A32_FLOAT, w x h), read from the color subrect at (x, y). RR then
+    // reads it at subrect origin 0.
     void ScaleColor(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *scaled, UINT x,
-                    UINT y, float scale) {
+                    UINT y, float scale, float knee) {
         UINT c[8] = {w, h, x, y};
         memcpy(&c[4], &scale, sizeof(scale));
+        memcpy(&c[5], &knee, sizeof(knee));
         TestPass(cl, p, p.test_root.Get(), p.color_scale.Get(), 10, scaled, ColorTarget, c, 8);
     }
     // RR's depth (the private copy, or the game's R32_FLOAT depth) with sky (0)
@@ -975,6 +977,7 @@ struct GpuFrame {
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
                     color_x, color_y, tolerate ? 1u : 0u, strength, 0, 0, 0};
         memcpy(header_map, c, sizeof(c));
+        header_map[16] = 0;
     }
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
@@ -987,6 +990,11 @@ struct GpuFrame {
     // Factor the gate's Display applies to RR's output (color scale test); 0 = none.
     void OutputScale(float factor) {
         memcpy(&header_map[13], &factor, sizeof(factor));
+    }
+    // Knee of the contrast test, whose compression the gate's Display undoes on RR's
+    // output (rrcontrast::ExpandFactor) before OutputScale; 0 = none. Header clears it.
+    void OutputContrast(float knee) {
+        memcpy(&header_map[16], &knee, sizeof(knee));
     }
     // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
     std::array<UINT, 4> ReadStats() {

@@ -106,7 +106,8 @@ inline constexpr const char *responsivity_sources[SourceCount] = {"none", "sss",
 inline const char *ResponsivitySourceName(unsigned source) {
     return source < SourceCount ? responsivity_sources[source] : "unknown";
 }
-// A reset_reasons bit beyond HistoryPolicy's: the color brightness test changed its scale.
+// A reset_reasons bit beyond HistoryPolicy's: the color brightness test changed its scale,
+// or the contrast test its knee (both transform the color copy RR's history was built on).
 inline constexpr unsigned ColorScaleReset = 16;
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
@@ -120,9 +121,11 @@ struct Meta {
     unsigned water_guide{};
     bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
     // Tree-noise tests: the color brightness test's factor on RR's color (RR's output is in the
-    // same scaled domain; 1 = off), the guide test mode this frame's guides were converted with,
-    // the depth sky was lifted to (0 = not lifted), and the responsivity mask RR took.
-    float color_scale = 1.0f, depth_floor{};
+    // same scaled domain; 1 = off), the contrast test's knee (rr_contrast_test.h: the scaled
+    // color, and RR's output, are compressed by it; 0 = off), the guide test mode this frame's
+    // guides were converted with, the depth sky was lifted to (0 = not lifted), and the
+    // responsivity mask RR took.
+    float color_scale = 1.0f, contrast_knee{}, depth_floor{};
     unsigned guide_test{}, responsivity_source{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
@@ -304,6 +307,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("water_masks"), m.water_masks);
     JsonUint(f.Key("water_guide"), m.water_guide);
     JsonNumber(f.Key("color_scale"), m.color_scale);
+    JsonNumber(f.Key("contrast_knee"), m.contrast_knee);
     JsonUint(f.Key("guide_test"), m.guide_test);
     JsonNumber(f.Key("depth_floor"), m.depth_floor);
     JsonString(f.Key("responsivity_source"), ResponsivitySourceName(m.responsivity_source));

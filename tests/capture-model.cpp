@@ -615,6 +615,7 @@ static Frame<int> Rich(unsigned serial) {
     f.meta.water_masks = serial % 2 != 0;
     f.meta.water_guide = serial % 4;
     f.meta.color_scale = serial % 2 ? 0.25f : 1.0f;
+    f.meta.contrast_knee = serial % 2 ? 0.25f : 0.0f;
     f.meta.guide_test = serial % 2 ? 8 : 0;
     f.meta.depth_floor = serial % 2 ? 1e-7f : 0.0f;
     f.meta.responsivity_source = serial % 4 == 3 ? SkyEdgeMask : NoMask;
@@ -795,6 +796,8 @@ static void ManifestShape() {
                                 "\"water_guide\": 0",
                                 "\"color_scale\": 0.25",
                                 "\"color_scale\": 1",
+                                "\"contrast_knee\": 0.25",
+                                "\"contrast_knee\": 0",
                                 "\"guide_test\": 8",
                                 "\"depth_floor\": 1.00000001e-07",
                                 "\"depth_floor\": 0",

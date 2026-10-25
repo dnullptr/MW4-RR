@@ -2,7 +2,7 @@
 #include "../src/rr_gate_stats.h"
 // Private full-frame presentation gate. Persistent state is initialized once
 // outside replayable game recordings. A replayed reset must never clear it.
-cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength,OutputScale;uint2 Unused;}
+cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength,OutputScale;uint2 Unused;float ContrastKnee;uint3 Reserved2;}
 Texture2D<uint> Status:register(t0);
 Texture2D<float4> Reconstructed:register(t1);
 Texture2D<float4> CurrentColor:register(t2);
@@ -67,8 +67,13 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  }
  float3 color=Reconstructed.Load(int3(id.xy,0)).rgb;
  if(!Finite3(color)){uint old;Stats.InterlockedAdd(RR_STATS_NON_FINITE_OUTPUT,1,old);}
+ // Contrast test (rr_contrast_test.h ExpandFactor, SeriesLimit 0.01, MaxExponent 16): undo
+ // the compression of RR's input, before the color scale test's factor. 0 = off.
+ float t=max(max(color.r,color.g),color.b);
+ if(ContrastKnee>0&&t>0){float e=min(t/ContrastKnee,16.0);color*=e<0.01?1+e*(0.5+e/6):(exp(e)-1)/e;}
  // Color scale test (rr_color_scale.h): undo the scale on RR's input. 0 = off.
  if(OutputScale>0)color*=OutputScale;
+ if(ContrastKnee>0)color=min(color,65504.0);
  GameOutput[id.xy]=float4(color,1);
  if(id.x==0&&id.y==0)Stats.Store(4,1);
 }

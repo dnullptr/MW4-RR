@@ -9,6 +9,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_contrast_test.h"
 #include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
@@ -215,6 +216,16 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         ++rrguidetest::changes;
     }
     if (rrguidetest::Valid(static_cast<unsigned>(guide_test)) == rrguidetest::SkySurface) {
+        int sky_distance = static_cast<int>(rrguidetest::ValidFloor(rrguidetest::floor));
+        if (ImGui::Combo("Sky distance", &sky_distance, rrguidetest::floor_labels,
+                         rrguidetest::FloorCount)) {
+            rrguidetest::floor = rrguidetest::ValidFloor(static_cast<unsigned>(sky_distance));
+            ++rrguidetest::changes;
+        }
+        ImGui::TextWrapped("How far away RR sees the sky, in game units. Hills sit a few times "
+                           "farther than the trees in front of them; normally the sky is "
+                           "infinitely far. Scenery past the chosen distance ends up behind "
+                           "the sky for RR, so judge trees close by.");
         const auto floor = LiveRR().DepthFloorTest();
         ImGui::Text("Sky depth floor: %s",
                     floor == TestState::Active    ? "active"
@@ -298,6 +309,25 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
+    int contrast = static_cast<int>(rrcontrast::Valid(rrcontrast::mode));
+    if (ImGui::Combo("Color contrast test", &contrast, rrcontrast::labels, rrcontrast::Count)) {
+        rrcontrast::mode = rrcontrast::Valid(static_cast<unsigned>(contrast));
+        ++rrcontrast::changes;
+    }
+    const auto squeeze = LiveRR().ContrastTest();
+    ImGui::Text("Color contrast test: %s",
+                squeeze == TestState::Active    ? "active"
+                : contrast == 0                 ? "off"
+                : squeeze == TestState::Blocked ? "off: not enough GPU memory (change the "
+                                                  "setting to retry)"
+                : !rr_running                   ? "waiting for RR"
+                                                : "waiting");
+    ImGui::TextWrapped("Session-only test. Squeezes bright colors before RR and stretches RR's "
+                       "output back, so the sky behind branches is only a few times brighter "
+                       "than the needles for RR instead of about 28x. Shows whether the tree "
+                       "flicker follows that contrast. Stronger settings can darken noisy, "
+                       "bright spots a little. The SSS and transparency guides are left out "
+                       "while on.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
         LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();

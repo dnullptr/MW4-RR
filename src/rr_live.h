@@ -10,6 +10,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_contrast_test.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -135,8 +136,9 @@ class Controller {
     WeaponHold weapon_hold{};
     unsigned weapon_hold_changes{};
     rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
-    // Color scale RR's history was built with (color brightness test).
-    float applied_color_scale = 1.0f;
+    // Color scale and contrast knee RR's history was built with (color brightness and
+    // contrast tests).
+    float applied_color_scale = 1.0f, applied_contrast_knee = 0.0f;
     float responsivity_strength = rrresponsivity::DefaultStrength;
     // Running water tests (rr_water.h): session-only, off by default.
     rrwater::Settings water;
@@ -462,6 +464,7 @@ class Controller {
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
         applied_color_scale = 1.0f;
+        applied_contrast_knee = 0.0f;
         init_list.Reset();
         init_allocator.Reset();
         fence.Reset();
@@ -949,12 +952,18 @@ class Controller {
     }
     TestState ColorTest() {
         std::lock_guard lock(mutex);
-        const auto changes = rrcolorscale::changes.load(std::memory_order_relaxed);
+        const auto changes = ColorChanges();
         const float scale =
             rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
         if (scale > 1.0f && Test(wide_output, changes, true) == TestState::Blocked)
             return TestState::Blocked;
         return Test(color_test, changes, scale != 1.0f);
+    }
+    // The contrast test shares the color brightness test's copy of RR's color.
+    TestState ContrastTest() {
+        std::lock_guard lock(mutex);
+        return Test(color_test, ColorChanges(),
+                    rrcontrast::Knee(rrcontrast::mode.load(std::memory_order_relaxed)) > 0);
     }
     TestState DepthFloorTest() {
         std::lock_guard lock(mutex);
@@ -1497,6 +1506,12 @@ class Controller {
             return TestState::Blocked;
         return t.active && enabled && !failed && !retired && feature ? TestState::Active
                                                                      : TestState::Idle;
+    }
+    // The color brightness and contrast tests share one color copy: a change to either
+    // retries it.
+    static unsigned ColorChanges() {
+        return rrcolorscale::changes.load(std::memory_order_relaxed) +
+               rrcontrast::changes.load(std::memory_order_relaxed);
     }
   public:
 
@@ -2043,13 +2058,15 @@ class Controller {
             // that test's depth floor.
             const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
             bool weapon_on = feature ? weapon_linear : WeaponDepthWanted();
+            // Read once, so the depth copy, the weapon mapping and a capture all agree.
+            const float depth_floor =
+                rrguidetest::DepthFloor(rrguidetest::floor.load(std::memory_order_relaxed));
             rrweapondepth::Mapping weapon_map;
             const bool weapon_mapped =
                 weapon_on &&
                 rrweapondepth::Map(s->projection, projection,
-                                   s->gpu.guide_test == rrguidetest::SkySurface
-                                       ? rrguidetest::DepthFloor
-                                       : 0.0f,
+                                   s->gpu.guide_test == rrguidetest::SkySurface ? depth_floor
+                                                                                : 0.0f,
                                    weapon_map);
             if (!UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
                          DXGI_FORMAT_R32_FLOAT, "Weapon depth test") &&
@@ -2145,26 +2162,36 @@ class Controller {
                                     preset.has_effective, preset.effective);
             const float color_scale =
                 rrcolorscale::Factor(rrcolorscale::mode.load(std::memory_order_relaxed));
-            // Brightened, RR's output needs FP32 too; without it the test stays off.
-            const auto color_changes = rrcolorscale::changes.load(std::memory_order_relaxed);
+            const float contrast_knee =
+                rrcontrast::Knee(rrcontrast::mode.load(std::memory_order_relaxed));
+            // Brightened, RR's output needs FP32 too; without it the brightness test stays
+            // off (the contrast test, which shares the color copy, can still run).
+            const auto color_changes = ColorChanges();
             const bool wide_on =
                 UseTest(wide_output, color_scale > 1.0f, color_changes, s->gpu.ow, s->gpu.oh,
                         DXGI_FORMAT_R32G32B32A32_FLOAT, "Color brightness test output");
+            const float scale_used = color_scale < 1.0f || wide_on ? color_scale : 1.0f;
             const bool color_on =
-                UseTest(color_test, color_scale != 1.0f && (color_scale < 1.0f || wide_on),
-                        color_changes, s->gpu.w, s->gpu.h, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                UseTest(color_test, scale_used != 1.0f || contrast_knee > 0, color_changes,
+                        s->gpu.w, s->gpu.h, DXGI_FORMAT_R32G32B32A32_FLOAT,
                         "Color brightness test");
             if (!color_on)
                 wide_output.active = false;
             // The gate's Display reads RR's output from heap slot 9.
             s->gpu.Reconstructed(pipelines, wide_output.active ? wide_output.texture.Get()
                                                                 : s->gpu.rr_output.Get());
-            if (color_on)
-                s->gpu.OutputScale(1.0f / color_scale);
-            // RR's history is in the previous scale: start it over when the scale changes.
-            const float applied = color_on ? color_scale : 1.0f;
-            const bool color_scale_changed = applied != applied_color_scale;
+            if (color_on) {
+                s->gpu.OutputScale(1.0f / scale_used);
+                s->gpu.OutputContrast(contrast_knee);
+            }
+            // RR's history is in the previous scale and contrast: start it over when either
+            // changes.
+            const float applied = color_on ? scale_used : 1.0f,
+                        applied_knee = color_on ? contrast_knee : 0.0f;
+            const bool color_scale_changed =
+                applied != applied_color_scale || applied_knee != applied_contrast_knee;
             applied_color_scale = applied;
+            applied_contrast_knee = applied_knee;
             // The guide mode this slot's guides were converted with, not the panel's
             // current one, so normals and depth always come from the same mode.
             // The weapon depth test's linear depth carries the floor itself.
@@ -2262,10 +2289,10 @@ class Controller {
                                sky_edge_radius);
             if (color_on)
                 s->gpu.ScaleColor(cl.Get(), pipelines, color_test.texture.Get(), o.color_x,
-                                  o.color_y, color_scale);
+                                  o.color_y, scale_used, contrast_knee);
             if (depth_on)
                 s->gpu.FloorDepth(cl.Get(), pipelines, depth_test.texture.Get(), o.depth_x,
-                                  o.depth_y, rrguidetest::DepthFloor);
+                                  o.depth_y, depth_floor);
             if (weapon_on)
                 s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
                                    o.depth_y, weapon_map);
@@ -2281,9 +2308,10 @@ class Controller {
             if (captured) {
                 auto &m = s->captured.meta;
                 m.linear_depth = weapon_on;
-                m.color_scale = color_on ? color_scale : 1.0f;
+                m.color_scale = applied;
+                m.contrast_knee = applied_knee;
                 m.guide_test = s->gpu.guide_test;
-                m.depth_floor = depth_on ? rrguidetest::DepthFloor : 0.0f;
+                m.depth_floor = depth_on ? depth_floor : 0.0f;
                 m.responsivity_source = sky_edge_on           ? rrcapture::SkyEdgeMask
                                         : water_responsivity  ? rrcapture::WaterMask
                                         : responsivity_active ? rrcapture::SssMask
