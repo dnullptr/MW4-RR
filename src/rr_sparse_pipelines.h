@@ -52,7 +52,8 @@ inline void GlobalFail(const char *why) {
     if (!global_failed.exchange(true) && logger)
         logger(why);
 }
-inline std::unordered_map<uint64_t, Entry> pipelines;
+// Never destroyed: entries hold root signatures, which must not be released at process exit.
+inline auto &pipelines = *new std::unordered_map<uint64_t, Entry>;
 inline std::unordered_set<reshade::api::device *> failed_devices, corrected_devices;
 inline std::unordered_map<reshade::api::device *, uint64_t> unsafe_revision;
 struct Status {
@@ -262,13 +263,34 @@ inline int ApplySource(uint32_t count, const reshade::api::pipeline_subobject *o
     }
     return -1;
 }
+// The copy a game PSO already owns under id, or null; the game's PSO keeps owning it.
+inline ID3D12PipelineState *Attached(uint64_t p, const GUID &id) noexcept {
+    IUnknown *stored = nullptr;
+    UINT size = sizeof(stored);
+    if (!p || FAILED(((ID3D12PipelineState *)p)->GetPrivateData(id, &size, &stored)) ||
+        size != sizeof(stored) || !stored)
+        return nullptr;
+    Microsoft::WRL::ComPtr<IUnknown> owned;
+    owned.Attach(stored);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
+    return SUCCEEDED(owned.As(&state)) ? state.Get() : nullptr;
+}
 inline ID3D12PipelineState *MakeApplyVariant(reshade::api::device *d, ID3D12RootSignature *root,
                                              uint64_t p, int input, unsigned v) noexcept {
     static std::array<std::atomic<bool>, rrapply::Variants> reported{};
     ID3D12PipelineState *result = nullptr;
     try {
-        const auto prepared = rrapply::Shaders().Get(input, rrsss::ReplayCompiler());
-        const char *status = prepared.status[v];
+        // A repeated init_pipeline for the same game PSO (a pipeline library handing it out
+        // again) resets its Entry. Reuse the copy the PSO already owns: attaching a new one
+        // would release a pipeline the GPU may still be running.
+        if ((result = Attached(p, ApplyVariantId[v])))
+            return result;
+        rrapply::Prepared prepared;
+        if (root && input >= 0)
+            prepared = rrapply::Shaders().Get(input, rrsss::ReplayCompiler());
+        const char *status = input < 0 ? "unsupported-ray-selection-shader"
+                             : !root   ? "no-root-signature"
+                                       : prepared.status[v];
         if (const auto &code = prepared.code[v]) {
             result = MakeScaleVariant(d, {reinterpret_cast<uint64_t>(root)}, {p}, ApplyVariantId[v],
                                       {code->data(), code->size()});
@@ -443,7 +465,7 @@ inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Apply(reshade::api::device *d
         root = e->apply_root;
         input = e->apply_input;
     }
-    auto *made = root ? MakeApplyVariant(d, root.Get(), original, input, variant) : nullptr;
+    auto *made = MakeApplyVariant(d, root.Get(), original, input, variant);
     std::lock_guard lock(mutex);
     auto *e = find();
     if (!e)

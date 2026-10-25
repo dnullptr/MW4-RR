@@ -259,11 +259,13 @@ static void CheckRepeatBreak() {
 static void CheckBookkeeping() {
     using namespace rrapply;
     assert(Current(0) == State::Off && last_variant == 0);
+    assert(Current(2) == State::Waiting);
     Dispatched(2, true);
-    assert(last_variant == 2 && Current(2) == State::Active && Current(1) != State::Active);
-    // Turned back off: the native shader ran, and a capture must say so.
+    assert(last_variant == 2 && Current(2) == State::Active && Current(1) == State::Waiting);
+    // Turned back off: the native shader ran, and a capture must say so. Native dispatches
+    // leave the overlay's timestamps alone, so nothing reads as unavailable.
     Dispatched(0, false);
-    assert(last_variant == 0 && Current(0) == State::Off && Current(2) != State::Active);
+    assert(last_variant == 0 && Current(0) == State::Off && Current(2) == State::Waiting);
     Dispatched(3, false);
     assert(last_variant == 0 && Current(3) == State::Unavailable);
     Dispatched(3, true);
