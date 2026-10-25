@@ -19,10 +19,12 @@ using Capture = Frame<ComPtr<ID3D12Resource>>;
 using Session = Sequence<Capture>;
 
 // One per Input; resource == nullptr means not sent this frame. The box at (x, y) is w x h, where
-// 0 means the render size passed to Plan. Only subresource 0 is copied.
+// 0 means the render size passed to Plan. Only subresource 0 is copied. state is the one the
+// resource is in where Record runs, which Record leaves it in.
 struct Source {
     ID3D12Resource *resource{};
     UINT x{}, y{}, w{}, h{};
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 };
 using Sources = std::array<Source, InputCount>;
 
@@ -98,25 +100,31 @@ inline ComPtr<ID3D12Resource> Allocate(ID3D12Device *device, UINT64 bytes) {
         r.Reset();
     return r;
 }
-// Copies inputs [first, end), each moved from state to COPY_SOURCE and back. frame comes from
-// Plan with the same sources; frame.buffer holds at least frame.bytes.
+// Copies inputs [first, end), each moved from its own state to COPY_SOURCE and back (no barrier
+// when it is in COPY_SOURCE already). frame comes from Plan with the same sources; frame.buffer
+// holds at least frame.bytes.
 inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const Sources &sources,
-                   unsigned first, unsigned end, D3D12_RESOURCE_STATES state) {
+                   unsigned first, unsigned end) {
     if (!cl || !frame.buffer)
         return;
     end = std::min(end, unsigned(InputCount));
     std::array<D3D12_RESOURCE_BARRIER, InputCount> barriers{};
-    UINT n = 0;
+    UINT n = 0, copies = 0;
     // Subresource 0 is what RR reads; other mips or slices may be in any state.
     for (unsigned i = first; i < end; ++i)
         if (frame.regions[i].present && sources[i].resource) {
+            ++copies;
+            const auto state = sources[i].state;
+            if (state == D3D12_RESOURCE_STATE_COPY_SOURCE)
+                continue;
             auto &b = barriers[n++];
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition = {sources[i].resource, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
         }
-    if (!n)
+    if (!copies)
         return;
-    cl->ResourceBarrier(n, barriers.data());
+    if (n)
+        cl->ResourceBarrier(n, barriers.data());
     for (unsigned i = first; i < end; ++i) {
         const Region &r = frame.regions[i];
         if (!r.present || !sources[i].resource)
@@ -135,12 +143,14 @@ inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const So
     }
     for (UINT i = 0; i < n; ++i)
         std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
-    cl->ResourceBarrier(n, barriers.data());
+    if (n)
+        cl->ResourceBarrier(n, barriers.data());
 }
 
 struct Outcome {
     std::mutex mutex;
     bool done{}, ok{};
+    bool tainted{}; // A replayed SR recording copied into a frame again: no manifest.
     std::string text;
 };
 inline std::string Utf8(const std::filesystem::path &path) {
@@ -213,9 +223,10 @@ inline void WriteImages(const std::filesystem::path &folder, unsigned index, con
         written += std::uint64_t(r.width) * r.bytes_per_pixel * r.height;
     }
 }
-// Writes every frame, then manifest.json; returns the folder.
+// Writes every frame, then manifest.json (as manifest.json.tmp, renamed when complete) unless
+// outcome is tainted by then; returns the folder.
 inline std::filesystem::path Store(const std::vector<Capture> &frames, Header header,
-                                   std::uint64_t &written) {
+                                   Outcome &outcome, std::uint64_t &written) {
     SYSTEMTIME t{};
     GetLocalTime(&t);
     char text[64];
@@ -227,13 +238,20 @@ inline std::filesystem::path Store(const std::vector<Capture> &frames, Header he
     const auto folder = Folder(text);
     for (size_t i = 0; i < frames.size(); ++i)
         WriteImages(folder, unsigned(i), frames[i], written);
-    const auto path = folder / L"manifest.json";
+    const auto path = folder / L"manifest.json", tmp = folder / L"manifest.json.tmp";
     const std::string manifest = Manifest(header, frames);
-    std::ofstream out(path, std::ios::binary);
+    {
+        std::lock_guard lock(outcome.mutex);
+        if (outcome.tainted)
+            throw std::runtime_error("an SR recording was replayed while writing");
+    }
+    std::ofstream out(tmp, std::ios::binary);
     out.write(manifest.data(), std::streamsize(manifest.size()));
     out.close();
     if (!out)
-        throw std::runtime_error("cannot write " + Utf8(path));
+        throw std::runtime_error("cannot write " + Utf8(tmp));
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        throw std::runtime_error("cannot rename " + Utf8(tmp) + " to manifest.json");
     written += manifest.size();
     return folder;
 }
@@ -245,7 +263,7 @@ inline void Save(std::vector<Capture> &frames, Header header, void (*log)(const 
     char failure[1024]{};
     try {
         std::uint64_t written = 0;
-        text = Utf8(Store(frames, std::move(header), written));
+        text = Utf8(Store(frames, std::move(header), outcome, written));
         line = "RR capture: saved " + std::to_string(frames.size()) + " frames (" +
                std::to_string((written + (1u << 19)) >> 20) + " MB) to " + text;
         ok = true;
@@ -285,8 +303,8 @@ inline DWORD WINAPI Writer(void *p) {
     }
     FreeLibraryAndExitThread(module, 0);
 }
-// Writes frames on a background thread (on this one if it cannot start). The outcome is done
-// when the files are complete or have failed; log may be null.
+// Writes frames on a background thread. The outcome is done when the files are complete or have
+// failed, or at once when the thread cannot start (nothing is written then); log may be null.
 inline std::shared_ptr<Outcome> Write(std::vector<Capture> frames, Header header,
                                       void (*log)(const char *)) {
     auto outcome = std::make_shared<Outcome>();
@@ -303,11 +321,19 @@ inline std::shared_ptr<Outcome> Write(std::vector<Capture> frames, Header header
         job.reset(owned);
         FreeLibrary(job->module);
     }
-    if (job) {
-        frames = std::move(job->frames);
-        header = std::move(job->header);
+    // Never written on the calling (render) thread: the capture fails instead.
+    job.reset();
+    frames.clear();
+    {
+        std::lock_guard lock(outcome->mutex);
+        outcome->text = "could not start the writer thread";
+        outcome->done = true;
     }
-    Save(frames, std::move(header), log, *outcome);
+    try {
+        if (log)
+            log("RR capture failed: could not start the writer thread");
+    } catch (...) {
+    }
     return outcome;
 }
 } // namespace rrcapture

@@ -2066,18 +2066,27 @@ def jsonable(value):
 
 # ---- entry points --------------------------------------------------------------------------
 
+# src/rr_guide_test.h labels; a guide test changes the guides RR got (only mode 8's depth floor can be
+# undone).
+GUIDE_TESTS = {1: 'flip back-facing normals', 2: 'all normals face the camera',
+               3: 'flat diffuse albedo', 4: 'no specular albedo', 5: 'flat roughness',
+               6: 'all guides flat', 7: 'sky normals face the camera',
+               8: 'sky normals + non-zero sky depth', 9: 'sky roughness 0'}
+
+
 def undo_tests(manifest, frames):
     """Frames captured with a tree-noise test on, brought back to the game's values: color and
     rr_output RGB divided by the frame's color_scale (the color copy's constant alpha dropped), and
     sky depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged
     frames are the same objects."""
     entries = manifest.get('frames') or []
-    out, scaled, floored, sources = [], [], [], set()
+    out, scaled, floored, sources, guides = [], [], [], set(), {}
     for i, frame in enumerate(frames):
         meta = entries[i] if i < len(entries) else {}
         scale = meta.get('color_scale') or 1.0
         floor = meta.get('depth_floor') or 0.0
         sources.add(meta.get('responsivity_source') or 'unknown')
+        guides.setdefault(meta.get('guide_test'), []).append(i)
         if scale != 1.0 or floor > 0:
             frame = dict(frame)
         if scale != 1.0:
@@ -2103,6 +2112,11 @@ def undo_tests(manifest, frames):
     shown = sources - {'unknown'}
     if shown & {'sky_edge', 'water'}:   # Only a test mask is worth a note.
         notes.append('responsivity mask from: ' + ', '.join(sorted(shown)))
+    for mode, at in sorted((k, v) for k, v in guides.items() if k):
+        notes.append(f"guide test {mode} ({GUIDE_TESTS.get(mode, 'unknown')}) on in frames {at}: "
+                     "the guides are the test's, not the game's")
+    if len(guides.keys() - {None}) > 1:
+        notes.append('the guide test changed within the capture, so its frames mix guide values')
     return out, notes
 
 

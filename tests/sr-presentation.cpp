@@ -3,6 +3,7 @@
 #include "../src/rr_status.h"
 #include <cassert>
 #include <cmath>
+#include <cstring>
 int main() {
     rrstatus::Telemetry telemetry;
     rrstatus::Flags flags;
@@ -52,6 +53,53 @@ int main() {
     q.states[0] =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     assert(rrsr::Eligible(q));
+    // The capture log's reason, one clause per SR resource, in Eligible's order of checks.
+    char text[300];
+    rrsr::Describe(p, text, sizeof(text));
+    assert(!strcmp(text, "color 0x40 ok, depth 0x40 ok, motion 0x40 ok, output 0x8 ok"));
+    rrsr::Describe(q, text, sizeof(text));
+    assert(!strncmp(text, "color 0xc0 ok, ", 15));
+    q = p;
+    q.states[0] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    q.known[1] = false;
+    q.resources[2] = q.resources[0];
+    q.states[3] = D3D12_RESOURCE_STATE_COMMON;
+    q.aliased[3] = true;
+    assert(!rrsr::Eligible(q));
+    rrsr::Describe(q, text, sizeof(text));
+    assert(!strcmp(text,
+                   "color 0x80 (wants NPSR, reads only), depth unknown, motion same as color, "
+                   "output aliased 0x0 (wants UAV)"));
+    q = p;
+    q.resources[1] = 0; // Never known to the tracker either.
+    q.known[1] = false;
+    q.resources[3] = q.resources[2];
+    q.states[2] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
+    rrsr::Describe(q, text, sizeof(text));
+    assert(!strcmp(text, "color 0x40 ok, depth missing, motion 0x840 (wants NPSR, reads only), "
+                         "output same as motion"));
+    // Every clause "ok" exactly when Eligible accepts.
+    for (unsigned i = 0; i < 4; ++i)
+        for (auto s :
+             {D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_GENERIC_READ}) {
+            q = p;
+            q.states[i] = s;
+            rrsr::Describe(q, text, sizeof(text));
+            const char *at = text;
+            unsigned ok = 0;
+            while ((at = strstr(at, " ok")))
+                ++ok, ++at;
+            assert((ok == 4) == rrsr::Eligible(q) && ok >= 3);
+        }
+    // A short buffer keeps a terminated prefix; an empty one is left alone.
+    char short_text[12];
+    rrsr::Describe(p, short_text, sizeof(short_text));
+    assert(!strcmp(short_text, "color 0x40 "));
+    short_text[0] = 'x';
+    rrsr::Describe(p, short_text, 0);
+    assert(short_text[0] == 'x');
     auto a = rrspatial::Coordinate(0, 2, 4);
     assert(a.first == 0 && a.second == 1 && a.fraction == 0);
     a = rrspatial::Coordinate(1, 2, 4);

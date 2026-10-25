@@ -217,10 +217,12 @@ static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
     if (k != rrtrace::Kind::SR)
         return;
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
+    // A capture on this route copies an input from the tracker's state when nothing proved it.
     LiveRR().AfterSR(cl, p, rrtrace::Probe::CurrentCall(), r, rrtrace::Probe::CurrentRuntime(),
                      rrtrace::Probe::RuntimeEpoch(),
                      n && AlbedoInspector().SafeCopies(n.Get()) &&
-                         AlbedoInspector().StateCoverage(n.Get()));
+                         AlbedoInspector().StateCoverage(n.Get()),
+                     false, &SparseLayouts());
     ComputeState().Invalidate(n.Get());
 }
 static rrtrace::Probe &Observer() {

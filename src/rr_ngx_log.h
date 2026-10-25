@@ -285,7 +285,7 @@ inline void DescribeCreation(const rreval::Options &o, unsigned preset, bool lin
         o.quality >= 0 && o.quality <= 5 ? rrsettings::QualityLabel(o.quality) : "unknown";
     snprintf(out, size,
              "RR created: preset %s, quality %d (%s), flags %d -> %d, render %ux%u, output %ux%u",
-             name, o.quality, quality, o.flags, rreval::CreationFlags(o.flags, linear_depth),
-             o.width, o.height, o.out_width, o.out_height);
+             name, o.quality, quality, o.flags, rreval::CreateFlags(o.flags, linear_depth), o.width,
+             o.height, o.out_width, o.out_height);
 }
 } // namespace rrngxlog

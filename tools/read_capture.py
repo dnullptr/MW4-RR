@@ -6,6 +6,8 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
+Test passes that change RR's inputs (color_scale, depth_floor): undo them with
+tools/analyze_sky_edges.py undo_tests(manifest, frames).
 """
 import argparse
 import json
@@ -25,6 +27,9 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'Raw, cap bright samples (4x)', 'Raw, AO fix A (fill gaps)', 'Raw, AO fix B (native)',
             'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
             'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
+# Per-frame test settings and their off values; the summary shows only the ones that are on.
+FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
+               'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
 
 
 def small_float(bits, mantissa_bits):
@@ -74,7 +79,11 @@ def load(folder):
     if not path.is_file():
         raise FileNotFoundError(f'{path}: missing; the capture is incomplete or still being '
                                 'written (manifest.json is written last)')
-    manifest = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError as error:  # JSONDecodeError, UnicodeDecodeError: cut off while written
+        raise ValueError(f'{path}: unreadable ({error}); the capture is incomplete or was cut '
+                         'off while being written (manifest.json is written last)') from None
     if manifest.get('format') != 'mw4-rr-capture':
         raise ValueError(f'{path}: not an mw4-rr capture manifest')
     frames = [{name: read_input(folder, info) for name, info in frame['inputs'].items()
@@ -96,21 +105,48 @@ def range_text(array):
             (f' ({bad} non-finite)' if bad else ''))
 
 
+def input_states(frame):
+    """Where each input's copy state came from, leaving out the addon's own inputs, e.g.
+    'color layouts (0x40), depth contract, motion proven'; '' for manifests without the keys."""
+    parts = []
+    for name, info in (frame.get('inputs') or {}).items():
+        state = info.get('state') if isinstance(info, dict) else None
+        if state is None or state == 'addon':
+            continue
+        before = info.get('state_before')
+        tracked = state == 'layouts' and type(before) is int
+        parts.append(f'{name} {state}' + (f' ({before:#x})' if tracked else ''))
+    return ', '.join(parts)
+
+
 def summary(manifest, frames):
     m = manifest
     lines = [f'{m["frame_count"]} frames, render {m["render_width"]}x{m["render_height"]}, '
              f'output {m["output_width"]}x{m["output_height"]}, quality {m["quality"]}, '
-             f'preset {m["preset"]}, settings {json.dumps(m["settings"], separators=(",", ":"))}']
+             f'preset {m["preset"]}, create_flags {m.get("create_flags", "?")}, '
+             f'settings {json.dumps(m["settings"], separators=(",", ":"))}']
     lobe = m['settings'].get('lighting_input')
     if type(lobe) is int:
         lines.append(f'lighting input {lobe}: '
                      f'{LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else "unknown"}')
+    setups = {tuple(f.get(k) for k in ('lighting_input', *FRAME_TESTS)) for f in m['frames']}
+    if len(setups) > 1:
+        lines.append('warning: the frames differ in lighting input or test settings')
+    states = [input_states(f) for f in m['frames']]
+    if states and states[0]:
+        lines.append(f'input states: {states[0]}')
+    if len(set(states)) > 1:
+        lines.append('warning: the frames differ in input states')
     for frame, arrays in zip(m['frames'], frames):
         names = [n for bit, n in m['reset_reason_bits'].items() if frame['reset_reasons'] & int(bit)]
         reasons = f'({"|".join(names)})' if names else ''
+        tests = ''.join(f' {k}={frame[k]}' for k, off in FRAME_TESTS.items()
+                        if k in frame and frame[k] != off)
+        lighting = f' lighting_input={frame["lighting_input"]}' if 'lighting_input' in frame else ''
         lines.append(f'frame {frame["index"]} serial={frame["serial"]} sl_frame={frame["sl_frame"]} '
                      f'delivered={frame["delivered"]} reset={frame["reset"]} '
-                     f'reset_reasons={frame["reset_reasons"]}{reasons} jitter={frame["jitter"]}')
+                     f'reset_reasons={frame["reset_reasons"]}{reasons} jitter={frame["jitter"]}'
+                     f'{lighting}{tests}')
         for name, array in arrays.items():
             if name == 'status':
                 counts = [int((array == v).sum()) for v in range(5)]  # any dtype, no big allocation
@@ -170,7 +206,8 @@ def self_test():
                                 'height': h, 'bytes_per_pixel': array.nbytes // (w * h)}
             frames_json.append({'index': i, 'serial': 10 + i, 'sl_frame': 20 + i, 'delivered': True,
                                 'reset': bool(i), 'reset_reasons': 3 * i, 'jitter': [0.25, -0.125],
-                                'inputs': inputs})
+                                'lighting_input': 12, 'color_scale': [1, 4][i], 'guide_test': 0,
+                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs})
         manifest = {'format': 'mw4-rr-capture', 'version': 1, 'frame_count': 2,
                     'render_width': width, 'render_height': height, 'output_width': 8,
                     'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True,
@@ -217,8 +254,36 @@ def self_test():
         expect('  status: 0=0 1=1 2=0 3=0 4=0 other=2' in floats, 'status histogram on floats')
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
+        expect('jitter=[0.25, -0.125] lighting_input=12\n' in text, 'frame 0 lighting, tests off')
+        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge\n' in text,
+               'frame 1 tests that are on')
+        expect('warning: the frames differ in lighting input or test settings' in text,
+               'mixed test settings warned')
+        same = {**manifest, 'frames': [manifest['frames'][0]] * 2}
+        expect(not any(line.startswith('warning') for line in summary(same, frames)),
+               'uniform test settings not warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
+        # Input states: a manifest without them (older builds) prints nothing new.
+        expect('input states' not in text and 'differ in input states' not in text,
+               'no input states line without the keys')
+        stated = json.loads(json.dumps(manifest))
+        for name, (state, before) in {'color': ('layouts', 0x40), 'depth': ('contract', 0x40),
+                                      'motion': ('proven', 0x40), 'status': ('addon', 0x40),
+                                      'rr_output': ('addon', 8)}.items():
+            stated['frames'][0]['inputs'][name].update(state=state, state_before=before)
+        stated['frames'][1]['inputs']['color'].update(state='layouts', state_before=0x80)
+        (folder / 'manifest.json').write_text(json.dumps(stated), encoding='utf-8')
+        expect(load(folder)[0] == stated, 'a manifest with input states loads')
+        lines = summary(stated, frames)
+        expect('input states: color layouts (0x40), depth contract, motion proven' in lines,
+               f'input states of frame 0, addon ones left out: {lines[:4]}')
+        expect('warning: the frames differ in input states' in lines, 'differing states warned')
+        same = {**stated, 'frames': [stated['frames'][0]] * 2}
+        lines = summary(same, frames)
+        expect('input states: color layouts (0x40), depth contract, motion proven' in lines and
+               not any(line.startswith('warning') for line in lines), 'uniform states not warned')
+        (folder / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
         with np.load(folder / 'out.npz') as npz:
             expect(len(npz.files) == 12 and 'frame1_color' in npz.files, 'npz keys')
@@ -239,6 +304,18 @@ def self_test():
             expect('incomplete' in str(error) and 'manifest.json' in str(error), 'missing manifest')
         else:
             raise AssertionError('missing manifest must raise FileNotFoundError')
+        # A cut-off manifest (empty, truncated, or broken mid-character) is incomplete too.
+        text = json.dumps(manifest).encode('utf-8')
+        for broken in (b'', text[:len(text) // 2], text[:-1], b'{"format": "\xff'):
+            (folder / 'manifest.json').write_bytes(broken)
+            try:
+                load(folder)
+            except ValueError as error:
+                expect(not isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) and
+                       'incomplete' in str(error) and 'manifest.json' in str(error),
+                       f'unreadable manifest must say incomplete, got {error!r}')
+            else:
+                raise AssertionError('an unreadable manifest must raise ValueError')
     print('self-test passed')
 
 

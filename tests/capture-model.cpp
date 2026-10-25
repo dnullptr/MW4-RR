@@ -209,7 +209,7 @@ static void ResetOnlyStartsRun() {
     assert(done.size() == Frames && s.state == State::Writing && s.run.empty());
     for (unsigned i = 0; i < Frames; ++i)
         assert(done[i].meta.serial == 13 + i && done[i].meta.reset == (i == 0));
-    assert(s.pool.size() == 11); // 8 + the buffers of 10..12, as for a gap.
+    assert(s.pool.empty()); // The 8 + the buffers of 10..12 are released on Writing.
     // A reset frame that comes first starts a run like any other.
     Seq t = Collecting();
     Frame<int> first = Make(30, 1);
@@ -220,6 +220,36 @@ static void ResetOnlyStartsRun() {
         Done(t, Make(i, int(i)));
     const auto run = t.Settle();
     assert(run.size() == Frames && run.front().meta.serial == 30 && t.state == State::Writing);
+}
+
+static void LightingBreaksRun() {
+    // The lighting input changes at 73, so 70..72 cannot lead into it.
+    Seq s = Collecting();
+    for (unsigned i = 70; i <= 80; ++i) {
+        Frame<int> f = Make(i, int(i));
+        f.meta.lighting_input = i < 73 ? 0 : 5;
+        Done(s, f);
+    }
+    const auto done = s.Settle();
+    assert(done.size() == Frames && s.state == State::Writing);
+    for (unsigned i = 0; i < Frames; ++i)
+        assert(done[i].meta.serial == 73 + i && done[i].meta.lighting_input == 5);
+    // Across polls as well, and the broken run's buffer goes back to the pool.
+    Seq t = Collecting();
+    Frame<int> a = Make(1, 21), b = Make(2, 22);
+    a.meta.lighting_input = 1;
+    b.meta.lighting_input = 2;
+    Done(t, a);
+    assert(t.Settle().empty() && t.run.size() == 1);
+    Done(t, b);
+    assert(t.Settle().empty() && t.state == State::Collecting);
+    assert(t.run.size() == 1 && t.run[0].meta.serial == 2 && t.run[0].buffer == 22);
+    assert(t.pool.size() == 9 && t.pool.back() == 21);
+    // An unchanged lighting input keeps the run going.
+    Frame<int> c = Make(3, 23);
+    c.meta.lighting_input = 2;
+    Done(t, c);
+    assert(t.Settle().empty() && t.run.size() == 2 && t.pool.size() == 9);
 }
 
 static void StaleSessions() {
@@ -256,7 +286,7 @@ static void StaleSessions() {
     assert(done.size() == Frames && s.state == State::Writing);
     for (unsigned i = 0; i < Frames; ++i)
         assert(done[i].meta.serial == 100 + i && done[i].session == 2);
-    assert(s.pool.size() == 8);
+    assert(s.pool.empty()); // The eight spare buffers are released on Writing.
     // The same holds after a save: a straggler from the finished session is dropped.
     Frame<int> late = Make(200, 95);
     late.session = s.session;
@@ -289,6 +319,21 @@ static void CountOverflow() {
     assert(!s.Count());
     assert(s.state == State::Failed && s.message == "RR did not deliver 8 consecutive frames");
     assert(s.pool.empty() && s.run.empty());
+}
+
+static void CountWhy() {
+    // The attempt past the cap names its own reason; earlier ones change nothing.
+    const char *why = "RR's input states were unknown (native SR path)";
+    Seq s = Collecting();
+    for (unsigned i = 0; i < MaxAttempts; ++i)
+        assert(s.Count(i % 2 ? why : nullptr));
+    assert(s.attempts == MaxAttempts && s.state == State::Collecting && s.message.empty());
+    assert(!s.Count(why));
+    assert(s.state == State::Failed && s.message == why && s.pool.empty());
+    // A null reason keeps the default text.
+    Seq t = Collecting();
+    t.attempts = MaxAttempts;
+    assert(!t.Count(nullptr) && t.message == "RR did not deliver 8 consecutive frames");
 }
 
 static void FinishedTransitions() {
@@ -364,6 +409,37 @@ static void MoveOnlyBuffers() {
         assert(s.pool.size() == 8); // An empty handle is not pooled.
         s.Fail("done");
         assert(Handle::live == 0 && s.pool.empty());
+    }
+    assert(Handle::live == 0);
+}
+
+// Once the run is complete, only its eight buffers stay alive.
+static void PoolReleasedOnWriting() {
+    {
+        Sequence<Frame<Handle>> s;
+        std::vector<Handle> buffers;
+        for (int i = 0; i < 8; ++i)
+            buffers.emplace_back(i);
+        assert(s.Request());
+        s.Begin(std::move(buffers));
+        auto frame = [&](unsigned serial, Handle b, bool delivered) {
+            Frame<Handle> f;
+            f.buffer = std::move(b);
+            f.meta.serial = serial;
+            f.meta.delivered = delivered;
+            f.session = s.session;
+            s.Complete(std::move(f));
+        };
+        frame(1, Handle(9), false); // A ninth buffer joins the pool, as after a failed frame.
+        assert(s.Settle().empty() && s.pool.size() == 9 && Handle::live == 9);
+        for (unsigned i = 0; i < Frames; ++i)
+            frame(10 + i, s.Take(), true);
+        assert(s.pool.size() == 1 && Handle::live == 9);
+        const auto done = s.Settle();
+        assert(done.size() == Frames && s.state == State::Writing);
+        assert(s.pool.empty() && Handle::live == 8);
+        s.Recycle(Handle(10)); // Nothing is pooled while Writing.
+        assert(s.pool.empty() && Handle::live == 8);
     }
     assert(Handle::live == 0);
 }
@@ -628,6 +704,7 @@ static void ManifestShape() {
     h.output_height = 6;
     h.quality = -1;
     h.preset = 6;
+    h.create_flags = 11;
     h.sss_enabled = true;
     h.responsivity_strength = -0.5f;
     h.water_discard = true;
@@ -638,10 +715,18 @@ static void ManifestShape() {
     h.sky_edge_radius = 3;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
+    frames[1].meta.lighting_input = 3;
     frames[0].meta.hit_distance_test = 2;
     const std::string m = Manifest(h, frames);
     assert(Balanced(m));
     assert(Contains(m, "\"cpu_time_ms\": 100000000.125")); // Fixed, where %.9g would round.
+    // Each frame's lighting input, right after its cpu_time_ms; create_flags right after preset.
+    assert(Contains(m, "\"cpu_time_ms\": 123456.789,\n      \"lighting_input\": 0,\n      "
+                       "\"inputs\": {"));
+    assert(Contains(m, "\"cpu_time_ms\": 100000000.125,\n      \"lighting_input\": 3,\n      "
+                       "\"inputs\": {"));
+    assert(Count(m, "\"lighting_input\": ") == 3); // Two frames and the header's settings.
+    assert(Contains(m, "\"preset\": 6,\n  \"create_flags\": 11,\n  \"settings\": {"));
     const char *top[] = {"\"format\": \"mw4-rr-capture\"",
                          "\"version\": 1",
                          "\"created\": \"2026-10-25T10:31:02\"",
@@ -652,6 +737,7 @@ static void ManifestShape() {
                          "\"output_height\": 6",
                          "\"quality\": -1",
                          "\"preset\": 6",
+                         "\"create_flags\": 11",
                          "\"settings\"",
                          "\"status_values\"",
                          "\"reset_reason_bits\"",
@@ -775,7 +861,7 @@ static void ManifestOutputSize() {
     h.output_height = 6;
     Frame<int> f = Make(9, 0);
     f.regions[Color] = Region{true, 26, 4, 3, 4, 0, 256, 0, 0, 8, 6};
-    f.regions[RrOutput] = Region{true, 10, 8, 6, 8, 1024, 256, 0, 0, 8, 6};
+    f.regions[RrOutput] = Region{true, 10, 8, 6, 8, 1024, 256, 0, 0, 8, 6, Addon, 8};
     const std::string m = Manifest(h, std::vector<Frame<int>>{f});
     assert(Balanced(m));
     assert(Contains(m, "\"color\": {\"file\": \"frame0_color.bin\", \"format\": "
@@ -784,7 +870,7 @@ static void ManifestOutputSize() {
     assert(Contains(m, "\"rr_output\": {\"file\": \"frame0_rr_output.bin\", \"format\": "
                        "\"R16G16B16A16_FLOAT\", \"dxgi_format\": 10, \"width\": 8, \"height\": 6, "
                        "\"bytes_per_pixel\": 8, \"source_offset\": [0, 0], "
-                       "\"source_size\": [8, 6]}"));
+                       "\"source_size\": [8, 6], \"state\": \"addon\", \"state_before\": 8}"));
     // All 14 inputs in table order, and no others: two present, twelve null.
     std::size_t at = m.find("\"inputs\": {");
     assert(at != std::string::npos);
@@ -793,6 +879,37 @@ static void ManifestOutputSize() {
         assert(at != std::string::npos);
     }
     assert(InputCount == 14 && Count(m, "\": null") == 12 && Count(m, "{\"file\": ") == 2);
+}
+// Each present input says where the state its copy moved it from came from; absent ones are null.
+static void ManifestInputStates() {
+    assert(std::string(StateSourceName(Addon)) == "addon" &&
+           std::string(StateSourceName(Proven)) == "proven" &&
+           std::string(StateSourceName(Tracked)) == "layouts" &&
+           std::string(StateSourceName(Contract)) == "contract" &&
+           std::string(StateSourceName(StateSourceCount)) == "unknown");
+    Header h;
+    Frame<int> f = Make(9, 0);
+    f.regions[Color] = Region{true, 26, 4, 3, 4, 0, 256, 2, 1, 8, 6, Tracked, 0xC0};
+    f.regions[Depth] = Region{true, 41, 4, 3, 4, 1024, 256, 0, 0, 8, 6, Contract, 0x40};
+    f.regions[Motion] = Region{true, 34, 4, 3, 4, 2048, 256, 0, 0, 8, 6, Proven, 0x40};
+    f.regions[Status] = Region{true, 42, 4, 3, 4, 3072, 256, 0, 0, 4, 3, Addon, 0x40};
+    const std::string m = Manifest(h, std::vector<Frame<int>>{f});
+    assert(Balanced(m));
+    // After source_size, keeping the existing keys and their order.
+    assert(Contains(m, "\"color\": {\"file\": \"frame0_color.bin\", \"format\": "
+                       "\"R11G11B10_FLOAT\", \"dxgi_format\": 26, \"width\": 4, \"height\": 3, "
+                       "\"bytes_per_pixel\": 4, \"source_offset\": [2, 1], "
+                       "\"source_size\": [8, 6], \"state\": \"layouts\", \"state_before\": 192}"));
+    assert(Contains(m, "\"depth\": {\"file\": \"frame0_depth.bin\""));
+    assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"contract\", \"state_before\": 64}"));
+    assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"proven\", \"state_before\": 64}"));
+    assert(Contains(m, "\"source_size\": [4, 3], \"state\": \"addon\", \"state_before\": 64}"));
+    assert(Count(m, "\"state\": ") == 4 && Count(m, "\"state_before\": ") == 4);
+    assert(Count(m, "\": null") == InputCount - 4 && Contains(m, "\"sss_guide\": null") &&
+           Contains(m, "\"rr_output\": null"));
+    // An out-of-range source still writes valid JSON.
+    f.regions[Color].state_source = StateSourceCount;
+    assert(Contains(Manifest(h, std::vector<Frame<int>>{f}), "\"state\": \"unknown\""));
 }
 
 // Writes two 4 x 3 frames: color (R11G11B10_FLOAT, every texel R=1 G=0.5 B=2) and status
@@ -819,6 +936,8 @@ static int WriteSample(const char *folder) {
     h.output_height = 6;
     h.quality = 2;
     h.preset = 6;
+    h.create_flags = 11;
+    h.lighting_input = 12; // From frame 0, as the add-on writes it.
     h.sss_enabled = true;
     h.transparency_enabled = true;
     h.tolerate_isolated = true;
@@ -834,6 +953,7 @@ static int WriteSample(const char *folder) {
         f.meta.motion_scale[0] = f.meta.motion_scale[1] = 1;
         f.meta.pre_exposure = f.meta.exposure_scale = 1;
         f.meta.cpu_time_ms = 123456.789 + i;
+        f.meta.lighting_input = 12;
         f.meta.world_to_view[0] = f.meta.world_to_view[5] = f.meta.world_to_view[10] = 1;
         f.meta.world_to_view[15] = 1;
         f.meta.view_to_clip[0] = 1.5f;
@@ -846,9 +966,9 @@ static int WriteSample(const char *folder) {
         f.meta.camera.aspect = 1.78f;
         f.meta.camera.depth_inverted = 1;
         Region &c = f.regions[Color];
-        c = Region{true, 26, W, H, 4, 0, Pitch, 0, 0, 8, 6};
+        c = Region{true, 26, W, H, 4, 0, Pitch, 0, 0, 8, 6, Proven, 0x40};
         Region &s = f.regions[Status];
-        s = Region{true, 42, W, H, 4, StatusAt, Pitch, 0, 0, W, H};
+        s = Region{true, 42, W, H, 4, StatusAt, Pitch, 0, 0, W, H, Addon, 0x40};
         for (unsigned in : {unsigned(Color), unsigned(Status)}) {
             std::ofstream out(std::filesystem::path(folder) / FileName(i, in), std::ios::binary);
             PackRows(buffer.data(), f.regions[in], [&](const unsigned char *row, std::uint64_t n) {
@@ -873,12 +993,15 @@ int main(int argc, char **argv) {
     UndeliveredClearsRun();
     GapAndSizeRestart();
     ResetOnlyStartsRun();
+    LightingBreaksRun();
     StaleSessions();
     FailDropsLater();
     CountOverflow();
+    CountWhy();
     FinishedTransitions();
     FailIgnoredWhileWriting();
     MoveOnlyBuffers();
+    PoolReleasedOnWriting();
     Packing();
     RegionBounds();
     Names();
@@ -887,6 +1010,7 @@ int main(int argc, char **argv) {
     LocaleIndependent();
     ManifestShape();
     ManifestOutputSize();
+    ManifestInputStates();
     std::puts("capture model tests passed");
     return argc > 1 ? WriteSample(argv[1]) : 0;
 }
