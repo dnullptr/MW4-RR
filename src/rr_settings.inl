@@ -57,6 +57,30 @@ static void LoadLodBias() {
         WriteLog(text);
     }
 }
+// The panel's sampler counts, also logged (at most every 10 s, when they change), so the
+// result can be read from ReShade.log.
+static void LogLodBiasStats() {
+    if (rrlodbias::mode == rrlodbias::Off)
+        return;
+    static ULONGLONG last{};
+    static unsigned logged_total{};
+    const auto &s = rrlodbias::stats;
+    const unsigned total = s.heap_seen + s.static_seen;
+    const ULONGLONG now = GetTickCount64();
+    if (total == logged_total || now - last < 10000)
+        return;
+    last = now;
+    logged_total = total;
+    char text[192];
+    snprintf(text, sizeof(text),
+             "LOD bias test (%s): %u of %u samplers, %u of %u static changed; game's bias "
+             "%.2f to %.2f",
+             rrlodbias::labels[rrlodbias::Valid(rrlodbias::mode)], s.heap_changed.load(),
+             s.heap_seen.load(), s.static_changed.load(), s.static_seen.load(),
+             s.min_bias <= s.max_bias ? s.min_bias / 100.0f : 0.0f,
+             s.min_bias <= s.max_bias ? s.max_bias / 100.0f : 0.0f);
+    WriteLog(text);
+}
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
     // Before RR can be enabled: RR takes its depth type when it is created. A change restarts
@@ -153,6 +177,7 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
             SaveToggles();
         }
     }
+    LogLodBiasStats();
     SparsePool().Poll();
     LiveRR().Poll();
     // Idle windows are reported a few times so a missing blur dispatch is visible.
