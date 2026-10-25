@@ -16,63 +16,37 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: claude/sss-noise-fixes
-          submodules: recursive
 
-      - name: Setup MSVC Developer Command Prompt (x64)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Inspect and Build Project
+      - name: Download NGX Headers, DXC 1.8.2505.1, and Build
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          Write-Host "=== Files in repository ==="
-          Get-ChildItem -Path . -Recurse -File | Where-Object { $_.FullName -notmatch "\\\.git\\" } | Select-Object -ExpandProperty FullName
+          Write-Host "1. Cloning NVIDIA DLSS/NGX SDK headers..."
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git external_ngx
+          $ngxHeader = Get-ChildItem -Path external_ngx -Filter nvsdk_ngx.h -Recurse | Select-Object -First 1
+          if (-not $ngxHeader) { throw "nvsdk_ngx.h not found!" }
+          $ngxInc = $ngxHeader.DirectoryName
+          Write-Host "Found NGX include directory: $ngxInc"
 
-          $cmake = Get-ChildItem -Path . -Filter CMakeLists.txt -Recurse | Where-Object { $_.FullName -notmatch "\\\.git\\" } | Select-Object -First 1
-          $sln = Get-ChildItem -Path . -Filter *.sln -Recurse | Select-Object -First 1
-          $vcxproj = Get-ChildItem -Path . -Filter *.vcxproj -Recurse | Select-Object -First 1
-          $bat = Get-ChildItem -Path . -Include *build*.bat, *compile*.bat, *make*.bat -Recurse | Select-Object -First 1
-          $ps1 = Get-ChildItem -Path . -Include *build*.ps1, *compile*.ps1 -Recurse | Select-Object -First 1
+          Write-Host "2. Downloading Microsoft DirectXShaderCompiler v1.8.2505.1..."
+          New-Item -ItemType Directory -Force -Path external_dxc | Out-Null
+          gh release download v1.8.2505.1 --repo microsoft/DirectXShaderCompiler --pattern "dxc_*.zip" -D external_dxc
+          $dxcZip = Get-ChildItem -Path external_dxc -Filter *.zip | Select-Object -First 1
+          Expand-Archive -Path $dxcZip.FullName -DestinationPath external_dxc\extracted -Force
+          $dxcExe = Get-ChildItem -Path external_dxc\extracted -Filter dxc.exe -Recurse | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          if (-not $dxcExe) { throw "dxc.exe (x64) not found!" }
+          $dxcBin = $dxcExe.DirectoryName
+          Write-Host "Found DXC bin\x64 directory: $dxcBin"
 
-          if ($cmake) {
-            Write-Host "Found CMakeLists.txt at: $($cmake.DirectoryName)"
-            cmake -S $cmake.DirectoryName -B build -A x64
-            cmake --build build --config Release
-          } elseif ($sln) {
-            Write-Host "Found Solution: $($sln.FullName)"
-            msbuild $sln.FullName /m /p:Configuration=Release /p:Platform=x64
-          } elseif ($vcxproj) {
-            Write-Host "Found vcxproj: $($vcxproj.FullName)"
-            msbuild $vcxproj.FullName /m /p:Configuration=Release /p:Platform=x64
-          } elseif ($bat) {
-            Write-Host "Found batch build script: $($bat.FullName)"
-            Push-Location $bat.DirectoryName
-            cmd /c $bat.Name
-            Pop-Location
-          } elseif ($ps1) {
-            Write-Host "Found PowerShell build script: $($ps1.FullName)"
-            Push-Location $ps1.DirectoryName
-            & $ps1.FullName
-            Pop-Location
-          } else {
-            Write-Error "Custom structure detected — check the file list printed above!"
-            exit 1
-          }
-
-      - name: Collect Compiled Files
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path artifact_out | Out-Null
-          Get-ChildItem -Path . -Include *.addon64, *.addon, *.dll -Recurse |
-            Where-Object { $_.FullName -notmatch "\\\.git\\" -and $_.FullName -notmatch "\\artifact_out\\" } |
-            ForEach-Object {
-              Copy-Item $_.FullName -Destination "artifact_out\" -Force
-            }
-          Get-ChildItem -Path artifact_out
+          Write-Host "3. Running build.cmd..."
+          & .\build.cmd "$ngxInc" "$dxcBin"
+          if ($LASTEXITCODE -ne 0) { throw "build.cmd failed with exit code $LASTEXITCODE" }
 
       - name: Upload Compiled Files
         uses: actions/upload-artifact@v4
         with:
-          name: MW4-RR-compiled-files
-          path: artifact_out/*
+          name: MW4-RR-sss-noise-fixes
+          path: |
+            build/mw4-rr.addon64
+            build/mw4-rr-dxcompiler.dll
