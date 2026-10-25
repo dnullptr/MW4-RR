@@ -13,14 +13,17 @@
 #include "../build/rr_convert_guides_test8.generated.h"
 #include "../build/rr_convert_guides_test9.generated.h"
 #include "../build/rr_sky_depth_floor.generated.h"
+#include "../build/rr_weapon_depth.generated.h"
 #include "../build/rr_color_scale.generated.h"
 #include "rr_guide_test.h"
+#include "rr_weapon_depth.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
 #include "../build/rr_live_display.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
 #include "../build/rr_sky_edge_mask.generated.h"
 #include "../build/rr_hit_condition.generated.h"
+#include "../build/rr_water_masks.generated.h"
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
 #include "rr_transparency_guide.h"
@@ -29,6 +32,7 @@
 #include "rr_specular_distance.h"
 #include "rr_hit_condition.h"
 #include "rr_ray_density.h"
+#include "rr_water.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -117,8 +121,9 @@ struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, sky_edge_root,
-        test_root, hit_root;
-    ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale;
+        test_root, water_root, hit_root;
+    ComPtr<ID3D12PipelineState> converter, probability, sky_edge, depth_floor, color_scale,
+        water, weapon_depth;
     // Hit distance conditioning for R32_UINT and R32_FLOAT lighting weights.
     std::array<ComPtr<ID3D12PipelineState>, 2> hit_condition;
     // Guide test variants, indexed by rrguidetest::Mode - 1.
@@ -131,14 +136,20 @@ struct Pipelines {
         stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, 0}};
-        D3D12_ROOT_PARAMETER p[4]{};
+        // u4 water classification (heap WaterSlot) and b2 water guide mode.
+        D3D12_DESCRIPTOR_RANGE water_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 4, 0, 0};
+        D3D12_ROOT_PARAMETER p[6]{};
         for (unsigned i = 0; i < 2; ++i) {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             p[i].DescriptorTable = {1, &ranges[i]};
             p[i + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             p[i + 2].Descriptor.ShaderRegister = i;
         }
-        D3D12_ROOT_SIGNATURE_DESC rd{4, p};
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[4].DescriptorTable = {1, &water_range};
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[5].Constants = {2, 0, 4};
+        D3D12_ROOT_SIGNATURE_DESC rd{6, p};
         Root(rd, converter_root);
         Pipeline(converter_root.Get(), RRGuideShader, sizeof(RRGuideShader), converter);
         Pipeline(converter_root.Get(), RRGuideShaderTest1, sizeof(RRGuideShaderTest1),
@@ -187,12 +198,13 @@ struct Pipelines {
         rd = {3, e};
         Root(rd, sky_edge_root);
         Pipeline(sky_edge_root.Get(), RRSkyEdgeMask, sizeof(RRSkyEdgeMask), sky_edge);
-        // Color scale and sky depth floor tests: source SRV table, target UAV
-        // table, 8 root constants.
+        // Color scale, sky depth floor and weapon depth tests: source SRV table,
+        // target UAV table, 8 root constants.
         e[2].Constants = {0, 0, 8};
         Root(rd, test_root);
         Pipeline(test_root.Get(), RRColorScale, sizeof(RRColorScale), color_scale);
         Pipeline(test_root.Get(), RRSkyDepthFloor, sizeof(RRSkyDepthFloor), depth_floor);
+        Pipeline(test_root.Get(), RRWeaponDepth, sizeof(RRWeaponDepth), weapon_depth);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
@@ -240,6 +252,23 @@ struct Pipelines {
         Pipeline(hit_root.Get(), RRHitCondition, sizeof(RRHitCondition), hit_condition[0]);
         Pipeline(hit_root.Get(), RRHitConditionFloat, sizeof(RRHitConditionFloat),
                  hit_condition[1]);
+    }
+    void WaterPipeline() {
+        if (water)
+            return;
+        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
+        D3D12_ROOT_PARAMETER p[4]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        for (unsigned i = 0; i < 2; ++i) {
+            p[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p[i + 1].DescriptorTable = {1, &ranges[i]};
+        }
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[3].Descriptor.ShaderRegister = 2;
+        D3D12_ROOT_SIGNATURE_DESC desc{4, p};
+        Root(desc, water_root);
+        Pipeline(water_root.Get(), RRWaterMasks, sizeof(RRWaterMasks), water);
     }
     void Pipeline(ID3D12RootSignature *r, const void *code, size_t bytes,
                   ComPtr<ID3D12PipelineState> &p) {
@@ -309,20 +338,35 @@ struct GpuFrame {
     // hit distance test is on; hit_source and hit_weights (the lighting weights
     // the conditioning read) are retained until that recording retires.
     ComPtr<ID3D12Resource> specular_hit, hit_source, hit_weights;
-    // Heap slots for the development tests (TestPass): the depth floor's source,
-    // then one target per test, so tests in the same frame never share one.
+    // Heap slots for the development tests (TestPass): the source of the depth
+    // tests, then one target per test, so tests in the same frame never share one.
     static constexpr UINT DepthSource = 12, SkyEdgeTarget = 13, ColorTarget = 14,
                           DepthTarget = 15;
+    // The guide shader's u4 water classification (WaterTarget).
+    static constexpr UINT WaterSlot = 16;
+    // The weapon depth test's target, after the water slot.
+    static constexpr UINT WeaponTarget = 17;
     // Hit distance conditioning: five sources (ConditionDistance), then its target.
-    static constexpr UINT HitSources = 16, HitTarget = 21, HeapSize = 22;
+    static constexpr UINT HitSources = 18, HitTarget = 23, HeapSize = 24;
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
+    // Water guide mode Convert used for this frame (rrwater::Guide).
+    unsigned water_guide{};
+    // Water tests (rr_water.h), allocated only once a test wants them: the
+    // guide shader's classification and the masks rr_water_masks.hlsl writes.
+    // bytes is their own optional term in the pool reservations, like SSS.
+    struct Water {
+        ComPtr<ID3D12Resource> mask, responsivity, disocclusion;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        UINT64 bytes{};
+        bool ready{};
+    } water;
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
-    bool use_depth{}, hit_ready{};
+    bool use_depth{}, hit_ready{}, water_written{};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
@@ -416,6 +460,75 @@ struct GpuFrame {
         stats = Allocate(p, b, bd);
         readback = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
     }
+    // Water test storage for a w x h guide: the classification and two masks.
+    static UINT64 WaterBytes(ID3D12Device *device, UINT w, UINT h) {
+        if (!device)
+            return 0;
+        const D3D12_RESOURCE_DESC descs[] = {TextureDesc(w, h, DXGI_FORMAT_R8_UNORM),
+                                             TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT),
+                                             TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)};
+        UINT64 total{};
+        for (const auto &d : descs) {
+            const auto n = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
+                return 0;
+            total += n;
+        }
+        return total;
+    }
+    // Optional water storage, after Prepare. The caller reserves the pool-wide
+    // budget first; this rechecks this frame's share and returns false on a
+    // shortage, or throws AllocationDeferred under GPU memory pressure. The
+    // controller then keeps the water tests waiting and retries later.
+    bool PrepareWater(Pipelines &p, Budget &b) {
+        if (water.ready)
+            return true;
+        const auto mask = TextureDesc(w, h, DXGI_FORMAT_R8_UNORM),
+                   value = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        UINT64 need{};
+        auto add = [&](const ComPtr<ID3D12Resource> &r, const D3D12_RESOURCE_DESC &d) {
+            if (r)
+                return true;
+            const auto n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || need > UINT64_MAX - n)
+                return false;
+            need += n;
+            return true;
+        };
+        if (!add(water.mask, mask) || !add(water.responsivity, value) ||
+            !add(water.disocclusion, value) || need > UINT64_MAX - b.bytes ||
+            !b.Reserve(p.device.Get(), b.bytes + need))
+            return false;
+        p.WaterPipeline();
+        auto take = [&](ComPtr<ID3D12Resource> &r, const D3D12_RESOURCE_DESC &d) {
+            if (r)
+                return;
+            r = Allocate(p, b, d);
+            water.bytes += p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        };
+        take(water.mask, mask);
+        take(water.responsivity, value);
+        take(water.disocclusion, value);
+        if (!water.heap) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+            rrprivate::CheckAllocation(
+                p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&water.heap)),
+                "water descriptor heap failed");
+        }
+        water.ready = true;
+        return true;
+    }
+    // The guide shader's u4 (heap WaterSlot): the classification, or a null view that
+    // drops its writes when no water test wants it this frame.
+    void WaterTarget(Pipelines &p, bool wanted) {
+        water_written = wanted && water.ready;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.Format = DXGI_FORMAT_R8_UNORM;
+        v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(water_written ? water.mask.Get() : nullptr, nullptr,
+                                            &v, Cpu(p, WaterSlot));
+    }
 
     // Copy-only: records no shader state. Caller proves the native dispatch,
     // its bindings and the recording; this checks extent, format and state.
@@ -489,13 +602,17 @@ struct GpuFrame {
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COMMON);
     }
-    void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p) {
+    // guide: rrwater::Guide for water pixels.
+    void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p, unsigned guide = 0) {
         Order(cl);
         for (unsigned i = 2; i < 4; ++i)
             Change(cl, sources[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for (auto &r : guides)
             Change(cl, r.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (water_written)
+            Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetComputeRootSignature(p.converter_root.Get());
@@ -508,9 +625,16 @@ struct GpuFrame {
         for (unsigned i = 0; i < 2; ++i)
             cl->SetComputeRootConstantBufferView(2 + i,
                                                  constants[i]->GetGPUVirtualAddress() + offsets[i]);
+        cl->SetComputeRootDescriptorTable(4, Gpu(p, WaterSlot));
+        water_guide = rrwater::ValidGuide(guide);
+        const UINT water_constants[4] = {water_guide, 0, 0, 0};
+        cl->SetComputeRoot32BitConstants(5, 4, water_constants, 0);
         cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         for (auto &r : guides)
             Change(cl, r.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        if (water_written)
+            Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COMMON);
         for (unsigned i = 2; i < 4; ++i)
             Change(cl, sources[i].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -730,6 +854,17 @@ struct GpuFrame {
         TestPass(cl, p, p.test_root.Get(), p.depth_floor.Get(), DepthSource, floored, DepthTarget,
                  c, 8);
     }
+    // RR's depth (the private copy, or the game's R32_FLOAT depth) as linear view depth
+    // (R32_FLOAT, w x h), read from the depth subrect at (x, y); see rrweapondepth::Map.
+    void WeaponDepth(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *linear, UINT x,
+                     UINT y, const rrweapondepth::Mapping &m) {
+        SRV(p, use_depth ? depth.Get() : sr[1].Get(), DepthSource);
+        UINT c[8] = {w, h, x, y};
+        const float f[] = {m.scale, m.offset, m.sky, rrweapondepth::Knee};
+        memcpy(&c[4], f, sizeof(f));
+        TestPass(cl, p, p.test_root.Get(), p.weapon_depth.Get(), DepthSource, linear,
+                 WeaponTarget, c, 8);
+    }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {
         if (inference_ok) {
@@ -755,6 +890,73 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 256);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    // SR time, after the SSS resolve. Reads this frame's classification and,
+    // when merged, the SSS responsivity mask (left NON_PIXEL_SHADER_RESOURCE by
+    // that resolve); leaves both masks readable for RR until WaterFinish.
+    void WaterPass(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *sss_mask) {
+        Require(water.ready && water_written && p.water, "water masks unavailable");
+        auto cpu = water.heap->GetCPUDescriptorHandleForHeapStart();
+        const auto gpu = water.heap->GetGPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        p.device->CreateShaderResourceView(water.mask.Get(), &srv, cpu);
+        srv.Format = DXGI_FORMAT_R16_FLOAT;
+        p.device->CreateShaderResourceView(sss_mask, &srv, {cpu.ptr + p.stride});
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R16_FLOAT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(water.responsivity.Get(), nullptr, &uav,
+                                            {cpu.ptr + 2 * p.stride});
+        p.device->CreateUnorderedAccessView(water.disocclusion.Get(), nullptr, &uav,
+                                            {cpu.ptr + 3 * p.stride});
+        Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for (auto *r : {water.responsivity.Get(), water.disocclusion.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Zero the water pixel count (stats byte 16) from the header's never-written tail.
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(stats.Get(), 16, header.Get(), 64, 4);
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {water.heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.water_root.Get());
+        cl->SetPipelineState(p.water.Get());
+        cl->SetComputeRootConstantBufferView(0, header->GetGPUVirtualAddress());
+        cl->SetComputeRootDescriptorTable(1, gpu);
+        cl->SetComputeRootDescriptorTable(2, {gpu.ptr + 2 * p.stride});
+        cl->SetComputeRootUnorderedAccessView(3, stats->GetGPUVirtualAddress());
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        for (auto *r : {water.responsivity.Get(), water.disocclusion.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void WaterFinish(ID3D12GraphicsCommandList *cl) {
+        for (auto *r : {water.mask.Get(), water.responsivity.Get(), water.disocclusion.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COMMON);
+    }
+    // Header words 14-15 for rr_water_masks.hlsl; Header() clears them each frame.
+    void WaterHeader(float strength, UINT flags) {
+        memcpy(&header_map[14], &strength, sizeof(strength));
+        header_map[15] = flags;
+    }
+    // Water pixels counted by the latest WaterPass on this frame.
+    UINT ReadWaterPixels() {
+        UINT v{};
+        void *m{};
+        D3D12_RANGE r{16, 20};
+        Check(readback->Map(0, &r, &m), "live water statistics map failed");
+        memcpy(&v, static_cast<const char *>(m) + 16, sizeof(v));
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
     }
     // tolerate: count isolated unusable guide pixels instead of rejecting the frame.
     // responsivity: value the SSS resolve writes to the responsivity mask on SSS pixels.
@@ -819,6 +1021,7 @@ struct GpuFrame {
         hit_source.Reset();
         hit_weights.Reset();
         hit_ready = false;
+        water_written = false;
     }
     void Release(Budget &b) {
         if (header_map)

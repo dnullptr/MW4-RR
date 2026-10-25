@@ -12,6 +12,21 @@
 #else
 #define RR_RESPONSIVITY_MASK_KEY "DLSSD.ResponsivityMask"
 #endif
+// Optional masks used by the running water tests (rr_water.h).
+#ifdef NVSDK_NGX_Parameter_DLSS_DisocclusionMask
+#define RR_DISOCCLUSION_MASK_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask
+#define RR_DISOCCLUSION_MASK_X_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_X
+#define RR_DISOCCLUSION_MASK_Y_KEY NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_Y
+#else
+#define RR_DISOCCLUSION_MASK_KEY "DLSS.DisocclusionMask"
+#define RR_DISOCCLUSION_MASK_X_KEY "DLSS.DisocclusionMask.Subrect.Base.X"
+#define RR_DISOCCLUSION_MASK_Y_KEY "DLSS.DisocclusionMask.Subrect.Base.Y"
+#endif
+#ifdef NVSDK_NGX_Parameter_AnimatedTextureMask
+#define RR_ANIMATED_TEXTURE_MASK_KEY NVSDK_NGX_Parameter_AnimatedTextureMask
+#else
+#define RR_ANIMATED_TEXTURE_MASK_KEY "AnimatedTextureMask"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -46,7 +61,11 @@ inline bool Valid(const Options &v) {
            v.exposure_scale > 0;
 }
 
-inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6) {
+// linear_depth: RR reads view-space depth (the weapon depth test, src/rr_weapon_depth.h)
+// instead of the game's hardware depth. Nearer is then smaller, so the game's inverted-depth
+// flag is cleared for RR.
+inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6,
+                             bool linear_depth = false) {
     rrpreset::Set(p, preset);
     p.Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     p.Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
@@ -55,11 +74,13 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_OutWidth, v.out_width);
     p.Set(NVSDK_NGX_Parameter_OutHeight, v.out_height);
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
-    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, v.flags);
+    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
+          linear_depth ? v.flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : v.flags);
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));
-    p.Set(NVSDK_NGX_Parameter_Use_HW_Depth, unsigned(NVSDK_NGX_DLSS_Depth_Type_HW));
+    p.Set(NVSDK_NGX_Parameter_Use_HW_Depth, unsigned(linear_depth ? NVSDK_NGX_DLSS_Depth_Type_Linear
+                                                                 : NVSDK_NGX_DLSS_Depth_Type_HW));
 }
 struct Resources {
     ID3D12Resource *color{};
@@ -73,6 +94,8 @@ struct Resources {
     ID3D12Resource *before_transparency{};
     ID3D12Resource *responsivity{};
     ID3D12Resource *specular_hit{};
+    ID3D12Resource *disocclusion{};
+    ID3D12Resource *animated{};
 };
 inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const Resources &r,
                                float *world_to_view, float *view_to_clip) {
@@ -99,6 +122,10 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_Y, 0u);
 #endif
+    p.Set(RR_DISOCCLUSION_MASK_KEY, r.disocclusion);
+    p.Set(RR_DISOCCLUSION_MASK_X_KEY, 0u);
+    p.Set(RR_DISOCCLUSION_MASK_Y_KEY, 0u);
+    p.Set(RR_ANIMATED_TEXTURE_MASK_KEY, r.animated);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, v.jitter_x);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, v.jitter_y);
     p.Set(NVSDK_NGX_Parameter_Reset, 1);

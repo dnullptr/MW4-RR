@@ -3,8 +3,10 @@
 #include "rr_lighting_source.h"
 #include "rr_sss_mask.h"
 #include "rr_responsivity.h"
+#include "rr_water.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
+#include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_hit_condition.h"
@@ -201,6 +203,31 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
+    bool weapon_depth = rrweapondepth::enabled;
+    if (ImGui::Checkbox("Weapon depth test: give the weapon its own depth", &weapon_depth)) {
+        rrweapondepth::enabled = weapon_depth;
+        ++rrweapondepth::changes;
+    }
+    using WeaponState = rrlive::Controller::WeaponState;
+    const auto weapon = LiveRR().WeaponDepthState();
+    ImGui::Text("Weapon depth: %s",
+                weapon == WeaponState::Active       ? "active (RR uses linear depth)"
+                : weapon == WeaponState::Off        ? "off"
+                : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
+                : weapon == WeaponState::NoMemory
+                    ? "off: not enough GPU memory (turn it off and on to retry)"
+                : weapon == WeaponState::Unsupported
+                    ? "off: the game's projection is not supported (turn it off and on to retry)"
+                : weapon == WeaponState::Refused
+                    ? "off: RR did not accept linear depth (turn it off and on to retry)"
+                : !rr_running ? "waiting for RR"
+                              : "waiting");
+    ImGui::TextWrapped("Session-only test. The game draws the weapon and hands with their own "
+                       "camera, so RR normally sees them as one flat card. On, RR gets linear "
+                       "depth in which the weapon keeps its own depth steps, still in front of "
+                       "everything else; the rest of the scene keeps the same distances, with "
+                       "the sky very far instead of infinitely far. Turning it on or off "
+                       "restarts RR, like a preset change.");
     bool sky_edge = rrskyedge::enabled;
     if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
         rrskyedge::enabled = sky_edge;
@@ -230,7 +257,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                                             : "waiting (needs preset F)");
     ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
                        "steadier over time; moving branches may ghost. While on, it replaces the "
-                       "SSS responsivity mask.");
+                       "SSS and water responsivity masks.");
     int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
     if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
                      rrcolorscale::Count)) {
@@ -307,6 +334,60 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                              : "waiting (needs preset F and the SSS guide)");
     ImGui::TextWrapped("Tells RR to hold SSS pixels steadier over time: less boiling, but moving "
                        "SSS surfaces may ghost. Supported on RR preset F only.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Running water experiments (this session only)");
+    // Session-only: not saved, so a test mode never sticks across restarts.
+    static rrwater::Settings water;
+    bool water_changed = ImGui::Checkbox("Water: responsivity mask", &water.responsivity);
+    water_changed |=
+        ImGui::SliderFloat("Water mask strength", &water.strength, 0.0f, 1.0f, "%.2f");
+    water_changed |= ImGui::Checkbox("Water: discard RR history", &water.discard);
+    water_changed |= ImGui::Checkbox("Water: animated texture mask", &water.animated);
+    int water_guide = static_cast<int>(rrwater::ValidGuide(water.guide));
+    if (ImGui::Combo("Water guides", &water_guide, rrwater::guide_labels, rrwater::GuideCount)) {
+        water.guide = static_cast<unsigned>(water_guide);
+        water_changed = true;
+    }
+    if (water_changed)
+        LiveRR().SetWater(water);
+    const auto water_status = LiveRR().WaterStatus();
+    if (!water_status.wanted)
+        ImGui::TextUnformatted("Water tests: off");
+    else if (water_status.unavailable)
+        ImGui::TextUnformatted("Water tests: unavailable this session (see ReShade.log)");
+    else if (water_status.waiting_memory)
+        ImGui::TextUnformatted("Water tests: waiting for GPU memory (retrying)");
+    else if (!water_status.ready)
+        ImGui::TextUnformatted("Water tests: waiting for RR frames");
+    else {
+        if (water_status.coverage >= 0)
+            ImGui::Text("Water in the latest frame: %.1f%% of pixels",
+                        100.0f * water_status.coverage);
+        else
+            ImGui::TextUnformatted("Water in the latest frame: measuring");
+        if (water.responsivity)
+            ImGui::Text("Water responsivity mask: %s",
+                        water_status.responsivity               ? "active"
+                        : sky_edge && edge == TestState::Active ? "replaced by sky edge mask"
+                        : rrwater::Clamp(water.strength) == 0   ? "off (strength 0)"
+                                                                : "waiting (needs preset F)");
+        if (water.discard)
+            ImGui::Text("Water history discard: %s", water_status.discard ? "active" : "waiting");
+        if (water.animated)
+            ImGui::Text("Water animated texture mask: %s",
+                        water_status.animated ? "active" : "waiting");
+    }
+    ImGui::TextWrapped(
+        "Water pixels are the ones the game's prepass marks as water. Responsivity tells RR to "
+        "lean on the current frame there (preset F only); with the SSS responsivity mask also "
+        "on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, as "
+        "RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
+        "noisier water. The animated texture mask is an RR input NVIDIA does not document; it "
+        "is here to see whether it changes anything. Water guides changes the normal and albedo "
+        "guides on water only: the game mirror is what RR gets today, smoothed normal averages "
+        "the wave normal over 7x7 pixels, water material uses the game's own reflectance and "
+        "diffuse arrays, and physical uses water's 0.02 reflectance with a smoothed normal. "
+        "Water coverage and these settings are logged to ReShade.log every 10 seconds.");
     ImGui::Separator();
     if (changed) {
         ApplyEnabled();
