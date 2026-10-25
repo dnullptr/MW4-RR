@@ -514,10 +514,13 @@ struct GpuFrame {
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
     // tolerate: count isolated unusable guide pixels instead of rejecting the frame.
+    // responsivity: value the SSS resolve writes to the responsivity mask on SSS pixels.
     void Header(UINT serial, bool reset, bool replacement = false, UINT color_x = 0,
-                UINT color_y = 0, bool tolerate = false) {
+                UINT color_y = 0, bool tolerate = false, float responsivity = 0) {
+        UINT strength{};
+        memcpy(&strength, &responsivity, sizeof(strength));
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
-                    color_x, color_y, tolerate ? 1u : 0u};
+                    color_x, color_y, tolerate ? 1u : 0u, strength, 0, 0, 0};
         memcpy(header_map, c, sizeof(c));
     }
     void Accept(bool yes) {

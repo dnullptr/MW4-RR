@@ -2,6 +2,7 @@
 #include "rr_live_gpu.h"
 #include "rr_live_policy.h"
 #include "rr_guide_health.h"
+#include "rr_responsivity.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -81,6 +82,8 @@ class Controller {
     HistoryPolicy policy;
     rrhealth::Tracker health;
     bool tolerate_isolated = true;
+    bool responsivity_enabled{}, responsivity_active{};
+    float responsivity_strength = rrresponsivity::DefaultStrength;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
@@ -303,6 +306,17 @@ class Controller {
     void SetTolerateIsolated(bool value) {
         std::lock_guard lock(mutex);
         tolerate_isolated = value;
+    }
+    // Optional RR responsivity mask on SSS pixels; strength is clamped to -1..0.
+    void SetResponsivity(bool enabled, float strength) {
+        std::lock_guard lock(mutex);
+        responsivity_enabled = enabled;
+        responsivity_strength = rrresponsivity::Clamp(strength);
+    }
+    // Whether the latest evaluation sent the mask.
+    bool ResponsivityActive() {
+        std::lock_guard lock(mutex);
+        return responsivity_active;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -1045,7 +1059,8 @@ class Controller {
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
             if (reset)
                 health.Reset(policy.LastReason());
-            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y, tolerate_isolated);
+            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y, tolerate_isolated,
+                          responsivity_enabled ? responsivity_strength : 0.0f);
             rrinternal::Scope copy_guard;
             rrcompute::Tracker::Internal state_guard;
             s->recorded = true;
@@ -1067,6 +1082,10 @@ class Controller {
                 Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
                 preset.Created();
             }
+            // Written by the SSS resolve below; null keeps RR's default responsiveness.
+            responsivity_active =
+                rrresponsivity::Use(responsivity_enabled, responsivity_strength, s->sss_used,
+                                    preset.has_effective, preset.effective);
             rreval::Resources resources{s->gpu.sr[0].Get(),
                                         s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
@@ -1076,7 +1095,8 @@ class Controller {
                                         s->gpu.guides[2].Get(),
                                         s->sss_used ? s->gpu.sss.guide.Get() : nullptr,
                                         s->transparency_used ? s->gpu.transparency.guide.Get()
-                                                             : nullptr};
+                                                             : nullptr,
+                                        responsivity_active ? s->gpu.sss.mask.Get() : nullptr};
             rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
                                        s->projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);

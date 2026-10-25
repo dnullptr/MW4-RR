@@ -5,12 +5,16 @@
 #include "../src/rr_live_policy.h"
 #include "../src/rr_guide_health.h"
 #include "../src/rr_lighting_source.h"
+#include "../src/rr_responsivity.h"
 #include <cassert>
+#include <limits>
 #include <string_view>
 
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
+static_assert(!defaults.responsivity &&
+              defaults.responsivity_strength == rrresponsivity::DefaultStrength);
 // Stored values 0..2 keep their meaning; unknown values read as raw lighting.
 static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
@@ -53,6 +57,18 @@ int main() {
     assert(policy.Next(6, 1, false) && policy.LastReason() == rrlive::HistoryPolicy::Gap);
     policy.Reject();
     assert(policy.Next(7, 1, false) && policy.LastReason() == rrlive::HistoryPolicy::Rejected);
+
+    // The responsivity mask is sent only on preset F with a written SSS guide.
+    assert(rrresponsivity::Use(true, -0.5f, true, true, 6));
+    assert(!rrresponsivity::Use(false, -0.5f, true, true, 6));
+    assert(!rrresponsivity::Use(true, 0.0f, true, true, 6));
+    assert(!rrresponsivity::Use(true, 0.5f, true, true, 6)); // clamps to 0
+    assert(!rrresponsivity::Use(true, -0.5f, false, true, 6));
+    assert(!rrresponsivity::Use(true, -0.5f, true, false, 6));
+    for (unsigned preset : {0u, 4u, 5u})
+        assert(!rrresponsivity::Use(true, -0.5f, true, true, preset));
+    assert(rrresponsivity::Clamp(-2.0f) == -1.0f && rrresponsivity::Clamp(-0.25f) == -0.25f);
+    assert(rrresponsivity::Clamp(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
 
     // Health reports once per interval, only with activity, then starts over.
     rrhealth::Tracker health;

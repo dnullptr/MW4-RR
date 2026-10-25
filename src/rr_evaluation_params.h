@@ -6,6 +6,12 @@
 #include <climits>
 #include "rr_resolution_limits.h"
 #include "rr_presets.h"
+// Older local NGX headers may predate the RR responsivity mask key.
+#ifdef NVSDK_NGX_Parameter_DLSSD_ResponsivityMask
+#define RR_RESPONSIVITY_MASK_KEY NVSDK_NGX_Parameter_DLSSD_ResponsivityMask
+#else
+#define RR_RESPONSIVITY_MASK_KEY "DLSSD.ResponsivityMask"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -65,6 +71,7 @@ struct Resources {
     ID3D12Resource *specular{};
     ID3D12Resource *sss{};
     ID3D12Resource *before_transparency{};
+    ID3D12Resource *responsivity{};
 };
 inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const Resources &r,
                                float *world_to_view, float *view_to_clip) {
@@ -86,6 +93,11 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency, r.before_transparency);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency_Subrect_Base_Y, 0u);
+    p.Set(RR_RESPONSIVITY_MASK_KEY, r.responsivity);
+#ifdef NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X
+    p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X, 0u);
+    p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_Y, 0u);
+#endif
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, v.jitter_x);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, v.jitter_y);
     p.Set(NVSDK_NGX_Parameter_Reset, 1);

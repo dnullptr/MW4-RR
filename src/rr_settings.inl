@@ -1,6 +1,7 @@
 #pragma once
 #include "rr_settings_model.h"
 #include "rr_lighting_source.h"
+#include "rr_responsivity.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -10,6 +11,8 @@ static bool &requested_sss = preferences.sss;
 static bool &requested_glass = preferences.glass;
 static bool &requested_tolerate = preferences.tolerate_isolated;
 static unsigned &requested_lobe = preferences.native_lobe;
+static bool &requested_responsivity = preferences.responsivity;
+static float &requested_strength = preferences.responsivity_strength;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -18,6 +21,9 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
                               requested_tolerate);
     reshade::set_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
+    reshade::set_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);
+    reshade::set_config_value(nullptr, SettingsSection, "ResponsivityStrength",
+                              requested_strength);
 }
 static void ApplyEnabled() {
     config_allowed = VrsConfigAllowsRR();
@@ -28,6 +34,8 @@ static void ApplyEnabled() {
     LiveRR().SetTolerateIsolated(requested_tolerate);
     requested_lobe = rrlighting::Valid(requested_lobe);
     rrbypass::lobe_source = requested_lobe;
+    requested_strength = rrresponsivity::Clamp(requested_strength);
+    LiveRR().SetResponsivity(requested_responsivity, requested_strength);
 }
 static void LoadSettings() {
     if (settings_loaded)
@@ -40,6 +48,9 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
                               requested_tolerate);
     reshade::get_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
+    reshade::get_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);
+    reshade::get_config_value(nullptr, SettingsSection, "ResponsivityStrength",
+                              requested_strength);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -106,6 +117,18 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "whole frame (lobe 2 behaves as diffuse): clean but soft. Fill gaps keeps "
                        "each fresh ray sample unboosted and uses native accumulation only where no "
                        "ray landed this frame.");
+    changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
+    if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
+        LiveRR().SetResponsivity(requested_responsivity, requested_strength);
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        changed = true;
+    ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive()      ? "active"
+                                         : !requested_responsivity            ? "off"
+                                         : rrresponsivity::Clamp(requested_strength) == 0
+                                             ? "off (strength 0)"
+                                             : "waiting (needs preset F and the SSS guide)");
+    ImGui::TextWrapped("Tells RR to hold SSS pixels steadier over time: less boiling, but moving "
+                       "SSS surfaces may ghost. Supported on RR preset F only.");
     ImGui::Separator();
     if (changed) {
         ApplyEnabled();

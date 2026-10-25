@@ -17,13 +17,16 @@ struct ResolvePipeline {
     template <class Pipelines> void Prepare(Pipelines &p) {
         if (pipeline)
             return;
-        D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
-                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
+        // Table 2 holds u0 (guide) and u3 (responsivity mask) in consecutive descriptors.
+        D3D12_DESCRIPTOR_RANGE srvs[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}};
+        D3D12_DESCRIPTOR_RANGE uavs[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0},
+                                         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 3, 0, 1}};
         D3D12_ROOT_PARAMETER args[5]{};
         args[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        args[1].ParameterType = args[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        args[1].DescriptorTable = {1, srvs};
+        args[2].DescriptorTable = {2, uavs};
         for (unsigned i = 0; i < 2; ++i) {
-            args[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            args[1 + i].DescriptorTable = {1, &ranges[i]};
             args[3 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             args[3 + i].Descriptor.ShaderRegister = 1 + i;
         }
@@ -33,7 +36,7 @@ struct ResolvePipeline {
     }
 };
 struct Gpu {
-    ComPtr<ID3D12Resource> target, guide;
+    ComPtr<ID3D12Resource> target, guide, mask;
     ComPtr<ID3D12DescriptorHeap> rtv, heap;
     UINT stride{}, width{}, height{};
     UINT64 bytes{};
@@ -82,7 +85,8 @@ struct Gpu {
                                 DXGI_SAMPLE_DESC sample_desc = {4, 0}) {
         if (!device || !Layout{w, h}.Valid() || !SupportedSamples(sample_desc))
             return UINT64_MAX;
-        const D3D12_RESOURCE_DESC descriptions[] = {TargetDesc(w, h, sample_desc), GuideDesc(w, h)};
+        const D3D12_RESOURCE_DESC descriptions[] = {TargetDesc(w, h, sample_desc), GuideDesc(w, h),
+                                                    GuideDesc(w, h)};
         UINT64 total = 0;
         for (const auto &d : descriptions) {
             const auto n = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
@@ -131,6 +135,10 @@ struct Gpu {
             guide = frame.Allocate(p, budget, desc);
             bytes += p.device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
         }
+        if (!mask) {
+            mask = frame.Allocate(p, budget, desc);
+            bytes += p.device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        }
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
         if (!rtv)
             rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv)),
@@ -140,7 +148,7 @@ struct Gpu {
         view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
         p.device->CreateRenderTargetView(target.Get(), &view,
                                          rtv->GetCPUDescriptorHandleForHeapStart());
-        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         if (!heap)
             rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
                   "SSS resolve heap allocation failed");
@@ -155,6 +163,7 @@ struct Gpu {
         uav.Format = DXGI_FORMAT_R16_FLOAT;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         p.device->CreateUnorderedAccessView(guide.Get(), nullptr, &uav, {cpu.ptr + stride});
+        p.device->CreateUnorderedAccessView(mask.Get(), nullptr, &uav, {cpu.ptr + 2 * stride});
         ready = true;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE Target() const {
@@ -177,6 +186,8 @@ struct Gpu {
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(cl, mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetPipelineState(p.sss.pipeline.Get());
@@ -196,9 +207,13 @@ struct Gpu {
                    D3D12_RESOURCE_STATE_COMMON);
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(cl, mask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     void Finish(ID3D12GraphicsCommandList *cl) {
         Transition(cl, guide.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COMMON);
+        Transition(cl, mask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_COMMON);
     }
 };
