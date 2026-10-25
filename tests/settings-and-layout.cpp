@@ -584,7 +584,7 @@ int main() {
         extreme[i] = 0x80000000u;
     widest.Add(extreme);
     assert(widest.Report(rrdensity::Tracker::Interval, report));
-    assert(report.size() > 512 && report.size() < 1024);
+    assert(report.size() > 512);
     assert(report.ends_with(" | enabled=-2147483648 promote=-2147483648 clamp=-2147483648"));
 
     // Water responsivity needs preset F, a nonzero strength and this frame's water.

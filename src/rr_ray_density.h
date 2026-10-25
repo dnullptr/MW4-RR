@@ -18,6 +18,21 @@ class Tracker {
     unsigned frames{};
     std::uint64_t since{};
     bool started{};
+    // Expected rays per frame for one lobe: a pixel at inverse rate i gets a ray with
+    // probability 1/i, a not-requested pixel (bucket 0) none.
+    double Rays(unsigned lobe) const {
+        double rays = 0;
+        for (unsigned i = 1; i < Buckets; ++i)
+            rays += double(pixels[lobe * Buckets + i]) / i;
+        return rays;
+    }
+    // One lobe's pixels from bucket first on (0: all pixels, 1: the requested ones).
+    double Pixels(unsigned lobe, unsigned first) const {
+        double n = 0;
+        for (unsigned i = first; i < Buckets; ++i)
+            n += double(pixels[lobe * Buckets + i]);
+        return n;
+    }
 
   public:
     static constexpr std::uint64_t Interval = 10000;
@@ -30,25 +45,14 @@ class Tracker {
     }
     // Expected rays per requested pixel per frame for one lobe, 0..1.
     double Density(unsigned lobe) const {
-        double rays = 0, requested = 0;
-        for (unsigned i = 1; i < Buckets; ++i) {
-            const double n = double(pixels[lobe * Buckets + i]);
-            rays += n / i;
-            requested += n;
-        }
-        return requested ? rays / requested : 0;
+        const double requested = Pixels(lobe, 1);
+        return requested ? Rays(lobe) / requested : 0;
     }
-    // Expected rays per screen pixel per frame for one lobe, 0..1: a pixel at inverse rate i gets
-    // a ray with probability 1/i, a not-requested pixel none. 1 - this is the no-fresh-ray share.
+    // Expected rays per screen pixel per frame for one lobe, 0..1. 1 - this is the no-fresh-ray
+    // share.
     double ScreenDensity(unsigned lobe) const {
-        double rays = 0, all = 0;
-        for (unsigned i = 0; i < Buckets; ++i) {
-            const double n = double(pixels[lobe * Buckets + i]);
-            if (i)
-                rays += n / i;
-            all += n;
-        }
-        return all ? rays / all : 0;
+        const double all = Pixels(lobe, 0);
+        return all ? Rays(lobe) / all : 0;
     }
     double Share(unsigned lobe, unsigned first, unsigned end) const {
         std::uint64_t part = 0, total = 0;
