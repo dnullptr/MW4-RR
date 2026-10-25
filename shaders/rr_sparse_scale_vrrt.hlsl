@@ -113,10 +113,19 @@ uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if !RR_FILL_SPATIAL&&RR_FILL_HISTORY
 #error RR_FILL_HISTORY needs RR_FILL_SPATIAL
 #endif
+// RR_FILL_DEBUG (test view): as RR_FILL_SPATIAL, but each SSS pixel shows which source lobe 2
+// took, in lobe 2's colour with lobe 1 black: blue = fresh ray, green = native history,
+// yellow = spatial mean, red = spatial mean with no fresh sample within reach (0).
+#ifndef RR_FILL_DEBUG
+#define RR_FILL_DEBUG 0
+#endif
+#if RR_FILL_DEBUG&&!RR_FILL_SPATIAL
+#error RR_FILL_DEBUG needs RR_FILL_SPATIAL
+#endif
 #if RR_FILL_SPATIAL
 groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
-uint2 GroupMean(uint2 gt){
- float4 sum=0;uint n=0;
+uint2 GroupMean(uint2 gt,out uint n){
+ float4 sum=0;n=0;
  [unroll]for(int dy=-2;dy<=2;++dy)[unroll]for(int dx=-2;dx<=2;++dx){
   int2 q=int2(gt)+int2(dx,dy);
   if(any(q<0)||any(q>15))continue;
@@ -185,7 +194,14 @@ void main(uint3 id:SV_DispatchThreadID){
  bool fb;cb=SelectLobe(c.zw,((wt>>8)&4095)!=0,nc.zw,fb);
  outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
 #if RR_FILL_SPATIAL
- if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy);
+ uint found=1;
+ if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy,found);
+#if RR_FILL_DEBUG
+ {const float3 shade=fb?float3(0,0,1):((nw>>8)&4095)>=RR_FILL_HISTORY?float3(0,1,0):
+                     found!=0?float3(1,1,0):float3(1,0,0);
+  const uint3 hv=f32tof16(shade);
+  cb=uint2(hv.x|(hv.y<<16),hv.z|(cb.y&0xffff0000u));ca=uint2(0,ca.y&0xffff0000u);}
+#endif
 #endif
 #endif
 #if RR_SSS_MASK
