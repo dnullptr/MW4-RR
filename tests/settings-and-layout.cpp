@@ -346,8 +346,10 @@ int main() {
         assert(Mode() == SkyMiss);
         fill = true;
         assert(Mode() == both);
+        assert(Mode(rrguidetest::FaceCamera) == SkyMiss && Mode(rrguidetest::AllFlat) == SkyMiss);
+        assert(Mode(rrguidetest::Off) == both);
         sky_miss = false;
-        assert(Mode() == FillHoles);
+        assert(Mode() == FillHoles && Mode(rrguidetest::FaceCamera) == 0);
         fill = false;
 
         Diagnostics outcomes;
@@ -355,15 +357,16 @@ int main() {
         outcomes.Observe(Outcome::Off);
         outcomes.Observe(Outcome::Repeat);
         assert(!outcomes.Summary(text, sizeof(text)));
-        assert(std::string_view(text).find("conditioned=0 surfaceAliased=0 lastSkip=none") !=
-               npos);
+        assert(std::string_view(text).find(
+                   "conditioned=0 surfaceAliased=0 (named=0) lastSkip=none") != npos);
         outcomes.Observe(Outcome::Surface);
         outcomes.Observe(Outcome::Conditioned);
         outcomes.Observe(Outcome::Conditioned);
-        outcomes.SurfaceAliased();
+        outcomes.SurfaceAliased(false);
+        outcomes.SurfaceAliased(true);
         assert(outcomes.Summary(text, sizeof(text)));
-        assert(std::string_view(text).find("conditioned=2 surfaceAliased=1 lastSkip=surface") !=
-               npos);
+        assert(std::string_view(text).find(
+                   "conditioned=2 surfaceAliased=2 (named=1) lastSkip=surface") != npos);
         assert(std::string_view(text).find("weights=0 surface=1 context=0") != npos);
         assert(!outcomes.Summary(text, sizeof(text)));
         assert(std::string_view(OutcomeName(Outcome::Count)) == "none");
@@ -385,10 +388,11 @@ int main() {
         Frame g = f; // no fill
         g[CountFilledHit] = g[CountFilledMiss] = 0;
         pixels.Add(g, SkyMiss, 1100); // 100 more pixels in none of the categories
+        pixels.Raw();
         assert(pixels.Pixels(CountHit) == 400 && pixels.Pixels(StatCount) == 0);
         assert(!pixels.Report(1000 + Tracker::Interval - 1, report));
         assert(pixels.Report(1000 + Tracker::Interval, report));
-        assert(report.find("(10s): frames=2 skyMissFrames=1 fillFrames=1 | sky=9.5% "
+        assert(report.find("(10s): frames=2 rawFrames=1 skyMissFrames=1 fillFrames=1 | sky=9.5% "
                            "viewmodel=4.8% noRtSpecular=4.8% other=4.8% surfaces=76.2% | of "
                            "surfaces: hit=25.0% miss=12.5% noRay=62.5% | of noRay in fill "
                            "frames: filledFromHits=50.0% "
@@ -396,5 +400,10 @@ int main() {
                            "hitWithoutLobe2Ray=10.00% noRtSpecularHits=6") != npos);
         report.clear();
         assert(!pixels.Report(1000 + 2 * Tracker::Interval, report) && report.empty());
+        pixels.Raw();
+        pixels.Raw();
+        assert(pixels.Report(1000 + 3 * Tracker::Interval, report));
+        assert(report == "Specular hit distance pixels (10s): frames=0 rawFrames=2 (no frame "
+                         "conditioned)");
     }
 }

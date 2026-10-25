@@ -38,8 +38,9 @@ class Controller {
     struct Slot {
         rrsss::Producer sss;
         bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
-        // The hit distance tests conditioned this slot's copy, in mode (rrhitcond).
-        bool hit_conditioned{};
+        // The hit distance tests conditioned this slot's copy, in mode (rrhitcond);
+        // hit_test_on: a test was on for it when RR was evaluated.
+        bool hit_conditioned{}, hit_test_on{};
         unsigned hit_mode{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
@@ -500,6 +501,8 @@ class Controller {
                     density.Add(s.gpu.ReadRates());
                 if (s.gate_recorded && s.hit_conditioned)
                     hit_pixels.Add(s.gpu.ReadHitStats(), s.hit_mode, UINT64(s.gpu.w) * s.gpu.h);
+                else if (s.gate_recorded && s.hit_used && s.hit_test_on)
+                    hit_pixels.Raw();
                 if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
                     water_stats.Add(s.gpu.ReadWaterPixels(),
                                     UINT64((std::min)(s.options.width, s.gpu.w)) *
@@ -1119,9 +1122,7 @@ class Controller {
         if (!match)
             return why;
         auto &s = *match;
-        unsigned mode = rrhitcond::Mode();
-        if (rrhitcond::NormalsReplaced(s.gpu.guide_test))
-            mode &= ~rrhitcond::FillHoles;
+        const unsigned mode = rrhitcond::Mode(s.gpu.guide_test);
         if (!mode)
             return Outcome::Off;
         if (!s.gpu.hit_ready || !s.gpu.specular_hit)
@@ -1981,8 +1982,9 @@ class Controller {
             s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
                           !o.color_x && !o.color_y;
             // The panel shows the hit distance tests active only while RR gets the
-            // conditioned copy.
+            // conditioned copy; the log counts frames on that got the raw one.
             hit_scratch.active = s->hit_used && s->hit_conditioned;
+            s->hit_test_on = rrhitcond::Mode(s->gpu.guide_test) && !hit_condition_failed;
             // Water tests read the classification this slot's prepass wrote.
             s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
                             !o.color_x && !o.color_y;
