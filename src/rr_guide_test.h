@@ -18,6 +18,9 @@ inline constexpr float DepthFloor = 1e-7f;
 inline constexpr unsigned Valid(unsigned mode) {
     return mode < Count ? mode : Off;
 }
+// Modes the panel still offers, under "Older tests"; the others were ruled out. Hidden, never
+// renumbered, as captures record the mode.
+inline constexpr unsigned panel[] = {Off, AllFlat, SkySurface};
 inline std::atomic<unsigned> mode{};
 // Bumped by the panel on every change (retries a test blocked for GPU memory).
 inline std::atomic<unsigned> changes{};

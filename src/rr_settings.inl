@@ -67,8 +67,8 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
-    reshade::get_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
-                              requested_tolerate);
+    // Always on now: its panel checkbox is gone, and the saved key is rewritten as on.
+    requested_tolerate = true;
     reshade::get_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityStrength",
@@ -161,9 +161,38 @@ static void OnPresent(reshade::api::effect_runtime *runtime) {
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));
 }
+// A combo that lists only the given options, while still naming a current value outside them.
+template <std::size_t N>
+static bool OptionCombo(const char *name, unsigned current, const char *const *labels,
+                        const unsigned (&options)[N], unsigned &chosen) {
+    bool picked = false;
+    if (ImGui::BeginCombo(name, labels[current], 0)) {
+        for (const unsigned option : options) {
+            const bool selected = option == current;
+            if (ImGui::Selectable(labels[option], selected, 0, ImVec2(0, 0)) && !selected) {
+                chosen = option;
+                picked = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return picked;
+}
+template <std::size_t N>
+static bool LightingCombo(const char *name, const unsigned (&options)[N]) {
+    return OptionCombo(name, rrlighting::Valid(requested_lobe), rrlighting::labels, options,
+                       requested_lobe);
+}
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
+    using TestState = rrlive::Controller::TestState;
+    const bool rr_running = LiveRR().Running();
+    // The sky edge test, under Older tests, replaces the SSS and water responsivity masks.
+    bool sky_edge = rrskyedge::enabled;
+    const auto edge = LiveRR().SkyEdgeTest();
     ImGui::TextUnformatted("MW4 Ray Reconstruction — Beta 1");
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
@@ -235,77 +264,19 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     }
     ImGui::Separator();
     ImGui::TextUnformatted("Subsurface Scattering noise experiments");
-    changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
-    ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
-                       "history; they are counted in ReShade.log instead. Off: previous behavior.");
-    // Session-only: not saved, so a test mode never sticks across restarts.
-    int guide_test = static_cast<int>(rrguidetest::Valid(rrguidetest::mode));
-    using TestState = rrlive::Controller::TestState;
-    const bool rr_running = LiveRR().Running();
-    if (ImGui::Combo("Guide test (thin geometry)", &guide_test, rrguidetest::labels,
-                     rrguidetest::Count)) {
-        rrguidetest::mode = rrguidetest::Valid(static_cast<unsigned>(guide_test));
-        ++rrguidetest::changes;
-    }
-    if (rrguidetest::Valid(static_cast<unsigned>(guide_test)) == rrguidetest::SkySurface) {
-        const auto floor = LiveRR().DepthFloorTest();
-        ImGui::Text("Sky depth floor: %s",
-                    floor == TestState::Active    ? "active"
-                    : floor == TestState::Blocked ? "off: not enough GPU memory (switch to "
-                                                    "another mode and back to retry)"
-                    : !rr_running                 ? "waiting for RR"
-                                                  : "waiting");
-    }
-    bool sky_depth = rrskydepth::enabled;
-    if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
-        rrskydepth::enabled = sky_depth;
-    bool sky_edge = rrskyedge::enabled;
-    if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
-        rrskyedge::enabled = sky_edge;
-        ++rrskyedge::changes;
-    }
-    float edge_strength = rrskyedge::strength;
-    if (ImGui::SliderFloat("Sky edge strength", &edge_strength, -1.0f, 0.0f, "%.2f")) {
-        rrskyedge::strength = rrresponsivity::Clamp(edge_strength);
-        ++rrskyedge::changes;
-    }
-    int edge_radius = static_cast<int>(rrskyedge::ClampRadius(rrskyedge::radius));
-    if (ImGui::SliderInt("Sky edge width (pixels)", &edge_radius, 1,
-                         static_cast<int>(rrskyedge::MaxRadius), "%d",
-                         ImGuiSliderFlags_AlwaysClamp)) {
-        rrskyedge::radius =
-            edge_radius < 1 ? 1u : rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
-        ++rrskyedge::changes;
-    }
-    const auto edge = LiveRR().SkyEdgeTest();
-    ImGui::Text("Sky edge mask: %s",
-                edge == TestState::Active    ? "active"
-                : !sky_edge                  ? "off"
-                : edge == TestState::Blocked ? "off: not enough GPU memory (change a sky edge "
-                                               "setting to retry)"
-                : rrresponsivity::Clamp(edge_strength) == 0 ? "off (strength 0)"
-                : !rr_running                               ? "waiting for RR"
-                                                            : "waiting (needs preset F)");
-    ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
-                       "steadier over time; moving branches may ghost. While on, it replaces the "
-                       "SSS and water responsivity masks.");
-    int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
-    if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
-                     rrcolorscale::Count)) {
-        rrcolorscale::mode = rrcolorscale::Valid(static_cast<unsigned>(color_scale));
-        ++rrcolorscale::changes;
-    }
-    const auto brightness = LiveRR().ColorTest();
-    ImGui::Text("Color brightness test: %s",
-                brightness == TestState::Active    ? "active"
-                : color_scale == 0                 ? "off"
-                : brightness == TestState::Blocked ? "off: not enough GPU memory (change the "
-                                                     "setting to retry)"
-                : !rr_running                      ? "waiting for RR"
-                                                   : "waiting");
-    ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
-                       "output back, so the picture looks the same unless RR treats the levels "
-                       "differently. The SSS and transparency guides are left out while on.");
+    changed |= LightingCombo("Lighting input", rrlighting::panel);
+    ImGui::TextWrapped("SSS pixels options change lighting only where the previous frame's "
+                       "Subsurface Scattering guide is nonzero and keep raw lighting everywhere "
+                       "else; they need the SSS guide (F11) and show raw lighting without it. "
+                       "Fill gaps keeps each fresh ray sample unboosted and uses the game's own "
+                       "accumulation only where no ray landed this frame. The (test) options: "
+                       "history + spatial uses the game's accumulation only where it has lobe-2 "
+                       "history and otherwise averages this frame's rays within 2 pixels; "
+                       "settled + spatial also waits for that history to settle; spatial fill "
+                       "only never uses the game's accumulation. Older options are under Older "
+                       "tests.");
+    if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
+        ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     if (ImGui::Button("Capture RR inputs (Pause)"))
         LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();
@@ -331,43 +302,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Saves 8 consecutive frames of everything RR is given, plus the Status "
                        "guide and RR's output, to mw4-rr-captures in the game folder. About 50 "
                        "bytes per render pixel plus 8 per output pixel, per frame. Session only.");
-    int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
-    if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
-        requested_lobe = static_cast<unsigned>(lobe);
-        changed = true;
-    }
-    ImGui::TextWrapped("Native temporal replaces a lobe with the game's own accumulation across the "
-                       "whole frame (lobe 2 behaves as diffuse): clean but soft. Fill gaps keeps "
-                       "each fresh ray sample unboosted and uses native accumulation only where no "
-                       "ray landed this frame. Cap bright samples keeps raw lighting but limits "
-                       "each ray sample to 8x or 4x the game's own accumulated brightness before "
-                       "it is boosted, so the SSS blur cannot spread it into blotches; rare "
-                       "highlights get slightly darker. AO fix keeps raw colour but stops the "
-                       "boost from washing out the occlusion value each lighting pixel carries: "
-                       "A uses each fresh ray's own value and the game's where no ray landed, B "
-                       "uses the game's everywhere. SSS pixels options apply native temporal or "
-                       "fill gaps only where the previous frame's Subsurface Scattering guide is "
-                       "nonzero and keep raw lighting everywhere else; they need the SSS guide "
-                       "(F11) and show raw lighting without it. The (test) options keep fill gaps' fresh "
-                       "samples unboosted; history + spatial uses the game's accumulation only where "
-                       "it has lobe-2 history and otherwise averages this frame's rays within 2 "
-                       "pixels; spatial fill only never uses the game's accumulation.");
-    if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
-        ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
-    changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
-    if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
-        LiveRR().SetResponsivity(requested_responsivity, requested_strength);
-    if (ImGui::IsItemDeactivatedAfterEdit())
-        changed = true;
-    ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive()      ? "active"
-                                         : !requested_responsivity            ? "off"
-                                         : sky_edge && edge == TestState::Active
-                                             ? "replaced by sky edge mask"
-                                         : rrresponsivity::Clamp(requested_strength) == 0
-                                             ? "off (strength 0)"
-                                             : "waiting (needs preset F and the SSS guide)");
-    ImGui::TextWrapped("Tells RR to hold SSS pixels steadier over time: less boiling, but moving "
-                       "SSS surfaces may ghost. Supported on RR preset F only.");
     ImGui::Separator();
     ImGui::TextUnformatted("Running water experiments (this session only)");
     // Session-only: not saved, so a test mode never sticks across restarts.
@@ -445,65 +379,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "add-on could not convert: if special stays near 0%% while you look at water, the "
         "game does not mark that water.");
     ImGui::Separator();
-    // Session-only: not saved, so a test mode never sticks across restarts.
-    ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
-    int ray_noise = static_cast<int>(rrapply::NoiseOf(rrapply::noise.load()));
-    if (ImGui::Combo("Ray draws per lobe", &ray_noise, rrapply::noise_labels, rrapply::NoiseCount))
-        rrapply::noise = rrapply::NoiseOf(static_cast<unsigned>(ray_noise));
-    bool ray_untile = rrapply::untile;
-    if (ImGui::Checkbox("Break the 128-pixel noise repeat", &ray_untile))
-        rrapply::untile = ray_untile;
-    const unsigned ray_variant = rrapply::Selected();
-    const char *ray_reason = rrapply::variant_status[ray_variant].load();
-    switch (rrapply::Current(ray_variant)) {
-    case rrapply::State::Off:
-        ImGui::TextUnformatted("Ray selection: off (game's own)");
-        break;
-    case rrapply::State::Active:
-        ImGui::Text("Ray selection: active (%s)", rrapply::Name(ray_variant));
-        break;
-    case rrapply::State::Unavailable:
-        ImGui::Text("Ray selection: unavailable (%s); game's own in use",
-                    ray_reason ? ray_reason : "not prepared");
-        break;
-    case rrapply::State::Waiting:
-        ImGui::TextUnformatted("Ray selection: waiting for RR");
-        break;
-    }
-    ImGui::TextWrapped("Session-only test. The game uses one noise value per pixel for both ray "
-                       "lobes, so lobe 2's rays land on the pixels lobe 1's rays hit. Separate "
-                       "draws gives lobe 2 its own noise value. Opposite draws makes lobe 2's "
-                       "rays avoid lobe 1's, so fewer pixels get no fresh ray at all. Either way "
-                       "each lobe keeps the game's ray rate. The repeat break shifts the game's "
-                       "128-pixel noise tile differently in each 128-pixel block of the screen, "
-                       "which can leave faint fixed lines along the block edges. The first switch "
-                       "to an option pauses the game briefly while its shader is built. Judge "
-                       "with frame generation off.");
-    ImGui::Separator();
-    if (changed) {
-        ApplyEnabled();
-        SaveToggles();
-    }
-#ifdef RR_FILTER_DIAGNOSTIC
-    ImGui::Separator();
-    ImGui::TextUnformatted("Development diagnostic: lighting filtering");
-    auto filter = LiveRR().NativeFilterStatus();
-    const char *filter_names[] = {rrfilter::Label(rrfilter::Mode::Raw),
-                                 rrfilter::Label(rrfilter::Mode::TemporalSpatial),
-                                 rrfilter::Label(rrfilter::Mode::TemporalOnly),
-                                 rrfilter::Label(rrfilter::Mode::SpatialRemaining)};
-    int filter_choice = static_cast<int>(filter.desired);
-    if (ImGui::Combo("Lighting comparison", &filter_choice, filter_names, 4))
-        LiveRR().RequestFilterMode(static_cast<rrfilter::Mode>(filter_choice));
-    if (ImGui::Button("Restart comparison history"))
-        LiveRR().RestartFilterComparison();
-    filter = LiveRR().NativeFilterStatus();
-    ImGui::Text("Applied lighting: %s", rrfilter::Label(filter.effective));
-    if (filter.pending)
-        ImGui::TextUnformatted("Waiting for pending frames to retire...");
-    ImGui::TextWrapped("Session-only comparison. Switching paths restarts RR history. Temporal only keeps native lighting history and bypasses spatial filtering. Temporal + spatial is the previous checkbox-on mode. Spatial only keeps raw preparation in place of the first spatial pass, then runs the remaining native spatial passes; it is not the complete native spatial chain.");
-    ImGui::Separator();
-#endif
     auto preset = LiveRR().PresetStatus();
     int selected = 3;
     for (int i = 0; i < 4; ++i)
@@ -548,4 +423,159 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "Restart the game after changing it. RR preset changes above apply live.");
     ImGui::TextWrapped("Keep enhanced FOV, depth of field, and motion blur disabled. See README "
                        "for the exact configuration entries.");
+    ImGui::Separator();
+    // Tests already judged, kept for comparisons; collapsed by default.
+    if (ImGui::CollapsingHeader("Older tests", 0)) {
+        // Session-only: not saved, so a test mode never sticks across restarts.
+        unsigned guide_test = rrguidetest::Valid(rrguidetest::mode);
+        if (OptionCombo("Guide test (thin geometry)", guide_test, rrguidetest::labels,
+                        rrguidetest::panel, guide_test)) {
+            rrguidetest::mode = guide_test;
+            ++rrguidetest::changes;
+        }
+        if (rrguidetest::Valid(guide_test) == rrguidetest::SkySurface) {
+            const auto floor = LiveRR().DepthFloorTest();
+            ImGui::Text("Sky depth floor: %s", floor == TestState::Active ? "active"
+                                               : floor == TestState::Blocked
+                                                   ? "off: not enough GPU memory (switch to "
+                                                     "another mode and back to retry)"
+                                               : !rr_running ? "waiting for RR"
+                                                             : "waiting");
+        }
+        if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
+            rrskyedge::enabled = sky_edge;
+            ++rrskyedge::changes;
+        }
+        float edge_strength = rrskyedge::strength;
+        if (ImGui::SliderFloat("Sky edge strength", &edge_strength, -1.0f, 0.0f, "%.2f")) {
+            rrskyedge::strength = rrresponsivity::Clamp(edge_strength);
+            ++rrskyedge::changes;
+        }
+        int edge_radius = static_cast<int>(rrskyedge::ClampRadius(rrskyedge::radius));
+        if (ImGui::SliderInt("Sky edge width (pixels)", &edge_radius, 1,
+                             static_cast<int>(rrskyedge::MaxRadius), "%d",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            rrskyedge::radius =
+                edge_radius < 1 ? 1u : rrskyedge::ClampRadius(static_cast<unsigned>(edge_radius));
+            ++rrskyedge::changes;
+        }
+        ImGui::Text("Sky edge mask: %s",
+                    edge == TestState::Active    ? "active"
+                    : !sky_edge                  ? "off"
+                    : edge == TestState::Blocked ? "off: not enough GPU memory (change a sky edge "
+                                                   "setting to retry)"
+                    : rrresponsivity::Clamp(edge_strength) == 0 ? "off (strength 0)"
+                    : !rr_running                               ? "waiting for RR"
+                                                                : "waiting (needs preset F)");
+        ImGui::TextWrapped(
+            "Session-only test. Tells RR to hold pixels where geometry meets sky "
+            "steadier over time; moving branches may ghost. While on, it replaces the "
+            "SSS and water responsivity masks.");
+        int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
+        if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
+                         rrcolorscale::Count)) {
+            rrcolorscale::mode = rrcolorscale::Valid(static_cast<unsigned>(color_scale));
+            ++rrcolorscale::changes;
+        }
+        const auto brightness = LiveRR().ColorTest();
+        ImGui::Text("Color brightness test: %s", brightness == TestState::Active ? "active"
+                                                 : color_scale == 0              ? "off"
+                                                 : brightness == TestState::Blocked
+                                                     ? "off: not enough GPU memory (change the "
+                                                       "setting to retry)"
+                                                 : !rr_running ? "waiting for RR"
+                                                               : "waiting");
+        ImGui::TextWrapped(
+            "Session-only test. Sends RR the color darker or brighter and scales its "
+            "output back, so the picture looks the same unless RR treats the levels "
+            "differently. The SSS and transparency guides are left out while on.");
+        changed |= LightingCombo("Lighting input (older options)", rrlighting::older);
+        ImGui::TextWrapped(
+            "Native temporal replaces a lobe with the game's own accumulation (lobe 2 "
+            "behaves as diffuse): lobe 1 across the whole frame, the SSS pixels "
+            "options only on SSS pixels. Both lobes fill gaps fills both lobes across "
+            "the whole frame. These share the setting above.");
+        changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
+        if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
+            LiveRR().SetResponsivity(requested_responsivity, requested_strength);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            changed = true;
+        ImGui::Text("Responsivity mask: %s", LiveRR().ResponsivityActive() ? "active"
+                                             : !requested_responsivity     ? "off"
+                                             : sky_edge && edge == TestState::Active
+                                                 ? "replaced by sky edge mask"
+                                             : rrresponsivity::Clamp(requested_strength) == 0
+                                                 ? "off (strength 0)"
+                                                 : "waiting (needs preset F and the SSS guide)");
+        ImGui::TextWrapped(
+            "Tells RR to hold SSS pixels steadier over time: less boiling, but moving "
+            "SSS surfaces may ghost. Supported on RR preset F only.");
+        // Session-only: not saved, so a test mode never sticks across restarts.
+        ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
+        int ray_noise = static_cast<int>(rrapply::NoiseOf(rrapply::noise.load()));
+        if (ImGui::Combo("Ray draws per lobe", &ray_noise, rrapply::noise_labels,
+                         rrapply::NoiseCount))
+            rrapply::noise = rrapply::NoiseOf(static_cast<unsigned>(ray_noise));
+        const unsigned ray_variant = rrapply::Selected();
+        const char *ray_reason = rrapply::variant_status[ray_variant].load();
+        switch (rrapply::Current(ray_variant)) {
+        case rrapply::State::Off:
+            ImGui::TextUnformatted("Ray selection: off (game's own)");
+            break;
+        case rrapply::State::Active:
+            ImGui::Text("Ray selection: active (%s)", rrapply::Name(ray_variant));
+            break;
+        case rrapply::State::Unavailable:
+            ImGui::Text("Ray selection: unavailable (%s); game's own in use",
+                        ray_reason ? ray_reason : "not prepared");
+            break;
+        case rrapply::State::Waiting:
+            ImGui::TextUnformatted("Ray selection: waiting for RR");
+            break;
+        }
+        ImGui::TextWrapped(
+            "Session-only test. The game uses one noise value per pixel for both ray "
+            "lobes, so lobe 2's rays land on the pixels lobe 1's rays hit. Separate "
+            "draws gives lobe 2 its own noise value. Opposite draws makes lobe 2's "
+            "rays avoid lobe 1's, so fewer pixels get no fresh ray at all. Either way "
+            "each lobe keeps the game's ray rate. The first switch to an option pauses "
+            "the game briefly while its shader is built. Judge with frame generation "
+            "off.");
+        bool ray_untile = rrapply::untile;
+        if (ImGui::Checkbox("Break the 128-pixel noise repeat", &ray_untile))
+            rrapply::untile = ray_untile;
+        ImGui::TextWrapped(
+            "Session-only part of the ray selection test. Shifts the game's "
+            "128-pixel noise tile differently in each 128-pixel block of the screen, "
+            "which can leave faint fixed lines along the block edges.");
+#ifdef RR_FILTER_DIAGNOSTIC
+        ImGui::Separator();
+        ImGui::TextUnformatted("Development diagnostic: lighting filtering");
+        auto filter = LiveRR().NativeFilterStatus();
+        const char *filter_names[] = {rrfilter::Label(rrfilter::Mode::Raw),
+                                      rrfilter::Label(rrfilter::Mode::TemporalSpatial),
+                                      rrfilter::Label(rrfilter::Mode::TemporalOnly),
+                                      rrfilter::Label(rrfilter::Mode::SpatialRemaining)};
+        int filter_choice = static_cast<int>(filter.desired);
+        if (ImGui::Combo("Lighting comparison", &filter_choice, filter_names, 4))
+            LiveRR().RequestFilterMode(static_cast<rrfilter::Mode>(filter_choice));
+        if (ImGui::Button("Restart comparison history"))
+            LiveRR().RestartFilterComparison();
+        filter = LiveRR().NativeFilterStatus();
+        ImGui::Text("Applied lighting: %s", rrfilter::Label(filter.effective));
+        if (filter.pending)
+            ImGui::TextUnformatted("Waiting for pending frames to retire...");
+        ImGui::TextWrapped(
+            "Session-only comparison. Switching paths restarts RR history. Temporal only keeps "
+            "native lighting history and bypasses spatial filtering. Temporal + spatial is the "
+            "previous checkbox-on mode. Spatial only keeps raw preparation in place of the first "
+            "spatial pass, then runs the remaining native spatial passes; it is not the complete "
+            "native spatial chain.");
+        ImGui::Separator();
+#endif
+    }
+    if (changed) {
+        ApplyEnabled();
+        SaveToggles();
+    }
 }

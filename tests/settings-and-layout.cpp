@@ -15,6 +15,7 @@
 #include "../src/rr_trace_model.h"
 #include "../src/rr_hit_condition.h"
 #include "../src/rr_water.h"
+#include "../src/rr_guide_test.h"
 #include <algorithm>
 #include <cassert>
 #include <limits>
@@ -76,6 +77,32 @@ static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill2Spatial]) 
               "SSS pixels: lobe 2 fill gaps, history + spatial (test)");
 static_assert(std::string_view(rrlighting::labels[rrlighting::SssSpatial2]) ==
               "SSS pixels: lobe 2 spatial fill only (test)");
+// The panel lists each option at most once; the ruled-out ones in neither list.
+template <std::size_t A, std::size_t B>
+constexpr unsigned Listed(unsigned value, const unsigned (&a)[A], const unsigned (&b)[B]) {
+    unsigned n = 0;
+    for (const unsigned v : a)
+        n += v == value;
+    for (const unsigned v : b)
+        n += v == value;
+    return n;
+}
+constexpr bool PanelLightingLists() {
+    for (unsigned s = 0; s < rrlighting::Count; ++s) {
+        const bool ruled_out = s == rrlighting::NativeLobe2 || s == rrlighting::FillLobe2 ||
+                               s == rrlighting::CapGentle || s == rrlighting::CapStrong ||
+                               s == rrlighting::WFill || s == rrlighting::WNative;
+        if (Listed(s, rrlighting::panel, rrlighting::older) != (ruled_out ? 0u : 1u))
+            return false;
+    }
+    return rrlighting::panel[0] == rrlighting::Raw;
+}
+static_assert(PanelLightingLists());
+constexpr unsigned none[] = {rrguidetest::Count};
+static_assert(rrguidetest::panel[0] == rrguidetest::Off &&
+              Listed(rrguidetest::AllFlat, rrguidetest::panel, none) == 1 &&
+              Listed(rrguidetest::SkySurface, rrguidetest::panel, none) == 1 &&
+              std::size(rrguidetest::panel) == 3);
 // A guide serves the next few frames of its generation and extent, across wrap.
 constexpr rrsssmask::Record guide{true, 100, 7, 1280, 720};
 static_assert(rrsssmask::Usable(guide, 101, 7, 1280, 720) &&
