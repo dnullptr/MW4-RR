@@ -61,7 +61,9 @@ void main(uint3 id : SV_DispatchThreadID)
     if(!RRConversionLayout(size))return;
     if(any(float2(p)>=Scene[86].xy)){RRWriteEmpty(p,0,0);return;}
     uint4 surface=PackedSurface.Load(int3(p,0));float depth=asfloat(surface.x);
-    if(depth==0 || surface.x==0x7f7fffffu){RRWriteEmpty(p,2,1);return;}
+    // NVIDIA's RR guide: sky diffuse albedo 0.5, specular albedo and normal 0.
+    // Zero sky albedo smears thin foliage and wire edges against the sky.
+    if(depth==0 || surface.x==0x7f7fffffu){RRWriteEmpty(p,2,1);DiffuseAlbedo[p]=float4(0.5,0.5,0.5,1);return;}
     if(!RRFinite(depth) || depth<=0 || depth>1)return;
     bool alternate=(surface.w&1u)!=0, special=(surface.w&2u)!=0, depthOverride=(surface.w&8u)!=0;
     if(alternate!=(depth>63.0/64.0) || (depthOverride&&!special))return;
