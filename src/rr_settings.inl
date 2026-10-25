@@ -10,6 +10,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_contrast_test.h"
 #include "rr_hit_condition.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
@@ -24,6 +25,7 @@ static unsigned &requested_lobe = preferences.native_lobe;
 static bool &requested_responsivity = preferences.responsivity;
 static float &requested_strength = preferences.responsivity_strength;
 static bool &requested_hit = preferences.hit;
+static bool &requested_weapon_depth = preferences.weapon_depth;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -36,9 +38,14 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
+    // Before RR can be enabled: RR takes its depth type when it is created. A change restarts
+    // a running RR and retries linear depth held off since the last change.
+    if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
+        ++rrweapondepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
@@ -69,6 +76,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -201,6 +209,32 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "ReShade.log shows the shares every 10 s.");
         ImGui::Unindent();
     }
+    changed |= ImGui::Checkbox("Weapon depth", &requested_weapon_depth);
+    {
+        ImGui::Indent();
+        using WeaponState = rrlive::Controller::WeaponState;
+        const auto weapon = LiveRR().WeaponDepthState();
+        ImGui::Text("Weapon depth: %s",
+                    weapon == WeaponState::Active       ? "active (RR uses linear depth)"
+                    : weapon == WeaponState::Off        ? "off"
+                    : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
+                    : weapon == WeaponState::NoMemory
+                        ? "off: not enough GPU memory (turn it off and on to retry)"
+                    : weapon == WeaponState::Unsupported
+                        ? "off: the game's projection is not supported (turn it off and on to "
+                          "retry)"
+                    : weapon == WeaponState::Refused
+                        ? "off: RR did not accept linear depth (turn it off and on to retry)"
+                    : !LiveRR().Running() ? "waiting for RR"
+                                          : "waiting");
+        ImGui::TextWrapped("The game draws the weapon and hands with their own camera, so with "
+                           "the game's depth RR sees them as one flat card. On, RR gets linear "
+                           "depth in which they keep their own depth steps, still in front of "
+                           "everything else; the rest of the scene keeps its distances, with the "
+                           "sky very far instead of infinitely far. Changing it restarts RR, like "
+                           "a preset change.");
+        ImGui::Unindent();
+    }
     ImGui::Separator();
     ImGui::TextUnformatted("Subsurface Scattering noise experiments");
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
@@ -216,6 +250,16 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         ++rrguidetest::changes;
     }
     if (rrguidetest::Valid(static_cast<unsigned>(guide_test)) == rrguidetest::SkySurface) {
+        int sky_distance = static_cast<int>(rrguidetest::ValidFloor(rrguidetest::floor));
+        if (ImGui::Combo("Sky distance", &sky_distance, rrguidetest::floor_labels,
+                         rrguidetest::FloorCount)) {
+            rrguidetest::floor = rrguidetest::ValidFloor(static_cast<unsigned>(sky_distance));
+            ++rrguidetest::changes;
+        }
+        ImGui::TextWrapped("How far away RR sees the sky, in game units. Hills sit a few times "
+                           "farther than the trees in front of them; normally the sky is "
+                           "infinitely far. Scenery past the chosen distance ends up behind "
+                           "the sky for RR, so judge trees close by.");
         const auto floor = LiveRR().DepthFloorTest();
         ImGui::Text("Sky depth floor: %s",
                     floor == TestState::Active    ? "active"
@@ -243,31 +287,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                              "lists are proven large enough over 120 frames, costs GPU time, and "
                              "stops itself for the session with a ReShade.log line if any check "
                              "fails.");
-    bool weapon_depth = rrweapondepth::enabled;
-    if (ImGui::Checkbox("Weapon depth test: give the weapon its own depth", &weapon_depth)) {
-        rrweapondepth::enabled = weapon_depth;
-        ++rrweapondepth::changes;
-    }
-    using WeaponState = rrlive::Controller::WeaponState;
-    const auto weapon = LiveRR().WeaponDepthState();
-    ImGui::Text("Weapon depth: %s",
-                weapon == WeaponState::Active       ? "active (RR uses linear depth)"
-                : weapon == WeaponState::Off        ? "off"
-                : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
-                : weapon == WeaponState::NoMemory
-                    ? "off: not enough GPU memory (turn it off and on to retry)"
-                : weapon == WeaponState::Unsupported
-                    ? "off: the game's projection is not supported (turn it off and on to retry)"
-                : weapon == WeaponState::Refused
-                    ? "off: RR did not accept linear depth (turn it off and on to retry)"
-                : !rr_running ? "waiting for RR"
-                              : "waiting");
-    ImGui::TextWrapped("Session-only test. The game draws the weapon and hands with their own "
-                       "camera, so RR normally sees them as one flat card. On, RR gets linear "
-                       "depth in which the weapon keeps its own depth steps, still in front of "
-                       "everything else; the rest of the scene keeps the same distances, with "
-                       "the sky very far instead of infinitely far. Turning it on or off "
-                       "restarts RR, like a preset change.");
     bool sky_edge = rrskyedge::enabled;
     if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
         rrskyedge::enabled = sky_edge;
@@ -315,6 +334,25 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
+    int contrast = static_cast<int>(rrcontrast::Valid(rrcontrast::mode));
+    if (ImGui::Combo("Color contrast test", &contrast, rrcontrast::labels, rrcontrast::Count)) {
+        rrcontrast::mode = rrcontrast::Valid(static_cast<unsigned>(contrast));
+        ++rrcontrast::changes;
+    }
+    const auto squeeze = LiveRR().ContrastTest();
+    ImGui::Text("Color contrast test: %s",
+                squeeze == TestState::Active    ? "active"
+                : contrast == 0                 ? "off"
+                : squeeze == TestState::Blocked ? "off: not enough GPU memory (change the "
+                                                  "setting to retry)"
+                : !rr_running                   ? "waiting for RR"
+                                                : "waiting");
+    ImGui::TextWrapped("Session-only test. Squeezes bright colors before RR and stretches RR's "
+                       "output back, so the sky behind branches is only a few times brighter "
+                       "than the needles for RR instead of about 28x. Shows whether the tree "
+                       "flicker follows that contrast. Stronger settings can darken noisy, "
+                       "bright spots a little. The SSS and transparency guides are left out "
+                       "while on.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
         LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();
@@ -357,7 +395,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "uses the game's everywhere. SSS pixels options apply native temporal or "
                        "fill gaps only where the previous frame's Subsurface Scattering guide is "
                        "nonzero and keep raw lighting everywhere else; they need the SSS guide "
-                       "(F11) and show raw lighting without it.");
+                       "(F11) and show raw lighting without it. The (test) options keep fill gaps' fresh "
+                       "samples unboosted; history + spatial uses the game's accumulation only where "
+                       "it has lobe-2 history and otherwise averages this frame's rays within 2 "
+                       "pixels; spatial fill only never uses the game's accumulation.");
     if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
         ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
@@ -382,6 +423,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     water_changed |=
         ImGui::SliderFloat("Water mask strength", &water.strength, 0.0f, 1.0f, "%.2f");
     water_changed |= ImGui::Checkbox("Water: discard RR history", &water.discard);
+    water_changed |= ImGui::SliderFloat("Water discard strength", &water.discard_strength, 0.0f,
+                                        1.0f, "%.2f");
     water_changed |= ImGui::Checkbox("Water: animated texture mask", &water.animated);
     int water_guide = static_cast<int>(rrwater::ValidGuide(water.guide));
     if (ImGui::Combo("Water guides", &water_guide, rrwater::guide_labels, rrwater::GuideCount)) {
@@ -405,6 +448,14 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                         100.0f * water_status.coverage);
         else
             ImGui::TextUnformatted("Water in the latest frame: measuring");
+        // What the game's prepass marks, to tell whether a surface is flagged at all.
+        const auto &flags = water_status.prepass;
+        if (flags[rrwater::Special] >= 0)
+            ImGui::Text("Game flags: special %.1f%% (water flag %.1f%%, override %.1f%%), "
+                        "marker %.1f%%, rejected %.1f%%",
+                        100.0f * flags[rrwater::Special], 100.0f * flags[rrwater::Marked],
+                        100.0f * flags[rrwater::Override], 100.0f * flags[rrwater::Bit31],
+                        100.0f * flags[rrwater::SpecialRejected]);
         if (water.responsivity)
             ImGui::Text("Water responsivity mask: %s",
                         water_status.responsivity               ? "active"
@@ -412,22 +463,34 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                         : rrwater::Clamp(water.strength) == 0   ? "off (strength 0)"
                                                                 : "waiting (needs preset F)");
         if (water.discard)
-            ImGui::Text("Water history discard: %s", water_status.discard ? "active" : "waiting");
+            ImGui::Text("Water history discard: %s",
+                        water_status.discard                                 ? "active"
+                        : rrwater::DiscardLevel(water.discard_strength) == 0 ? "off (strength 0)"
+                                                                             : "waiting");
         if (water.animated)
             ImGui::Text("Water animated texture mask: %s",
                         water_status.animated ? "active" : "waiting");
     }
     ImGui::TextWrapped(
-        "Water pixels are the ones the game's prepass marks as water. Responsivity tells RR to "
-        "lean on the current frame there (preset F only); with the SSS responsivity mask also "
-        "on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, as "
-        "RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
-        "noisier water. The animated texture mask is an RR input NVIDIA does not document; it "
+        "Water pixels are the game's special surfaces: mirror-like water that its prepass marks "
+        "with its water flag (lakes, distant water) or its override (rivers). Responsivity tells "
+        "RR to lean on the current frame there (preset F only); with the SSS responsivity mask "
+        "also on, SSS pixels keep their own value. Discard RR history marks water as disoccluded, "
+        "as RTX Remix does for animated water, so RR rebuilds it every frame: expect sharper but "
+        "noisier water. Discard strength keeps part of the history instead: 1 drops it all, "
+        "0.5 sends RR 100 instead of 10000 (it reads the mask in log scale), so try 0.5 to 0.8 "
+        "for less blur with calmer reflections. The animated texture mask is an RR input NVIDIA "
+        "does not document; it "
         "is here to see whether it changes anything. Water guides changes the normal and albedo "
         "guides on water only: the game mirror is what RR gets today, smoothed normal averages "
         "the wave normal over 7x7 pixels, water material uses the game's own reflectance and "
-        "diffuse arrays, and physical uses water's 0.02 reflectance with a smoothed normal. "
-        "Water coverage and these settings are logged to ReShade.log every 10 seconds.");
+        "diffuse arrays (not yet checked on rivers), and physical uses water's 0.02 reflectance "
+        "with a smoothed normal. "
+        "Water coverage and these settings are logged to ReShade.log every 10 seconds. Game "
+        "flags shows how much of the frame the game's prepass marks special, split into its "
+        "water flag and its override, plus the water lighting marker and special pixels the "
+        "add-on could not convert: if special stays near 0%% while you look at water, the "
+        "game does not mark that water.");
     ImGui::Separator();
     // Session-only: not saved, so a test mode never sticks across restarts.
     ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");

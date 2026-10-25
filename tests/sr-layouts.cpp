@@ -38,6 +38,9 @@ int main() {
     layouts.Observe(cl, 1, &second);
     assert(layouts.Get(cl, a.Get(), state) && state == read);
     assert(layouts.GetUnaliased(cl, a.Get(), state) && state == read);
+    using Alias = rrsparsecopy::Layouts::Alias;
+    auto kind = Alias::Named;
+    assert(layouts.Get(cl, a.Get(), state, kind) && state == read && kind == Alias::None);
     D3D12_RESOURCE_BARRIER alias{};
     alias.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
     alias.Aliasing = {a.Get(), b.Get()};
@@ -52,17 +55,28 @@ int main() {
     assert(!layouts.GetUnaliased(cl, b.Get(), state));
     assert(!layouts.Get(cl, untouched.Get(), state));
     assert(!layouts.GetUnaliased(cl, untouched.Get(), state));
+    assert(layouts.Get(cl, a.Get(), state, kind) && kind == Alias::Named);
+    assert(!layouts.Get(cl, untouched.Get(), state, kind));
     layouts.Observe(cl, 1, &transition);
     assert(layouts.GetUnaliased(cl, a.Get(), state) && state == read);
+    assert(layouts.Get(cl, a.Get(), state, kind) && kind == Alias::None);
     alias.Aliasing = {};
     layouts.Observe(cl, 1, &alias);
     assert(layouts.Get(cl, a.Get(), state) && state == read);
     assert(!layouts.GetUnaliased(cl, a.Get(), state));
+    // A barrier with a null side covers every resource without naming one.
+    assert(layouts.Get(cl, a.Get(), state, kind) && state == read && kind == Alias::Any);
+    assert(layouts.Get(cl, b.Get(), state, kind) && kind == Alias::Named); // still
+    layouts.Observe(cl, 1, &transition);
+    alias.Aliasing = {nullptr, b.Get()};
+    layouts.Observe(cl, 1, &alias);
+    assert(layouts.Get(cl, a.Get(), state, kind) && kind == Alias::Any);
     layouts.Observe(cl, 1, &transition);
     alias.Aliasing = {nullptr, a.Get()};
     layouts.Observe(cl, 1, &alias);
     assert(layouts.Get(cl, a.Get(), state) && state == read);
     assert(!layouts.GetUnaliased(cl, a.Get(), state));
+    assert(layouts.Get(cl, a.Get(), state, kind) && kind == Alias::Named);
     transition.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
     layouts.Observe(cl, 1, &transition);
     assert(!layouts.Get(cl, a.Get(), state));

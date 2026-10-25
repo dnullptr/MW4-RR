@@ -1,4 +1,4 @@
-// Weapon depth test (src/rr_weapon_depth.h): RR's depth as linear view depth, read from
+// Weapon depth (src/rr_weapon_depth.h): RR's depth as linear view depth, read from
 // the depth subrect at Offset. World depth is Scale / (depth + DepthOffset), what the
 // projection RR is given implies; the weapon slice (depth > 63/64, the game's own weapon
 // camera) keeps its depth order in front of the near plane instead of a flat card.

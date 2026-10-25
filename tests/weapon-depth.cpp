@@ -136,6 +136,119 @@ static void Unsupported() {
     assert(!Map(game, negative, 0, m));
 }
 
+static void Choice() {
+    // AfterSR's depth for a frame: RR's depth type is fixed at creation, so a frame follows
+    // the RR it goes to, and only a new RR (feature false) takes the setting.
+    using namespace rrweapondepth;
+    auto same = [](FrameDepth a, FrameDepth b) {
+        return a.linear == b.linear && a.restart == b.restart && a.hold == b.hold;
+    };
+    const FrameDepth hardware{}, linear{true};
+    for (bool wanted : {false, true}) {
+        // RR with hardware depth: hardware depth, whatever the setting and the frame.
+        for (bool mapped : {false, true})
+            for (bool texture : {false, true})
+                for (bool blocked : {false, true})
+                    assert(same(Choose(true, false, wanted, mapped, texture, blocked), hardware));
+        // RR with linear depth: linear depth when the frame has it, else restart RR, and hold
+        // linear depth off when the cause would stay.
+        assert(same(Choose(true, true, wanted, true, true, false), linear));
+        assert(same(Choose(true, true, wanted, false, false, false), {true, true, Hold::Projection}));
+        assert(same(Choose(true, true, wanted, true, false, true), {true, true, Hold::Memory}));
+        // A texture released for another size: restart, nothing held.
+        assert(same(Choose(true, true, wanted, true, false, false), {true, true, Hold::None}));
+    }
+    // A new RR: the setting, unless the frame cannot have linear depth.
+    assert(same(Choose(false, false, false, false, false, false), hardware));
+    assert(same(Choose(false, true, false, true, true, false), hardware));
+    assert(same(Choose(false, false, true, true, true, false), linear));
+    assert(same(Choose(false, false, true, false, false, false), {false, false, Hold::Projection}));
+    assert(same(Choose(false, false, true, true, false, true), {false, false, Hold::Memory}));
+    assert(same(Choose(false, false, true, true, false, false), hardware));
+    // Every case: linear depth is sent only with a mapping and its texture, a restart only for
+    // an RR with linear depth, and a hold names its cause.
+    for (unsigned bits = 0; bits < 64; ++bits) {
+        const bool b[] = {bool(bits & 1), bool(bits & 2), bool(bits & 4),
+                          bool(bits & 8), bool(bits & 16), bool(bits & 32)};
+        const auto f = Choose(b[0], b[1], b[2], b[3], b[4], b[5]);
+        const bool sent = f.linear && !f.restart;
+        assert(!sent || (b[3] && b[4]));
+        assert(f.linear == (b[0] ? b[1] : b[2] && b[3] && b[4]) || f.restart);
+        assert(!f.restart || (b[0] && b[1] && !(b[3] && b[4])));
+        assert(f.hold != Hold::Projection || !b[3]);
+        assert(f.hold != Hold::Memory || (b[3] && b[5] && !b[4]));
+        assert(f.hold != Hold::Refused);
+        assert(f.hold == Hold::None || (Wants(b[0], b[1], b[2]) && !(b[3] && b[4])));
+    }
+}
+
+static bool Close(float a, float b, double absolute) {
+    return std::abs(double(a) - double(b)) <= absolute;
+}
+
+static void Inverse() {
+    // Hardware undoes Linear, so a capture's linear depth reads as the game's depth again.
+    using namespace rrweapondepth;
+    const Matrix game = Infinite(1);
+    Mapping m;
+    assert(Map(game, game, 0, m));
+    for (float d : {Slice, 0.75f, 0.5f, 0.1f, 1e-3f, 1e-5f, 2e-6f})
+        assert(Near(Hardware(Linear(d, m), m, 0), d, 1e-6));
+    // The weapon stays the weapon, at its own depth.
+    for (float t : {1e-5f, 1e-4f, 0.001f, 0.004f, 0.01f, 0.03f, 0.25f, 0.5f, 1.0f}) {
+        const float d = Weapon(t), back = Hardware(Linear(d, m), m, 0);
+        assert(back > Slice && Close(back, d, 3e-7));
+    }
+    assert(Hardware(Linear(1, m), m, 0) == 1);
+    // A weapon depth on the near plane or between it and the nearest world depth is the
+    // slice's back; nearer than the weapon's front is its front.
+    const float near_plane = m.scale / (1 + m.offset);
+    assert(Hardware(near_plane, m, 0) == Slice);
+    assert(Hardware(std::nextafter(Linear(Slice, m), 0.0f), m, 0) == Slice);
+    assert(Hardware(near_plane / 4096, m, 0) == 1);
+    // Sky, and what was clamped to it, is the sky's depth; nothing is NaN.
+    assert(Hardware(Linear(0, m), m, 0) == 0 && Hardware(Linear(1e-7f, m), m, 0) == 0);
+    // Depth Linear never gives stays as it is.
+    const float inf = std::numeric_limits<float>::infinity();
+    assert(Hardware(inf, m, 0) == inf && Hardware(-inf, m, 0) == -inf);
+    assert(std::isnan(Hardware(std::numeric_limits<float>::quiet_NaN(), m, 0)));
+    assert(Hardware(0, m, 0) == 0 && Hardware(-1, m, 0) == -1);
+    // World depth never comes back as the weapon, whatever the near plane.
+    for (float near_plane = 1e-3f; near_plane < 100; near_plane *= 1.37f) {
+        const Matrix p = Infinite(near_plane);
+        Matrix sky_test = p;
+        Mapping w;
+        assert(Map(p, p, 0, w) && Hardware(Linear(Slice, w), w, 0) <= Slice);
+        assert(rrskydepth::Apply(sky_test) && Map(p, sky_test, 0, w));
+        assert(Hardware(Linear(Slice, w), w, 0) <= Slice);
+    }
+    // Other near planes and the column layout.
+    const Matrix close = Infinite(0.1f);
+    Matrix column{};
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned col = 0; col < 4; ++col)
+            column[col * 4 + row] = close[row * 4 + col];
+    for (const Matrix &p : {close, column}) {
+        Mapping c;
+        assert(Map(p, p, 0, c));
+        assert(Near(Hardware(Linear(0.5f, c), c, 0), 0.5, 1e-6));
+        assert(Close(Hardware(Linear(Weapon(0.01f), c), c, 0), Weapon(0.01f), 3e-7));
+    }
+    // The sky depth test's finite far plane: nothing is farther than sky, so all world depth
+    // comes back.
+    Matrix passed = game;
+    assert(rrskydepth::Apply(passed) && Map(game, passed, 0, m) && m.offset > 0);
+    for (float d : {Slice, 0.5f, 0.01f, 1e-4f, 1e-6f, 1e-7f})
+        assert(Near(Hardware(Linear(d, m), m, 0), d, 1e-5));
+    assert(Close(Hardware(Linear(Weapon(0.01f), m), m, 0), Weapon(0.01f), 3e-7));
+    assert(Hardware(Linear(0, m), m, 0) == 0);
+    // The sky guide test: sky is the floor's depth.
+    const float floor = 1e-7f;
+    assert(Map(game, game, floor, m));
+    assert(Hardware(Linear(0, m), m, floor) == floor);
+    assert(Near(Hardware(Linear(0.5f, m), m, floor), 0.5, 1e-6));
+}
+
 static void Creation() {
     // RR is told the depth type at creation; linear depth is not inverted, so the game's
     // flag is cleared and every other flag kept.
@@ -178,11 +291,14 @@ static void Creation() {
 }
 
 int main() {
-    assert(!rrweapondepth::enabled && !rrweapondepth::changes); // Off until the panel says so.
+    // Off until the settings are applied (rr_settings.inl ApplyEnabled).
+    assert(!rrweapondepth::enabled && !rrweapondepth::changes);
     GameProjection();
     SkyDepthTest();
     SkySurfaceGuideTest();
     Unsupported();
+    Choice();
+    Inverse();
     Creation();
     std::puts("weapon depth tests passed");
 }

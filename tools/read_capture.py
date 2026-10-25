@@ -6,8 +6,9 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
-Test passes that change RR's inputs (color_scale, depth_floor): undo them with
-tools/analyze_sky_edges.py undo_tests(manifest, frames).
+Test passes that change RR's inputs (color_scale, contrast_knee, depth_floor, and linear_depth:
+weapon depth's linear view depth): undo them with tools/analyze_sky_edges.py undo_tests(manifest,
+frames).
 """
 import argparse
 import json
@@ -20,15 +21,24 @@ import numpy as np
 # 61 (R8_UNORM) is scaled to 0-1.
 FORMATS = {2: ('<f4', 4), 10: ('<f2', 4), 16: ('<f4', 2), 26: ('<u4', 1), 34: ('<f2', 2),
            41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1), 61: ('<u1', 1)}
-# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-12 need the SSS pre-denoise
+# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-15 need the SSS pre-denoise
 # build).
 LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from native temporal',
             'Lobe 2 fill gaps', 'Both lobes fill gaps', 'Raw, cap bright samples (8x)',
             'Raw, cap bright samples (4x)', 'Raw, AO fix A (fill gaps)', 'Raw, AO fix B (native)',
             'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
-            'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
+            'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps',
+            'SSS pixels: lobe 2 fill gaps, history + spatial (test)',
+            'SSS pixels: lobe 2 spatial fill only (test)',
+            'SSS pixels: lobe 2 fill gaps, settled + spatial (test)']
+MIXED_LIGHTING = 0xFFFFFFFF  # A frame's lighting_input when it changed within the frame.
+# Per-frame lighting_masked: whether an SSS-masked lighting input had its SSS guide.
+MASKED = {True: 'SSS guide applied', False: 'SSS guide missing, raw lighting',
+          None: 'not SSS-masked or not known'}
+# The same, on the lighting input line, when every frame has one value.
+MASKED_ALL = {True: 'SSS guide applied', False: 'SSS guide missing on every frame: raw lighting'}
 # Per-frame test settings and their off values; the summary shows only the ones that are on.
-FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
+FRAME_TESTS = {'color_scale': 1, 'contrast_knee': 0, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
                'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
 
 
@@ -105,6 +115,12 @@ def range_text(array):
             (f' ({bad} non-finite)' if bad else ''))
 
 
+def lighting_label(lobe):
+    if lobe == MIXED_LIGHTING:
+        return 'mixed (changed within the frame)'
+    return LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else 'unknown'
+
+
 def input_states(frame):
     """Where each input's copy state came from, leaving out the addon's own inputs, e.g.
     'color layouts (0x40), depth contract, motion proven'; '' for manifests without the keys."""
@@ -127,9 +143,14 @@ def summary(manifest, frames):
              f'settings {json.dumps(m["settings"], separators=(",", ":"))}']
     lobe = m['settings'].get('lighting_input')
     if type(lobe) is int:
-        lines.append(f'lighting input {lobe}: '
-                     f'{LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else "unknown"}')
-    setups = {tuple(f.get(k) for k in ('lighting_input', *FRAME_TESTS)) for f in m['frames']}
+        guides = {json.dumps(f.get('lighting_masked')) for f in m['frames']}  # True is not 1.
+        guide = m['frames'][0].get('lighting_masked') if len(guides) == 1 else None
+        note = '' if guide is None else (f' ({MASKED_ALL[guide]})' if type(guide) is bool else
+                                         f' (lighting_masked={json.dumps(guide)}: ?)')
+        lines.append(f'lighting input {lobe}: {lighting_label(lobe)}{note}')
+    setups = {(*(f.get(k) for k in ('lighting_input', 'lighting_masked', *FRAME_TESTS)),
+               bool(f.get('linear_depth'))) for f in m['frames']}
+    masked = any(f.get('lighting_masked') is not None for f in m['frames'])
     if len(setups) > 1:
         lines.append('warning: the frames differ in lighting input or test settings')
     states = [input_states(f) for f in m['frames']]
@@ -142,7 +163,15 @@ def summary(manifest, frames):
         reasons = f'({"|".join(names)})' if names else ''
         tests = ''.join(f' {k}={frame[k]}' for k, off in FRAME_TESTS.items()
                         if k in frame and frame[k] != off)
-        lighting = f' lighting_input={frame["lighting_input"]}' if 'lighting_input' in frame else ''
+        if frame.get('linear_depth'):   # Weapon depth's mapping: depth is linear view depth.
+            tests += ' linear_depth=on'
+        lobe = frame.get('lighting_input')
+        lighting = '' if lobe is None else (
+            f' lighting_input={lighting_label(lobe) if lobe == MIXED_LIGHTING else lobe}')
+        if masked:
+            guide = frame.get('lighting_masked')
+            known = guide is None or type(guide) is bool
+            lighting += f' lighting_masked={json.dumps(guide)} ({MASKED[guide] if known else "?"})'
         lines.append(f'frame {frame["index"]} serial={frame["serial"]} sl_frame={frame["sl_frame"]} '
                      f'delivered={frame["delivered"]} reset={frame["reset"]} '
                      f'reset_reasons={frame["reset_reasons"]}{reasons} jitter={frame["jitter"]}'
@@ -207,7 +236,9 @@ def self_test():
             frames_json.append({'index': i, 'serial': 10 + i, 'sl_frame': 20 + i, 'delivered': True,
                                 'reset': bool(i), 'reset_reasons': 3 * i, 'jitter': [0.25, -0.125],
                                 'lighting_input': 12, 'color_scale': [1, 4][i], 'guide_test': 0,
-                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs})
+                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs,
+                                'linear_depth': [None, {'scale': 0.1, 'offset': 0, 'sky': 1e5,
+                                                        'slice': 0.984375, 'knee': 2 ** -11}][i]})
         manifest = {'format': 'mw4-rr-capture', 'version': 1, 'frame_count': 2,
                     'render_width': width, 'render_height': height, 'output_width': 8,
                     'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True,
@@ -255,15 +286,73 @@ def self_test():
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
         expect('jitter=[0.25, -0.125] lighting_input=12\n' in text, 'frame 0 lighting, tests off')
-        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge\n' in text,
+        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge linear_depth=on\n' in text,
                'frame 1 tests that are on')
         expect('warning: the frames differ in lighting input or test settings' in text,
                'mixed test settings warned')
         same = {**manifest, 'frames': [manifest['frames'][0]] * 2}
         expect(not any(line.startswith('warning') for line in summary(same, frames)),
                'uniform test settings not warned')
+        linear = {**manifest, 'frames': [manifest['frames'][0],
+                                         {**manifest['frames'][0], 'linear_depth': {'scale': 1}}]}
+        expect('warning: the frames differ in lighting input or test settings' in
+               summary(linear, frames), 'weapon depth in some frames warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
+        # Whether an SSS-masked input had its guide: older manifests have no key, and print nothing.
+        expect('lighting_masked' not in text and 'SSS guide' not in text, 'no lighting_masked key')
+        base = json.loads(json.dumps(manifest))  # Frames 0 and 1, no test on.
+        for f in base['frames']:
+            f.update(color_scale=1, responsivity_source='none', linear_depth=None)
+        expect(not any(line.startswith('warning') for line in summary(base, frames)), 'base')
+        masked = json.loads(json.dumps(base))
+        for f, v in zip(masked['frames'], [True, False]):
+            f['lighting_masked'] = v
+        (folder / 'manifest.json').write_text(json.dumps(masked), encoding='utf-8')
+        expect(load(folder)[0] == masked, 'a manifest with lighting_masked loads')
+        lines = summary(masked, frames)
+        expect(any(line.startswith('frame 0 ') and
+                   line.endswith('lighting_input=12 lighting_masked=true (SSS guide applied)')
+                   for line in lines), f'frame 0 guide applied: {lines}')
+        expect(any(line.startswith('frame 1 ') and line.endswith(
+                   'lighting_input=12 lighting_masked=false (SSS guide missing, raw lighting)')
+                   for line in lines), f'frame 1 guide missing: {lines}')
+        expect('warning: the frames differ in lighting input or test settings' in lines,
+               'frames that differ only in lighting_masked are warned')
+        masked['frames'][1]['lighting_masked'] = None  # Shown once any frame has a value.
+        lines = summary(masked, frames)
+        expect(any(line.startswith('frame 1 ') and
+                   line.endswith('lighting_masked=null (not SSS-masked or not known)')
+                   for line in lines), f'frame 1 not known: {lines}')
+        masked['frames'][1]['lighting_masked'] = 2  # Not a value the addon writes.
+        lines = summary(masked, frames)
+        expect(any(line.startswith('frame 1 ') and line.endswith('lighting_masked=2 (?)')
+                   for line in lines), f'frame 1 unknown value: {lines}')
+        # The lighting input line says it when every frame shares one value.
+        header = 'lighting input 12: SSS pixels: both lobes fill gaps'
+        for values, note in (([True, True], ' (SSS guide applied)'),
+                             ([False, False], ' (SSS guide missing on every frame: raw lighting)'),
+                             ([2, 2], ' (lighting_masked=2: ?)'), ([True, False], ''),
+                             ([True, None], ''), ([True, 1], ''), ([None, None], '')):
+            for f, v in zip(masked['frames'], values):
+                f['lighting_masked'] = v
+            lines = summary(masked, frames)
+            expect(header + note in lines, f'lighting input line for {values}: {lines[:3]}')
+        lines = summary(masked, frames)
+        expect(not any('lighting_masked' in line or line.startswith('warning') for line in lines),
+               f'all null: nothing printed, nothing warned: {lines}')
+        # A frame whose lighting changed within it, and a header (frame 0) that was one.
+        mixed = json.loads(json.dumps(base))
+        mixed['frames'][1]['lighting_input'] = 0xFFFFFFFF
+        lines = summary(mixed, frames)
+        expect(any(line.startswith('frame 1 ') and
+                   line.endswith('lighting_input=mixed (changed within the frame)')
+                   for line in lines), f'mixed frame labelled: {lines}')
+        mixed['settings'] = {**mixed['settings'], 'lighting_input': 0xFFFFFFFF}
+        expect('lighting input 4294967295: mixed (changed within the frame)' in
+               summary(mixed, frames), 'mixed header label')
+        mixed['settings']['lighting_input'] = 16
+        expect('lighting input 16: unknown' in summary(mixed, frames), 'unknown lighting label')
         # Input states: a manifest without them (older builds) prints nothing new.
         expect('input states' not in text and 'differ in input states' not in text,
                'no input states line without the keys')
@@ -278,7 +367,15 @@ def self_test():
         lines = summary(stated, frames)
         expect('input states: color layouts (0x40), depth contract, motion proven' in lines,
                f'input states of frame 0, addon ones left out: {lines[:4]}')
-        expect('warning: the frames differ in input states' in lines, 'differing states warned')
+        # Frame 1 a copy of frame 0 but for one input's state_before, or its state.
+        for name, key, value in (('color', 'state_before', 0x80), ('motion', 'state', 'contract')):
+            differ = json.loads(json.dumps(stated))
+            differ['frames'][1] = json.loads(json.dumps(stated['frames'][0]))
+            differ['frames'][1]['inputs'][name][key] = value
+            lines = summary(differ, frames)
+            expect('warning: the frames differ in input states' in lines and
+                   'warning: the frames differ in lighting input or test settings' not in lines,
+                   f'frames that differ only in {name} {key} are warned: {lines[:5]}')
         same = {**stated, 'frames': [stated['frames'][0]] * 2}
         lines = summary(same, frames)
         expect('input states: color layouts (0x40), depth contract, motion proven' in lines and

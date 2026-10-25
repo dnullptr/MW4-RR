@@ -20,8 +20,9 @@ RWTexture2D<float4> SpecularAlbedo : register(u2);
 // 0=padding, 1=ordinary, 2=sky, 3=special, 4=invalid/unsupported.
 // A runtime consumer must reject a packet containing status4.
 RWTexture2D<uint> Status : register(u3);
-// Water classification for src/rr_water.h, 1 on water pixels. A null view
-// (zero size) when no water test wants it.
+// Water classification for src/rr_water.h, as code/255 (RRWaterCode), 0 for sky
+// and padding. shaders/rr_water_masks.hlsl counts the codes and turns them into
+// 1 on water, 0 elsewhere. A null view (zero size) when no water test wants it.
 RWTexture2D<float> Water : register(u4);
 // 0..3 = rrwater::Guide: game mirror, mirror with smoothed normal, water
 // material arrays, physical water constants with smoothed normal.
@@ -58,12 +59,22 @@ void RRWriteEmpty(uint2 p,uint status,float roughness)
     DiffuseAlbedo[p]=0;SpecularAlbedo[p]=0;Status[p]=status;
 }
 
-// cs_prepass marks water with w bit2 (value 4), never together with the
-// depth override (value 8); water always carries the special bit as well.
-bool RRWaterSurface(uint w) { return (w&4u)!=0 && (w&8u)==0; }
+// Water is every special surface (w&2): cs_prepass sets it for its water flag
+// (w&4, which it derives from the tile water's NormalGloss bit 31 marker) and for the class override (w&8),
+// which never come together. Andi's river captures (2026-10-25) carry the
+// override, mirror material and all, while only distant water has the flag,
+// and no other surface in those scenes is special.
+bool RRWaterSurface(uint w) { return (w&2u)!=0; }
+
+// Water code bits (rrwater::Prepass in src/rr_water.h): 1 water, 2 special (w&2),
+// 4 water flag (w&4), 8 override (w&8), 16 NormalGloss bit 31, 32 converted.
+// The flags are kept for pixels that fail validation, so the water report can
+// tell an unmarked surface from a marked one this shader rejects.
+uint RRWaterCode(uint w,uint normalGloss) { return (w&14u)|((normalGloss>>31)<<4); }
 
 // Mean wave normal of the water pixels in a 7x7 window, so the guide keeps the
-// surface's broad shape without its per-pixel ripple detail.
+// surface's broad shape without its per-pixel ripple detail. Each neighbour's
+// normal comes from where main reads it: override pixels from PackedSurface.y.
 float3 RRWaterSmoothNormal(int2 p,float3 normal)
 {
     float3 sum=0;
@@ -72,8 +83,10 @@ float3 RRWaterSmoothNormal(int2 p,float3 normal)
         [loop]for(int x=-3;x<=3;++x){
             int2 q=p+int2(x,y);
             if(any(q<0) || any(q>=extent))continue;
-            if(!RRWaterSurface(PackedSurface.Load(int3(q,0)).w))continue;
-            float3 n=RRDecodeNormalGloss(NormalGloss.Load(int4(RRMaterialArrayAddress(uint2(q)),0))).xyz;
+            uint4 neighbour=PackedSurface.Load(int3(q,0));
+            if(!RRWaterSurface(neighbour.w))continue;
+            float3 n=(neighbour.w&8u)!=0?RRDecodeSurfaceNormal(neighbour.y)
+                :RRDecodeNormalGloss(NormalGloss.Load(int4(RRMaterialArrayAddress(uint2(q)),0))).xyz;
             if(RRFinite3(n))sum+=n;
         }
     }
@@ -114,6 +127,11 @@ void main(uint3 id : SV_DispatchThreadID)
         NormalRoughness[p]=0;
 #endif
         return;
+    }
+    uint waterCode=0;
+    if(waterOut){
+        waterCode=RRWaterCode(surface.w,NormalGloss.Load(int4(RRMaterialArrayAddress(p),0)));
+        Water[p]=waterCode/255.0f;
     }
     if(!RRFinite(depth) || depth<=0 || depth>1)return;
     bool alternate=(surface.w&1u)!=0, special=(surface.w&2u)!=0, depthOverride=(surface.w&8u)!=0;
@@ -158,6 +176,8 @@ void main(uint3 id : SV_DispatchThreadID)
         // Fresnel-weighted specular reflectance, so it is already a specular
         // albedo: no second BRDF fit. Both arrays are read here regardless of
         // the Settings gates above, which only cover non-special pixels.
+        // That is established for the water flag's tile water only: what the
+        // arrays hold on override pixels (the river) is not known.
         float3 waterF0=MaterialF0.Load(int4(address,0));
         float3 waterDiffuse=MaterialDiffuse.Load(int4(address,0));
         if(RRFinite3(waterF0))specular=saturate(waterF0);
@@ -173,5 +193,5 @@ void main(uint3 id : SV_DispatchThreadID)
     DiffuseAlbedo[p]=float4(diffuse,1);
     SpecularAlbedo[p]=float4(specular,1);
     Status[p]=special?3u:1u;
-    if(waterOut && water)Water[p]=1;
+    if(waterOut)Water[p]=(waterCode|32u|(water?1u:0u))/255.0f;
 }
