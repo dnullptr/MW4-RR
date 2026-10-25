@@ -1,4 +1,5 @@
 #include "../src/rr_transparency_blend_policy.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -57,11 +58,11 @@ static void TestTargets() {
     assert(!FindTarget(0, 0));
 }
 
-static D3D12_BLEND_DESC Native(D3D12_BLEND dest) {
+static D3D12_BLEND_DESC Native(D3D12_BLEND dest, D3D12_BLEND src = D3D12_BLEND_ONE) {
     D3D12_BLEND_DESC d{};
     auto &rt = d.RenderTarget[0];
     rt.BlendEnable = TRUE;
-    rt.SrcBlend = D3D12_BLEND_ONE;
+    rt.SrcBlend = src;
     rt.DestBlend = dest;
     rt.BlendOp = D3D12_BLEND_OP_ADD;
     rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
@@ -72,34 +73,115 @@ static D3D12_BLEND_DESC Native(D3D12_BLEND dest) {
     return d;
 }
 
+// Dest factors that read the source alone.
+static constexpr D3D12_BLEND AcceptedDest[] = {D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR,
+                                               D3D12_BLEND_SRC_COLOR,  D3D12_BLEND_INV_SRC_COLOR,
+                                               D3D12_BLEND_SRC_ALPHA,  D3D12_BLEND_INV_SRC_ALPHA,
+                                               D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA};
+// Source factors that never read dest.
+static constexpr D3D12_BLEND AcceptedSource[] = {
+    D3D12_BLEND_ZERO,         D3D12_BLEND_ONE,
+    D3D12_BLEND_SRC_COLOR,    D3D12_BLEND_INV_SRC_COLOR,
+    D3D12_BLEND_SRC_ALPHA,    D3D12_BLEND_INV_SRC_ALPHA,
+    D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR,
+    D3D12_BLEND_SRC1_COLOR,   D3D12_BLEND_INV_SRC1_COLOR,
+    D3D12_BLEND_SRC1_ALPHA,   D3D12_BLEND_INV_SRC1_ALPHA,
+    D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_INV_ALPHA_FACTOR};
+// Source factors that read dest (SRC_ALPHA_SAT is min(As, 1 - Ad)).
+static constexpr D3D12_BLEND DestReading[] = {D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+                                              D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA,
+                                              D3D12_BLEND_SRC_ALPHA_SAT};
+
+// Tiny D3D12 colour blend evaluator for RT0 with BlendOp ADD, inputs in [0, 1].
+struct BlendInputs {
+    float src[4], src1[4], dest[4], factor[4];
+};
+static float Factor(D3D12_BLEND f, const BlendInputs &in, int ch) {
+    switch (f) {
+    case D3D12_BLEND_ZERO:
+        return 0.f;
+    case D3D12_BLEND_ONE:
+        return 1.f;
+    case D3D12_BLEND_SRC_COLOR:
+        return in.src[ch];
+    case D3D12_BLEND_INV_SRC_COLOR:
+        return 1.f - in.src[ch];
+    case D3D12_BLEND_SRC_ALPHA:
+        return in.src[3];
+    case D3D12_BLEND_INV_SRC_ALPHA:
+        return 1.f - in.src[3];
+    case D3D12_BLEND_DEST_ALPHA:
+        return in.dest[3];
+    case D3D12_BLEND_INV_DEST_ALPHA:
+        return 1.f - in.dest[3];
+    case D3D12_BLEND_DEST_COLOR:
+        return in.dest[ch];
+    case D3D12_BLEND_INV_DEST_COLOR:
+        return 1.f - in.dest[ch];
+    case D3D12_BLEND_SRC_ALPHA_SAT:
+        return (std::min)(in.src[3], 1.f - in.dest[3]);
+    case D3D12_BLEND_BLEND_FACTOR:
+        return in.factor[ch];
+    case D3D12_BLEND_INV_BLEND_FACTOR:
+        return 1.f - in.factor[ch];
+    case D3D12_BLEND_SRC1_COLOR:
+        return in.src1[ch];
+    case D3D12_BLEND_INV_SRC1_COLOR:
+        return 1.f - in.src1[ch];
+    case D3D12_BLEND_SRC1_ALPHA:
+        return in.src1[3];
+    case D3D12_BLEND_INV_SRC1_ALPHA:
+        return 1.f - in.src1[3];
+    case D3D12_BLEND_ALPHA_FACTOR:
+        return in.factor[3];
+    case D3D12_BLEND_INV_ALPHA_FACTOR:
+        return 1.f - in.factor[3];
+    default:
+        assert(!"unexpected blend factor");
+        return std::nanf("");
+    }
+}
+static float Blend(const D3D12_RENDER_TARGET_BLEND_DESC &rt, const BlendInputs &in, int ch) {
+    assert(rt.BlendEnable && rt.BlendOp == D3D12_BLEND_OP_ADD);
+    return in.src[ch] * Factor(rt.SrcBlend, in, ch) + in.dest[ch] * Factor(rt.DestBlend, in, ch);
+}
+static const BlendInputs Probes[] = {{{0.8f, 0.3f, 0.6f, 0.4f},
+                                      {0.25f, 0.5f, 0.75f, 0.2f},
+                                      {0.9f, 0.5f, 0.1f, 0.7f},
+                                      {0.3f, 0.6f, 0.9f, 0.5f}},
+                                     {{0.1f, 1.f, 0.45f, 0.95f},
+                                      {1.f, 0.05f, 0.6f, 0.65f},
+                                      {0.35f, 1.f, 0.6f, 0.15f},
+                                      {0.7f, 0.2f, 0.05f, 0.85f}}};
+static BlendInputs WithDest(BlendInputs in, float value) {
+    for (auto &channel : in.dest)
+        channel = value;
+    return in;
+}
+
 static void TestClassify() {
-    for (auto dest : {D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR, D3D12_BLEND_SRC_COLOR,
-                      D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA,
-                      D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA})
+    for (auto dest : AcceptedDest)
         assert(Classify(Native(dest), 1) == BlendClass::Accept);
     // Observed b723 state (programs.json): ONE / INV_SRC_ALPHA, write mask 15.
     assert(Classify(Native(D3D12_BLEND_INV_SRC_ALPHA), 1) == BlendClass::Accept);
     // Source factors that do not read dest keep dest * f(src) the transmittance.
-    for (auto src :
-         {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR,
-          D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_BLEND_FACTOR,
-          D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR,
-          D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA}) {
-        auto source = Native(D3D12_BLEND_INV_SRC1_COLOR);
-        source.RenderTarget[0].SrcBlend = src;
-        assert(Classify(source, 1) == BlendClass::Accept);
-    }
+    for (auto src : AcceptedSource)
+        assert(Classify(Native(D3D12_BLEND_INV_SRC1_COLOR, src), 1) == BlendClass::Accept);
     // A source term that reads dest (e.g. modulate 2x: DEST_COLOR / SRC_COLOR) makes
     // the composite non-linear in dest, so f(src) alone is not its transmittance.
-    for (auto src : {D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_DEST_ALPHA,
-                     D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_SRC_ALPHA_SAT}) {
-        auto modulate = Native(D3D12_BLEND_SRC_COLOR);
-        modulate.RenderTarget[0].SrcBlend = src;
+    for (auto src : DestReading) {
+        const auto modulate = Native(D3D12_BLEND_SRC_COLOR, src);
         assert(Classify(modulate, 1) == BlendClass::Factor);
-        auto dual = Native(D3D12_BLEND_INV_SRC1_COLOR);
-        dual.RenderTarget[0].SrcBlend = src;
-        assert(Classify(dual, 1) == BlendClass::Factor);
+        assert(Classify(Native(D3D12_BLEND_INV_SRC1_COLOR, src), 1) == BlendClass::Factor);
+        const auto &in = Probes[0];
+        const float composite = Blend(modulate.RenderTarget[0], in, 0) -
+                                Blend(modulate.RenderTarget[0], WithDest(in, 0.f), 0);
+        assert(std::fabs(composite - in.dest[0] * in.src[0]) > 1e-3f);
     }
+    // Only the listed source factors are accepted; undefined values are refused.
+    for (int value : {0, 12, 13, 22, 255})
+        assert(Classify(Native(D3D12_BLEND_INV_SRC1_COLOR, static_cast<D3D12_BLEND>(value)), 1) ==
+               BlendClass::Factor);
     auto rgb_only = Native(D3D12_BLEND_INV_SRC1_COLOR);
     rgb_only.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
     assert(Classify(rgb_only, 1) == BlendClass::Accept);
@@ -112,15 +194,21 @@ static void TestClassify() {
     for (auto dest :
          {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
           D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_BLEND_FACTOR,
-          D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC_ALPHA_SAT})
+          D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ALPHA_FACTOR,
+          D3D12_BLEND_INV_ALPHA_FACTOR})
         assert(Classify(Native(dest), 1) == BlendClass::Factor);
-    auto op = Native(D3D12_BLEND_INV_SRC1_COLOR);
-    op.RenderTarget[0].BlendOp = D3D12_BLEND_OP_SUBTRACT;
-    assert(Classify(op, 1) == BlendClass::Op);
-    op.RenderTarget[0].BlendOp = D3D12_BLEND_OP_MAX;
-    assert(Classify(op, 1) == BlendClass::Op);
+    for (auto blend_op : {D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_MIN,
+                          D3D12_BLEND_OP_MAX}) {
+        auto op = Native(D3D12_BLEND_INV_SRC1_COLOR);
+        op.RenderTarget[0].BlendOp = blend_op;
+        assert(Classify(op, 1) == BlendClass::Op);
+    }
     auto logic = Native(D3D12_BLEND_INV_SRC1_COLOR);
     logic.RenderTarget[0].LogicOpEnable = TRUE;
+    assert(Classify(logic, 1) == BlendClass::Logic);
+    // A logic-op-only state (no blend) is refused too.
+    logic.RenderTarget[0].BlendEnable = FALSE;
+    logic.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_AND;
     assert(Classify(logic, 1) == BlendClass::Logic);
     auto mask = Native(D3D12_BLEND_INV_SRC1_COLOR);
     mask.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALPHA;
@@ -133,9 +221,19 @@ static void TestClassify() {
     assert(Classify(coverage, 1) == BlendClass::Mask);
 }
 
+static bool Src1(D3D12_BLEND f) {
+    return f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR ||
+           f == D3D12_BLEND_SRC1_ALPHA || f == D3D12_BLEND_INV_SRC1_ALPHA;
+}
+static bool Colour(D3D12_BLEND f) {
+    return f == D3D12_BLEND_SRC_COLOR || f == D3D12_BLEND_INV_SRC_COLOR ||
+           f == D3D12_BLEND_DEST_COLOR || f == D3D12_BLEND_INV_DEST_COLOR ||
+           f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR;
+}
+
 static void TestPatchBlend() {
+    // Field by field for an accepted native state with stale state elsewhere.
     auto native = Native(D3D12_BLEND_INV_SRC1_COLOR);
-    native.AlphaToCoverageEnable = TRUE;
     native.IndependentBlendEnable = TRUE;
     native.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
     native.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
@@ -143,6 +241,7 @@ static void TestPatchBlend() {
     native.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
     for (UINT i = 1; i < 8; ++i)
         native.RenderTarget[i] = native.RenderTarget[0];
+    assert(Classify(native, 1) == BlendClass::Accept);
     const auto p = PatchBlend(native);
     assert(p.AlphaToCoverageEnable == FALSE);
     assert(p.IndependentBlendEnable == FALSE);
@@ -170,10 +269,47 @@ static void TestPatchBlend() {
     auto refraction = Native(D3D12_BLEND_INV_SRC_ALPHA);
     refraction.RenderTarget[0].RenderTargetWriteMask =
         D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_ALPHA;
+    assert(Classify(refraction, 1) == BlendClass::Accept);
     const auto q = PatchBlend(refraction);
     assert(q.RenderTarget[0].DestBlend == D3D12_BLEND_INV_SRC_ALPHA);
     assert(q.RenderTarget[0].RenderTargetWriteMask == D3D12_COLOR_WRITE_ENABLE_GREEN);
+
+    // Every accepted combination patches to a legal state whose blend records
+    // exactly the composite's transmittance: variant(d) = d * f(src) = native(d) - native(0).
+    for (auto dest : AcceptedDest)
+        for (auto src : AcceptedSource) {
+            const auto n = Native(dest, src);
+            assert(Classify(n, 1) == BlendClass::Accept);
+            const auto v = PatchBlend(n);
+            assert(!v.AlphaToCoverageEnable && !v.IndependentBlendEnable);
+            for (UINT i = 0; i < 8; ++i) {
+                const auto &r = v.RenderTarget[i];
+                assert(!r.LogicOpEnable);
+                assert(!Colour(r.SrcBlendAlpha) && !Colour(r.DestBlendAlpha));
+                if (i)
+                    assert(!Src1(r.SrcBlend) && !Src1(r.DestBlend) && !Src1(r.SrcBlendAlpha) &&
+                           !Src1(r.DestBlendAlpha));
+            }
+            const auto &r0 = v.RenderTarget[0];
+            assert(r0.SrcBlend == D3D12_BLEND_ZERO && r0.BlendOp == D3D12_BLEND_OP_ADD &&
+                   r0.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+            for (const auto &in : Probes)
+                for (int ch = 0; ch < 3; ++ch) {
+                    // f must not read dest: a NaN dest would poison it.
+                    const float f = Factor(dest, WithDest(in, std::nanf("")), ch);
+                    const float expected = in.dest[ch] * f;
+                    assert(Near(Blend(r0, in, ch), expected));
+                    assert(Near(Blend(n.RenderTarget[0], in, ch) -
+                                    Blend(n.RenderTarget[0], WithDest(in, 0.f), ch),
+                                expected));
+                }
+        }
 }
+
+static constexpr D3D12_STENCIL_OP WritingStencilOps[] = {
+    D3D12_STENCIL_OP_ZERO,     D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
+    D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT,  D3D12_STENCIL_OP_INCR,
+    D3D12_STENCIL_OP_DECR};
 
 static void TestDepthStencil() {
     D3D12_DEPTH_STENCIL_DESC d{};
@@ -197,16 +333,17 @@ static void TestDepthStencil() {
         &D3D12_DEPTH_STENCILOP_DESC::StencilFailOp, &D3D12_DEPTH_STENCILOP_DESC::StencilDepthFailOp,
         &D3D12_DEPTH_STENCILOP_DESC::StencilPassOp};
     for (auto face : {&D3D12_DEPTH_STENCIL_DESC::FrontFace, &D3D12_DEPTH_STENCIL_DESC::BackFace})
-        for (auto op : ops) {
-            auto writes = d;
-            (writes.*face).*op = D3D12_STENCIL_OP_REPLACE;
-            assert(DepthStencilReplayable(writes) == DepthClass::Refuse);
-            writes.StencilWriteMask = 0;
-            assert(DepthStencilReplayable(writes) == DepthClass::KeepDsv);
-            writes.StencilWriteMask = 0x80;
-            writes.StencilEnable = FALSE;
-            assert(DepthStencilReplayable(writes) == DepthClass::KeepDsv);
-        }
+        for (auto op : ops)
+            for (auto changes : WritingStencilOps) {
+                auto writes = d;
+                (writes.*face).*op = changes;
+                assert(DepthStencilReplayable(writes) == DepthClass::Refuse);
+                writes.StencilWriteMask = 0;
+                assert(DepthStencilReplayable(writes) == DepthClass::KeepDsv);
+                writes.StencilWriteMask = 0x80;
+                writes.StencilEnable = FALSE;
+                assert(DepthStencilReplayable(writes) == DepthClass::KeepDsv);
+            }
 
     // Stencil test only (no depth test) that never writes keeps the DSV.
     d.DepthEnable = FALSE;
@@ -254,6 +391,41 @@ static void TestDepthStencil() {
     e.DepthEnable = TRUE;
     e.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     assert(DepthStencilReplayable(e) == DepthClass::Refuse);
+
+    // Every writing op in every slot of either face refuses only through that
+    // face's own write mask.
+    D3D12_STENCIL_OP D3D12_DEPTH_STENCILOP_DESC1::*ops1[] = {
+        &D3D12_DEPTH_STENCILOP_DESC1::StencilFailOp,
+        &D3D12_DEPTH_STENCILOP_DESC1::StencilDepthFailOp,
+        &D3D12_DEPTH_STENCILOP_DESC1::StencilPassOp};
+    e.StencilEnable = TRUE;
+    e.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    for (auto face : {&D3D12_DEPTH_STENCIL_DESC2::FrontFace, &D3D12_DEPTH_STENCIL_DESC2::BackFace})
+        for (auto op : ops1)
+            for (auto changes : WritingStencilOps) {
+                auto writes = e;
+                writes.FrontFace = writes.BackFace = kept;
+                (writes.*face).*op = changes;
+                assert(DepthStencilReplayable(writes) == DepthClass::Refuse);
+                (writes.*face).StencilWriteMask = 0;
+                assert(DepthStencilReplayable(writes) == DepthClass::KeepDsv);
+            }
+
+    // The depth bounds test reads the DSV and discards pixels, against bounds
+    // set on the command list that this policy cannot mirror: always refused.
+    D3D12_DEPTH_STENCIL_DESC2 bounds{};
+    bounds.DepthBoundsTestEnable = TRUE;
+    assert(DepthStencilReplayable(bounds) == DepthClass::Refuse);
+    bounds.DepthEnable = TRUE;
+    bounds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    bounds.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    assert(DepthStencilReplayable(bounds) == DepthClass::Refuse);
+    bounds.DepthEnable = FALSE;
+    bounds.StencilEnable = TRUE;
+    bounds.FrontFace = bounds.BackFace = kept;
+    assert(DepthStencilReplayable(bounds) == DepthClass::Refuse);
+    bounds.DepthBoundsTestEnable = FALSE;
+    assert(DepthStencilReplayable(bounds) == DepthClass::KeepDsv);
 }
 
 static D3D12_INDIRECT_ARGUMENT_DESC Arg(D3D12_INDIRECT_ARGUMENT_TYPE type) {
@@ -691,7 +863,8 @@ static void TestReference() {
         c = (5.f / 16.f - OpacityFloor) / (1.f - OpacityFloor);
         assert(Near(g.diffuse[0], 0.9f + c * (0.5f - 0.9f)));
         assert(Near(g.specular[2], 0.06f + c * (0.f - 0.06f)));
-        // Unfiltered, an out-of-range centre clamps to full coverage.
+        // Unfiltered, an out-of-range centre clamps to full coverage. The outer
+        // saturate clamps it too; this documents equivalence with the shader.
         Fill(t, -0.5f);
         g = Sample();
         Reference(Admitted(plain), 3, 3, 1, t, g);

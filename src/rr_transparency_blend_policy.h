@@ -114,14 +114,15 @@ inline bool Extent(const D3D12_RESOURCE_DESC &coverage, uint32_t render_w, uint3
 // dest' = src * g + dest * f(src), and dest * f(src) is its transmittance only
 // when f reads the source alone and the source term g never reads dest.
 enum class BlendClass { Accept, NoBlend, Factor, Op, Logic, Mask, Targets };
+// Dest factors computed from the source alone. The UNORM variant target
+// saturates every shader output before blending (o0 and, with dual source,
+// o1), so each of these is clamped to [0, 1] in the variant even where the
+// native float-target blend sees larger values. a36d (1 - T) and b723
+// (saturated alpha) stay exact while T is in [0, 1].
 inline bool SourceFactor(D3D12_BLEND factor) {
     switch (factor) {
     case D3D12_BLEND_SRC1_COLOR:
     case D3D12_BLEND_INV_SRC1_COLOR:
-    // The UNORM variant target clamps the source to [0, 1] before blending, so
-    // with HDR source colour these two record a different factor than the
-    // native float-target blend. a36d (SRC1 = 1 - T) and b723 (saturated
-    // alpha) are unaffected.
     case D3D12_BLEND_SRC_COLOR:
     case D3D12_BLEND_INV_SRC_COLOR:
     case D3D12_BLEND_SRC_ALPHA:
@@ -133,11 +134,28 @@ inline bool SourceFactor(D3D12_BLEND factor) {
         return false;
     }
 }
-// SRC_ALPHA_SAT is min(As, 1 - Ad).
-inline bool ReadsDest(D3D12_BLEND factor) {
-    return factor == D3D12_BLEND_DEST_COLOR || factor == D3D12_BLEND_INV_DEST_COLOR ||
-           factor == D3D12_BLEND_DEST_ALPHA || factor == D3D12_BLEND_INV_DEST_ALPHA ||
-           factor == D3D12_BLEND_SRC_ALPHA_SAT;
+// Source factors known never to read dest. Everything else is refused: the
+// dest reads (DEST_*, and SRC_ALPHA_SAT = min(As, 1 - Ad)) and undefined values.
+inline bool IgnoresDest(D3D12_BLEND factor) {
+    switch (factor) {
+    case D3D12_BLEND_ZERO:
+    case D3D12_BLEND_ONE:
+    case D3D12_BLEND_SRC_COLOR:
+    case D3D12_BLEND_INV_SRC_COLOR:
+    case D3D12_BLEND_SRC_ALPHA:
+    case D3D12_BLEND_INV_SRC_ALPHA:
+    case D3D12_BLEND_BLEND_FACTOR:
+    case D3D12_BLEND_INV_BLEND_FACTOR:
+    case D3D12_BLEND_SRC1_COLOR:
+    case D3D12_BLEND_INV_SRC1_COLOR:
+    case D3D12_BLEND_SRC1_ALPHA:
+    case D3D12_BLEND_INV_SRC1_ALPHA:
+    case D3D12_BLEND_ALPHA_FACTOR:
+    case D3D12_BLEND_INV_ALPHA_FACTOR:
+        return true;
+    default:
+        return false;
+    }
 }
 inline BlendClass Classify(const D3D12_BLEND_DESC &blend, UINT num_render_targets) {
     const auto &rt = blend.RenderTarget[0];
@@ -152,8 +170,8 @@ inline BlendClass Classify(const D3D12_BLEND_DESC &blend, UINT num_render_target
     // Alpha to coverage changes which samples are written.
     if (blend.AlphaToCoverageEnable || !(rt.RenderTargetWriteMask & 7))
         return BlendClass::Mask;
-    return SourceFactor(rt.DestBlend) && !ReadsDest(rt.SrcBlend) ? BlendClass::Accept
-                                                                 : BlendClass::Factor;
+    return SourceFactor(rt.DestBlend) && IgnoresDest(rt.SrcBlend) ? BlendClass::Accept
+                                                                  : BlendClass::Factor;
 }
 // Valid only for a native blend that Classify returned Accept for.
 inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native) {
@@ -190,6 +208,10 @@ inline bool KeepsStencil(const D3D12_DEPTH_STENCILOP_DESC1 &face) {
 // DESC2 is the repo's normalized form (rrsss::NormalizeDepthStencil), with a
 // write mask per face as ReShade reports it.
 inline DepthClass DepthStencilReplayable(const D3D12_DEPTH_STENCIL_DESC2 &d) {
+    // The depth bounds test reads the DSV and discards pixels against bounds
+    // set on the command list; refused as in rrsss (Status::DepthBounds).
+    if (d.DepthBoundsTestEnable)
+        return DepthClass::Refuse;
     if (!d.DepthEnable && !d.StencilEnable)
         return DepthClass::NoDsv;
     // D3D never writes depth while the depth test is disabled.
