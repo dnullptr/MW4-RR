@@ -54,6 +54,12 @@ static void TestTargets() {
     assert(!FindTarget(0xa36d02f6245a4129ull, 11855));
     assert(!FindTarget(0xa36d02f6245a4129ull, 4812));
     assert(!FindTarget(0xb72393e05df90a78ull, 11856));
+    // Another build's refraction composite (Oct 18 lineage capture, event 604).
+    auto other = FindTarget(0x5a24807dc07ce595ull, 4780);
+    assert(other && other->kind == Kind::Refraction && other->bytes == 4780);
+    assert(!FindTarget(0x5a24807dc07ce595ull, 4812));
+    assert(!FindTarget(0x5a24807dc07ce595ull, 4779));
+    assert(!FindTarget(0xb72393e05df90a78ull, 4780));
     assert(!FindTarget(0xa36d02f6245a4128ull, 11856));
     assert(!FindTarget(0, 0));
 }
@@ -145,6 +151,11 @@ static float Blend(const D3D12_RENDER_TARGET_BLEND_DESC &rt, const BlendInputs &
     assert(rt.BlendEnable && rt.BlendOp == D3D12_BLEND_OP_ADD);
     return in.src[ch] * Factor(rt.SrcBlend, in, ch) + in.dest[ch] * Factor(rt.DestBlend, in, ch);
 }
+static float BlendAlpha(const D3D12_RENDER_TARGET_BLEND_DESC &rt, const BlendInputs &in) {
+    assert(rt.BlendEnable && rt.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+    return in.src[3] * Factor(rt.SrcBlendAlpha, in, 3) +
+           in.dest[3] * Factor(rt.DestBlendAlpha, in, 3);
+}
 static const BlendInputs Probes[] = {{{0.8f, 0.3f, 0.6f, 0.4f},
                                       {0.25f, 0.5f, 0.75f, 0.2f},
                                       {0.9f, 0.5f, 0.1f, 0.7f},
@@ -219,6 +230,18 @@ static void TestClassify() {
     auto coverage = Native(D3D12_BLEND_INV_SRC1_COLOR);
     coverage.AlphaToCoverageEnable = TRUE;
     assert(Classify(coverage, 1) == BlendClass::Mask);
+
+    // Refusal details logged with Reason::NoPipeline.
+    const char *labels[] = {"native-blend-accepted",
+                            "native-blend-disabled",
+                            "native-blend-factors-not-transmittance",
+                            "native-blend-op-not-add",
+                            "native-logic-op-enabled",
+                            "native-write-mask-or-alpha-to-coverage",
+                            "native-render-target-count"};
+    for (int i = 0; i <= int(BlendClass::Targets); ++i)
+        assert(!strcmp(Label(BlendClass(i)), labels[i]));
+    assert(!strcmp(Label(BlendClass(99)), "native-blend-unknown"));
 }
 
 static bool Src1(D3D12_BLEND f) {
@@ -229,6 +252,10 @@ static bool Colour(D3D12_BLEND f) {
     return f == D3D12_BLEND_SRC_COLOR || f == D3D12_BLEND_INV_SRC_COLOR ||
            f == D3D12_BLEND_DEST_COLOR || f == D3D12_BLEND_INV_DEST_COLOR ||
            f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR;
+}
+static bool AlphaType(D3D12_BLEND f) {
+    return f == D3D12_BLEND_SRC_ALPHA || f == D3D12_BLEND_INV_SRC_ALPHA ||
+           f == D3D12_BLEND_SRC1_ALPHA || f == D3D12_BLEND_INV_SRC1_ALPHA;
 }
 
 static void TestPatchBlend() {
@@ -242,68 +269,110 @@ static void TestPatchBlend() {
     for (UINT i = 1; i < 8; ++i)
         native.RenderTarget[i] = native.RenderTarget[0];
     assert(Classify(native, 1) == BlendClass::Accept);
-    const auto p = PatchBlend(native);
-    assert(p.AlphaToCoverageEnable == FALSE);
-    assert(p.IndependentBlendEnable == FALSE);
-    const auto &rt = p.RenderTarget[0];
-    assert(rt.BlendEnable == TRUE);
-    assert(rt.LogicOpEnable == FALSE);
-    assert(rt.SrcBlend == D3D12_BLEND_ZERO);
-    assert(rt.DestBlend == D3D12_BLEND_INV_SRC1_COLOR);
-    assert(rt.BlendOp == D3D12_BLEND_OP_ADD);
-    assert(rt.SrcBlendAlpha == D3D12_BLEND_ZERO);
-    assert(rt.DestBlendAlpha == D3D12_BLEND_ONE);
-    assert(rt.BlendOpAlpha == D3D12_BLEND_OP_ADD);
-    assert(rt.LogicOp == D3D12_LOGIC_OP_NOOP);
-    assert(rt.RenderTargetWriteMask == 7);
-    for (UINT i = 1; i < 8; ++i) {
-        const auto &rest = p.RenderTarget[i];
-        assert(rest.BlendEnable == FALSE && rest.LogicOpEnable == FALSE);
-        assert(rest.SrcBlend == D3D12_BLEND_ONE && rest.DestBlend == D3D12_BLEND_ZERO);
-        assert(rest.BlendOp == D3D12_BLEND_OP_ADD);
-        assert(rest.SrcBlendAlpha == D3D12_BLEND_ONE && rest.DestBlendAlpha == D3D12_BLEND_ZERO);
-        assert(rest.BlendOpAlpha == D3D12_BLEND_OP_ADD);
-        assert(rest.LogicOp == D3D12_LOGIC_OP_NOOP);
-        assert(rest.RenderTargetWriteMask == 0);
+    // A colour-type dest factor has no single-channel transmittance: both kinds
+    // leave alpha alone.
+    for (auto kind : {Kind::Oit, Kind::Refraction}) {
+        assert(!RefractionAlpha(native, kind));
+        const auto p = PatchBlend(native, kind);
+        assert(p.AlphaToCoverageEnable == FALSE);
+        assert(p.IndependentBlendEnable == FALSE);
+        const auto &rt = p.RenderTarget[0];
+        assert(rt.BlendEnable == TRUE);
+        assert(rt.LogicOpEnable == FALSE);
+        assert(rt.SrcBlend == D3D12_BLEND_ZERO);
+        assert(rt.DestBlend == D3D12_BLEND_INV_SRC1_COLOR);
+        assert(rt.BlendOp == D3D12_BLEND_OP_ADD);
+        assert(rt.SrcBlendAlpha == D3D12_BLEND_ZERO);
+        assert(rt.DestBlendAlpha == D3D12_BLEND_ONE);
+        assert(rt.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+        assert(rt.LogicOp == D3D12_LOGIC_OP_NOOP);
+        assert(rt.RenderTargetWriteMask == 7);
+        for (UINT i = 1; i < 8; ++i) {
+            const auto &rest = p.RenderTarget[i];
+            assert(rest.BlendEnable == FALSE && rest.LogicOpEnable == FALSE);
+            assert(rest.SrcBlend == D3D12_BLEND_ONE && rest.DestBlend == D3D12_BLEND_ZERO);
+            assert(rest.BlendOp == D3D12_BLEND_OP_ADD);
+            assert(rest.SrcBlendAlpha == D3D12_BLEND_ONE &&
+                   rest.DestBlendAlpha == D3D12_BLEND_ZERO);
+            assert(rest.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+            assert(rest.LogicOp == D3D12_LOGIC_OP_NOOP);
+            assert(rest.RenderTargetWriteMask == 0);
+        }
     }
+    // b723-like ONE / INV_SRC_ALPHA, writing green and alpha: the OIT form keeps
+    // alpha untouched; the refraction form also accumulates 1 - opacity in alpha.
     auto refraction = Native(D3D12_BLEND_INV_SRC_ALPHA);
     refraction.RenderTarget[0].RenderTargetWriteMask =
         D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_ALPHA;
     assert(Classify(refraction, 1) == BlendClass::Accept);
-    const auto q = PatchBlend(refraction);
+    assert(!RefractionAlpha(refraction, Kind::Oit));
+    const auto q = PatchBlend(refraction, Kind::Oit);
     assert(q.RenderTarget[0].DestBlend == D3D12_BLEND_INV_SRC_ALPHA);
+    assert(q.RenderTarget[0].DestBlendAlpha == D3D12_BLEND_ONE);
     assert(q.RenderTarget[0].RenderTargetWriteMask == D3D12_COLOR_WRITE_ENABLE_GREEN);
+    assert(RefractionAlpha(refraction, Kind::Refraction));
+    const auto r = PatchBlend(refraction, Kind::Refraction);
+    assert(r.RenderTarget[0].SrcBlend == D3D12_BLEND_ZERO);
+    assert(r.RenderTarget[0].DestBlend == D3D12_BLEND_INV_SRC_ALPHA);
+    assert(r.RenderTarget[0].SrcBlendAlpha == D3D12_BLEND_ZERO);
+    assert(r.RenderTarget[0].DestBlendAlpha == D3D12_BLEND_INV_SRC_ALPHA);
+    assert(r.RenderTarget[0].BlendOpAlpha == D3D12_BLEND_OP_ADD);
+    assert(r.RenderTarget[0].RenderTargetWriteMask ==
+           (D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_ALPHA));
+    // Alpha is written whatever the native alpha mask: it holds the variant's own data.
+    refraction.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_BLUE;
+    assert(PatchBlend(refraction, Kind::Refraction).RenderTarget[0].RenderTargetWriteMask ==
+           (D3D12_COLOR_WRITE_ENABLE_BLUE | D3D12_COLOR_WRITE_ENABLE_ALPHA));
+    // Observed b723 state, write mask 15.
+    const auto b723 = Native(D3D12_BLEND_INV_SRC_ALPHA);
+    assert(PatchBlend(b723, Kind::Refraction).RenderTarget[0].RenderTargetWriteMask == 15);
+    assert(PatchBlend(b723, Kind::Oit).RenderTarget[0].RenderTargetWriteMask == 7);
 
-    // Every accepted combination patches to a legal state whose blend records
-    // exactly the composite's transmittance: variant(d) = d * f(src) = native(d) - native(0).
-    for (auto dest : AcceptedDest)
-        for (auto src : AcceptedSource) {
-            const auto n = Native(dest, src);
-            assert(Classify(n, 1) == BlendClass::Accept);
-            const auto v = PatchBlend(n);
-            assert(!v.AlphaToCoverageEnable && !v.IndependentBlendEnable);
-            for (UINT i = 0; i < 8; ++i) {
-                const auto &r = v.RenderTarget[i];
-                assert(!r.LogicOpEnable);
-                assert(!Colour(r.SrcBlendAlpha) && !Colour(r.DestBlendAlpha));
-                if (i)
-                    assert(!Src1(r.SrcBlend) && !Src1(r.DestBlend) && !Src1(r.SrcBlendAlpha) &&
-                           !Src1(r.DestBlendAlpha));
-            }
-            const auto &r0 = v.RenderTarget[0];
-            assert(r0.SrcBlend == D3D12_BLEND_ZERO && r0.BlendOp == D3D12_BLEND_OP_ADD &&
-                   r0.BlendOpAlpha == D3D12_BLEND_OP_ADD);
-            for (const auto &in : Probes)
-                for (int ch = 0; ch < 3; ++ch) {
-                    // f must not read dest: a NaN dest would poison it.
-                    const float f = Factor(dest, WithDest(in, std::nanf("")), ch);
-                    const float expected = in.dest[ch] * f;
-                    assert(Near(Blend(r0, in, ch), expected));
-                    assert(Near(Blend(n.RenderTarget[0], in, ch) -
-                                    Blend(n.RenderTarget[0], WithDest(in, 0.f), ch),
-                                expected));
+    // Every accepted combination, for both kinds, patches to a legal state whose
+    // blend records exactly the composite's transmittance:
+    // variant(d) = d * f(src) = native(d) - native(0). A refraction variant with
+    // an alpha-type f also records it in alpha: alpha'(d) = d.a * f(src).
+    for (auto kind : {Kind::Oit, Kind::Refraction})
+        for (auto dest : AcceptedDest)
+            for (auto src : AcceptedSource) {
+                const auto n = Native(dest, src);
+                assert(Classify(n, 1) == BlendClass::Accept);
+                const bool carried = kind == Kind::Refraction && AlphaType(dest);
+                assert(RefractionAlpha(n, kind) == carried);
+                const auto v = PatchBlend(n, kind);
+                assert(!v.AlphaToCoverageEnable && !v.IndependentBlendEnable);
+                for (UINT i = 0; i < 8; ++i) {
+                    const auto &r = v.RenderTarget[i];
+                    assert(!r.LogicOpEnable);
+                    assert(!Colour(r.SrcBlendAlpha) && !Colour(r.DestBlendAlpha));
+                    if (i)
+                        assert(!Src1(r.SrcBlend) && !Src1(r.DestBlend) && !Src1(r.SrcBlendAlpha) &&
+                               !Src1(r.DestBlendAlpha));
                 }
-        }
+                const auto &r0 = v.RenderTarget[0];
+                assert(r0.SrcBlend == D3D12_BLEND_ZERO && r0.BlendOp == D3D12_BLEND_OP_ADD &&
+                       r0.SrcBlendAlpha == D3D12_BLEND_ZERO &&
+                       r0.BlendOpAlpha == D3D12_BLEND_OP_ADD);
+                assert(r0.DestBlendAlpha == (carried ? dest : D3D12_BLEND_ONE));
+                assert(r0.RenderTargetWriteMask == (carried ? 15 : 7));
+                for (const auto &in : Probes) {
+                    for (int ch = 0; ch < 3; ++ch) {
+                        // f must not read dest: a NaN dest would poison it.
+                        const float f = Factor(dest, WithDest(in, std::nanf("")), ch);
+                        const float expected = in.dest[ch] * f;
+                        assert(Near(Blend(r0, in, ch), expected));
+                        assert(Near(Blend(n.RenderTarget[0], in, ch) -
+                                        Blend(n.RenderTarget[0], WithDest(in, 0.f), ch),
+                                    expected));
+                    }
+                    const float f_alpha = Factor(dest, WithDest(in, std::nanf("")), 3);
+                    assert(Near(BlendAlpha(r0, in), carried ? in.dest[3] * f_alpha : in.dest[3]));
+                    // One scalar: every colour channel sees the factor alpha records.
+                    if (carried)
+                        for (int ch = 0; ch < 3; ++ch)
+                            assert(Factor(dest, in, ch) == f_alpha);
+                }
+            }
 }
 
 static constexpr D3D12_STENCIL_OP WritingStencilOps[] = {

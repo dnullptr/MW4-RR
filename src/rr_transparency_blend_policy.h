@@ -18,8 +18,11 @@ struct Target {
     size_t bytes;
     Kind kind;
 };
+// 5a24 is very likely another build's b723 (Oct 18 lineage capture, event 604);
+// its blend state was never observed, so Classify guards it at pipeline creation.
 inline constexpr Target Targets[] = {{0xa36d02f6245a4129ull, 11856, Kind::Oit},
-                                     {0xb72393e05df90a78ull, 4812, Kind::Refraction}};
+                                     {0xb72393e05df90a78ull, 4812, Kind::Refraction},
+                                     {0x5a24807dc07ce595ull, 4780, Kind::Refraction}};
 inline const Target *FindTarget(uint64_t hash, size_t bytes) {
     for (const auto &target : Targets)
         if (target.hash == hash && target.bytes == bytes)
@@ -173,8 +176,50 @@ inline BlendClass Classify(const D3D12_BLEND_DESC &blend, UINT num_render_target
     return SourceFactor(rt.DestBlend) && IgnoresDest(rt.SrcBlend) ? BlendClass::Accept
                                                                   : BlendClass::Factor;
 }
+// The refusal detail logged with Reason::NoPipeline.
+inline const char *Label(BlendClass blend) {
+    switch (blend) {
+    case BlendClass::Accept:
+        return "native-blend-accepted";
+    case BlendClass::NoBlend:
+        return "native-blend-disabled";
+    case BlendClass::Factor:
+        return "native-blend-factors-not-transmittance";
+    case BlendClass::Op:
+        return "native-blend-op-not-add";
+    case BlendClass::Logic:
+        return "native-logic-op-enabled";
+    case BlendClass::Mask:
+        return "native-write-mask-or-alpha-to-coverage";
+    case BlendClass::Targets:
+        return "native-render-target-count";
+    default:
+        return "native-blend-unknown";
+    }
+}
+// Dest factors of one scalar, the source alpha. They are legal in the alpha
+// slots, and every colour channel sees the same transmittance.
+inline bool AlphaFactor(D3D12_BLEND factor) {
+    switch (factor) {
+    case D3D12_BLEND_SRC_ALPHA:
+    case D3D12_BLEND_INV_SRC_ALPHA:
+    case D3D12_BLEND_SRC1_ALPHA:
+    case D3D12_BLEND_INV_SRC1_ALPHA:
+        return true;
+    default:
+        return false;
+    }
+}
+// A refraction variant also carries its transmittance in alpha when the native
+// dest factor is alpha-type. A colour-type factor has no single-channel
+// transmittance, so alpha is then left alone, as for the OIT resolve.
+inline bool RefractionAlpha(const D3D12_BLEND_DESC &native, Kind kind) {
+    return kind == Kind::Refraction && AlphaFactor(native.RenderTarget[0].DestBlend);
+}
 // Valid only for a native blend that Classify returned Accept for.
-inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native) {
+// RGB: dest' = dest * f(src). Alpha is untouched, or for a refraction variant
+// with an alpha-type f, alpha' = alpha * f(src) (2 bits in R10G10B10A2).
+inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native, Kind kind) {
     D3D12_BLEND_DESC d{};
     d.AlphaToCoverageEnable = FALSE;
     d.IndependentBlendEnable = FALSE;
@@ -194,6 +239,10 @@ inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native) {
     rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
     rt.DestBlendAlpha = D3D12_BLEND_ONE;
     rt.RenderTargetWriteMask = UINT8(native.RenderTarget[0].RenderTargetWriteMask & 7);
+    if (RefractionAlpha(native, kind)) {
+        rt.DestBlendAlpha = native.RenderTarget[0].DestBlend;
+        rt.RenderTargetWriteMask = UINT8(rt.RenderTargetWriteMask | D3D12_COLOR_WRITE_ENABLE_ALPHA);
+    }
     return d;
 }
 
