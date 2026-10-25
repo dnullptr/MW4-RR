@@ -120,16 +120,16 @@ class Controller {
     };
     // wide_output: RR's output while the color test brightens its input, in FP32
     // so the brightened result does not clip in the FP16 rr_output.
-    // weapon_test: the linear depth RR reads while the weapon depth test runs.
+    // weapon_test: the linear depth RR reads while weapon depth is on.
     // hit_scratch: the raw hit distance the conditioning reads while it rewrites
     // a slot's copy; used only inside one guide recording.
     DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test, hit_scratch;
     UINT64 test_reserve{};
-    // Weapon depth test (rrweapondepth): weapon_linear is the depth type the current RR
-    // feature was created with; weapon_hold says why the test stays off until its setting
-    // next changes. The hold outlives Reconfigure, so a test that cannot run restarts RR
+    // Weapon depth (rrweapondepth): weapon_linear is the depth type the current RR feature
+    // was created with; weapon_hold says why linear depth stays off until the setting next
+    // changes. The hold outlives Reconfigure, so linear depth that cannot run restarts RR
     // once, never over and over.
-    enum class WeaponHold { None, Memory, Projection, Refused };
+    using WeaponHold = rrweapondepth::Hold;
     bool weapon_linear{};
     WeaponHold weapon_hold{};
     unsigned weapon_hold_changes{};
@@ -370,7 +370,7 @@ class Controller {
         return layout_pending || (preset.has_effective && preset.desired != preset.effective) ||
                (feature && weapon_linear != WeaponDepthWanted());
     }
-    // The weapon depth test's setting, unless held off since its last change. RR's depth
+    // The weapon depth setting, unless held off since its last change. RR's depth
     // type is fixed at creation, so a new feature takes it and a change restarts RR.
     bool WeaponDepthWanted() const {
         return rrweapondepth::enabled.load(std::memory_order_relaxed) &&
@@ -386,13 +386,13 @@ class Controller {
         weapon_hold_changes = changes;
         // UseTest already logged a memory failure.
         if (why == WeaponHold::Projection)
-            Log("Weapon depth test: the game's projection does not map to linear depth; test "
-                "off until its setting changes");
+            Log("Weapon depth: the game's projection does not map to linear depth; off until "
+                "the setting changes, RR runs with hardware depth");
         else if (why == WeaponHold::Refused) {
             char line[200];
             snprintf(line, sizeof(line),
-                     "Weapon depth test: RR did not accept linear depth%s%s%s; test off until its "
-                     "setting changes, RR runs with hardware depth",
+                     "Weapon depth: RR did not accept linear depth%s%s%s; off until the setting "
+                     "changes, RR runs with hardware depth",
                      outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
             Log(line);
         }
@@ -957,12 +957,12 @@ class Controller {
         std::lock_guard lock(mutex);
         const bool wanted = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
                             rrguidetest::SkySurface;
-        // While the weapon depth test runs, its linear depth carries the floor instead.
+        // While RR has linear depth, it carries the floor instead.
         if (wanted && weapon_linear && weapon_test.active)
             return Test(weapon_test, weapon_test.changes, true);
         return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed), wanted);
     }
-    // Weapon depth test state for the panel. Restarting: RR is being recreated with the
+    // Weapon depth state for the panel. Restarting: RR is being recreated with the
     // depth type the setting asks for (the change takes effect once in-flight frames retire).
     enum class WeaponState { Off, Active, Waiting, Restarting, NoMemory, Unsupported, Refused };
     WeaponState WeaponDepthState() {
@@ -2035,34 +2035,30 @@ class Controller {
                 }
                 rrskydepth::Apply(projection);
             }
-            // Weapon depth test: RR's depth type is fixed when RR is created, so a frame
-            // follows the feature's type and a new feature takes the setting's. Linear depth
-            // matches the projection RR is given; with the sky guide test, sky stands for
-            // that test's depth floor.
+            // Weapon depth: RR's depth type is fixed when RR is created, so a frame follows
+            // the feature's type and a new feature takes the setting's (rrweapondepth::Choose).
+            // Linear depth matches the projection RR is given; with the sky guide test, sky
+            // stands for that test's depth floor.
             const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
-            bool weapon_on = feature ? weapon_linear : WeaponDepthWanted();
+            const float weapon_sky_depth =
+                s->gpu.guide_test == rrguidetest::SkySurface ? rrguidetest::DepthFloor : 0.0f;
+            const bool weapon_wanted = WeaponDepthWanted();
             rrweapondepth::Mapping weapon_map;
             const bool weapon_mapped =
-                weapon_on &&
-                rrweapondepth::Map(s->projection, projection,
-                                   s->gpu.guide_test == rrguidetest::SkySurface
-                                       ? rrguidetest::DepthFloor
-                                       : 0.0f,
-                                   weapon_map);
-            if (!UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
-                         DXGI_FORMAT_R32_FLOAT, "Weapon depth test") &&
-                weapon_on) {
-                // No GPU memory or an unsupported projection holds the test off. A texture
-                // left at another size is only released: the restart allocates it again.
-                if (!weapon_mapped || weapon_test.blocked)
-                    HoldWeaponDepth(weapon_mapped ? WeaponHold::Memory : WeaponHold::Projection,
-                                    weapon_changes);
-                // A linear-depth RR is never given hardware depth: restart it instead.
-                if (feature) {
-                    QueueReconfigure();
-                    return false;
-                }
-                weapon_on = false;
+                rrweapondepth::Wants(feature, weapon_linear, weapon_wanted) &&
+                rrweapondepth::Map(s->projection, projection, weapon_sky_depth, weapon_map);
+            const bool weapon_texture =
+                UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R32_FLOAT, "Weapon depth");
+            const auto weapon_frame =
+                rrweapondepth::Choose(feature, weapon_linear, weapon_wanted, weapon_mapped,
+                                      weapon_texture, weapon_test.blocked);
+            bool weapon_on = weapon_frame.linear;
+            if (weapon_frame.hold != WeaponHold::None)
+                HoldWeaponDepth(weapon_frame.hold, weapon_changes);
+            if (weapon_frame.restart) {
+                QueueReconfigure();
+                return false;
             }
 
             const bool reset =
@@ -2118,7 +2114,7 @@ class Controller {
                     parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
                     // Read back from the parameters; decimal, as the "RR created" line above.
                     snprintf(line, sizeof(line),
-                             "Weapon depth test: RR created with linear depth (game create flags "
+                             "Weapon depth: RR created with linear depth (game create flags "
                              "%d, sent %d)",
                              o.flags, sent);
                     Log(line);
@@ -2165,7 +2161,7 @@ class Controller {
             applied_color_scale = applied;
             // The guide mode this slot's guides were converted with, not the panel's
             // current one, so normals and depth always come from the same mode.
-            // The weapon depth test's linear depth carries the floor itself.
+            // Linear depth (weapon depth) carries the floor itself.
             const bool depth_on =
                 UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface && !weapon_on,
                         rrguidetest::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
@@ -2228,8 +2224,8 @@ class Controller {
                 weapon_logged = weapon_map;
                 char line[224];
                 snprintf(line, sizeof(line),
-                         "Weapon depth test: world depth %g / (depth + %g), sky %g, weapon "
-                         "slice in front of %g",
+                         "Weapon depth: world depth %.7g / (depth + %.7g), sky %.7g, weapon "
+                         "slice in front of %.7g",
                          weapon_map.scale, weapon_map.offset, weapon_map.sky,
                          weapon_map.scale / (1 + weapon_map.offset));
                 Log(line);
@@ -2279,9 +2275,14 @@ class Controller {
             if (captured) {
                 auto &m = s->captured.meta;
                 m.linear_depth = weapon_on;
+                if (weapon_on)
+                    m.linear_map = {weapon_map.scale, weapon_map.offset, weapon_map.sky};
                 m.color_scale = color_on ? color_scale : 1.0f;
                 m.guide_test = s->gpu.guide_test;
-                m.depth_floor = depth_on ? rrguidetest::DepthFloor : 0.0f;
+                // Linear depth's sky stands for the floor, so its hardware depth has it too.
+                m.depth_floor = depth_on || (weapon_on && weapon_sky_depth > 0)
+                                    ? rrguidetest::DepthFloor
+                                    : 0.0f;
                 m.responsivity_source = sky_edge_on           ? rrcapture::SkyEdgeMask
                                         : water_responsivity  ? rrcapture::WaterMask
                                         : responsivity_active ? rrcapture::SssMask

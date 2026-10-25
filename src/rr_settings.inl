@@ -23,6 +23,7 @@ static unsigned &requested_lobe = preferences.native_lobe;
 static bool &requested_responsivity = preferences.responsivity;
 static float &requested_strength = preferences.responsivity_strength;
 static bool &requested_hit = preferences.hit;
+static bool &requested_weapon_depth = preferences.weapon_depth;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -35,9 +36,14 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
+    // Before RR can be enabled: RR takes its depth type when it is created. A change restarts
+    // a running RR and retries linear depth held off since the last change.
+    if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
+        ++rrweapondepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
@@ -68,6 +74,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityStrength",
                               requested_strength);
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
+    reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -200,6 +207,32 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "ReShade.log shows the shares every 10 s.");
         ImGui::Unindent();
     }
+    changed |= ImGui::Checkbox("Weapon depth", &requested_weapon_depth);
+    {
+        ImGui::Indent();
+        using WeaponState = rrlive::Controller::WeaponState;
+        const auto weapon = LiveRR().WeaponDepthState();
+        ImGui::Text("Weapon depth: %s",
+                    weapon == WeaponState::Active       ? "active (RR uses linear depth)"
+                    : weapon == WeaponState::Off        ? "off"
+                    : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
+                    : weapon == WeaponState::NoMemory
+                        ? "off: not enough GPU memory (turn it off and on to retry)"
+                    : weapon == WeaponState::Unsupported
+                        ? "off: the game's projection is not supported (turn it off and on to "
+                          "retry)"
+                    : weapon == WeaponState::Refused
+                        ? "off: RR did not accept linear depth (turn it off and on to retry)"
+                    : !LiveRR().Running() ? "waiting for RR"
+                                          : "waiting");
+        ImGui::TextWrapped("The game draws the weapon and hands with their own camera, so with "
+                           "the game's depth RR sees them as one flat card. On, RR gets linear "
+                           "depth in which they keep their own depth steps, still in front of "
+                           "everything else; the rest of the scene keeps its distances, with the "
+                           "sky very far instead of infinitely far. Changing it restarts RR, like "
+                           "a preset change.");
+        ImGui::Unindent();
+    }
     ImGui::Separator();
     ImGui::TextUnformatted("Subsurface Scattering noise experiments");
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
@@ -226,31 +259,6 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
-    bool weapon_depth = rrweapondepth::enabled;
-    if (ImGui::Checkbox("Weapon depth test: give the weapon its own depth", &weapon_depth)) {
-        rrweapondepth::enabled = weapon_depth;
-        ++rrweapondepth::changes;
-    }
-    using WeaponState = rrlive::Controller::WeaponState;
-    const auto weapon = LiveRR().WeaponDepthState();
-    ImGui::Text("Weapon depth: %s",
-                weapon == WeaponState::Active       ? "active (RR uses linear depth)"
-                : weapon == WeaponState::Off        ? "off"
-                : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
-                : weapon == WeaponState::NoMemory
-                    ? "off: not enough GPU memory (turn it off and on to retry)"
-                : weapon == WeaponState::Unsupported
-                    ? "off: the game's projection is not supported (turn it off and on to retry)"
-                : weapon == WeaponState::Refused
-                    ? "off: RR did not accept linear depth (turn it off and on to retry)"
-                : !rr_running ? "waiting for RR"
-                              : "waiting");
-    ImGui::TextWrapped("Session-only test. The game draws the weapon and hands with their own "
-                       "camera, so RR normally sees them as one flat card. On, RR gets linear "
-                       "depth in which the weapon keeps its own depth steps, still in front of "
-                       "everything else; the rest of the scene keeps the same distances, with "
-                       "the sky very far instead of infinitely far. Turning it on or off "
-                       "restarts RR, like a preset change.");
     bool sky_edge = rrskyedge::enabled;
     if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
         rrskyedge::enabled = sky_edge;

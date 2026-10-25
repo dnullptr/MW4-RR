@@ -617,6 +617,8 @@ static Frame<int> Rich(unsigned serial) {
     f.meta.color_scale = serial % 2 ? 0.25f : 1.0f;
     f.meta.guide_test = serial % 2 ? 8 : 0;
     f.meta.depth_floor = serial % 2 ? 1e-7f : 0.0f;
+    f.meta.linear_depth = serial % 2 != 0; // Weapon depth's mapping, odd serials only.
+    f.meta.linear_map = {1.0f, 0.0f, 1e6f};
     f.meta.responsivity_source = serial % 4 == 3 ? SkyEdgeMask : NoMask;
     f.meta.camera.far_plane = std::numeric_limits<float>::infinity(); // Not finite: null.
     f.meta.camera.near_plane = 0.1f;
@@ -761,7 +763,7 @@ static void ManifestShape() {
                               "\"ray_selection\": 0"};
     for (const char *s : settings)
         assert(Contains(m, s));
-    h.weapon_depth = true; // The weapon depth test: depth is linear view depth.
+    h.weapon_depth = true; // Weapon depth: depth is linear view depth.
     assert(Contains(Manifest(h, frames), "\"weapon_depth\": true"));
     assert(Contains(m, "\"2\": \"sky\""));
     assert(Contains(m, "\"8\": \"gap\""));
@@ -798,6 +800,9 @@ static void ManifestShape() {
                                 "\"guide_test\": 8",
                                 "\"depth_floor\": 1.00000001e-07",
                                 "\"depth_floor\": 0",
+                                "\"linear_depth\": {\"scale\": 1, \"offset\": 0, \"sky\": 1000000, "
+                                "\"slice\": 0.984375, \"knee\": 0.00048828125}",
+                                "\"linear_depth\": null",
                                 "\"responsivity_source\": \"sky_edge\"",
                                 "\"responsivity_source\": \"none\"",
                                 "\"stats\"",
@@ -845,8 +850,8 @@ static void ManifestShape() {
     assert(Contains(m, "\"format\": \"DXGI_87\", \"dxgi_format\": 87"));
     assert(Contains(m, "\"source_size\": [8, 6]"));
     assert(Contains(m, "\"source_offset\": [0, 0]"));
-    // Twelve absent inputs per frame, and "far".
-    assert(Count(m, "\": null") == 2 * (InputCount - 2) + 2);
+    // Twelve absent inputs per frame, "far", and the hardware depth frame's linear_depth.
+    assert(Count(m, "\": null") == 2 * (InputCount - 2) + 3);
     // No frames at all is still valid.
     const std::string empty = Manifest(h, std::vector<Frame<int>>{});
     assert(Balanced(empty) && Contains(empty, "\"frame_count\": 0"));
@@ -878,7 +883,8 @@ static void ManifestOutputSize() {
         at = m.find("\"" + std::string(names[i]) + "\": ", at);
         assert(at != std::string::npos);
     }
-    assert(InputCount == 14 && Count(m, "\": null") == 12 && Count(m, "{\"file\": ") == 2);
+    // Twelve absent inputs, and linear_depth (hardware depth).
+    assert(InputCount == 14 && Count(m, "\": null") == 13 && Count(m, "{\"file\": ") == 2);
 }
 // Each present input says where the state its copy moved it from came from; absent ones are null.
 static void ManifestInputStates() {
@@ -905,7 +911,8 @@ static void ManifestInputStates() {
     assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"proven\", \"state_before\": 64}"));
     assert(Contains(m, "\"source_size\": [4, 3], \"state\": \"addon\", \"state_before\": 64}"));
     assert(Count(m, "\"state\": ") == 4 && Count(m, "\"state_before\": ") == 4);
-    assert(Count(m, "\": null") == InputCount - 4 && Contains(m, "\"sss_guide\": null") &&
+    // The absent inputs, and linear_depth (hardware depth).
+    assert(Count(m, "\": null") == InputCount - 4 + 1 && Contains(m, "\"sss_guide\": null") &&
            Contains(m, "\"rr_output\": null"));
     // An out-of-range source still writes valid JSON.
     f.regions[Color].state_source = StateSourceCount;

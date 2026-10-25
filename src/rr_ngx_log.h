@@ -273,7 +273,7 @@ inline void CapabilityLine(const rreval::Api &api, char *out, size_t size) {
         api.destroy(map);
 }
 // "RR created: preset F, quality 1 (Balanced), flags 75 -> 11, render 2224x1248, output
-// 3840x2160": the game's flags, then the ones RR got (linear_depth: the weapon depth test).
+// 3840x2160": the game's flags, then the ones RR got (linear_depth: weapon depth).
 inline void DescribeCreation(const rreval::Options &o, unsigned preset, bool linear_depth,
                              char *out, size_t size) {
     const char *name = "unknown";

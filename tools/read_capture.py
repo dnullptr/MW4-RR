@@ -6,8 +6,8 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
-Test passes that change RR's inputs (color_scale, depth_floor): undo them with
-tools/analyze_sky_edges.py undo_tests(manifest, frames).
+Test passes that change RR's inputs (color_scale, depth_floor, and linear_depth: weapon depth's
+linear view depth): undo them with tools/analyze_sky_edges.py undo_tests(manifest, frames).
 """
 import argparse
 import json
@@ -129,7 +129,8 @@ def summary(manifest, frames):
     if type(lobe) is int:
         lines.append(f'lighting input {lobe}: '
                      f'{LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else "unknown"}')
-    setups = {tuple(f.get(k) for k in ('lighting_input', *FRAME_TESTS)) for f in m['frames']}
+    setups = {(*(f.get(k) for k in ('lighting_input', *FRAME_TESTS)), bool(f.get('linear_depth')))
+              for f in m['frames']}
     if len(setups) > 1:
         lines.append('warning: the frames differ in lighting input or test settings')
     states = [input_states(f) for f in m['frames']]
@@ -142,6 +143,8 @@ def summary(manifest, frames):
         reasons = f'({"|".join(names)})' if names else ''
         tests = ''.join(f' {k}={frame[k]}' for k, off in FRAME_TESTS.items()
                         if k in frame and frame[k] != off)
+        if frame.get('linear_depth'):   # Weapon depth's mapping: depth is linear view depth.
+            tests += ' linear_depth=on'
         lighting = f' lighting_input={frame["lighting_input"]}' if 'lighting_input' in frame else ''
         lines.append(f'frame {frame["index"]} serial={frame["serial"]} sl_frame={frame["sl_frame"]} '
                      f'delivered={frame["delivered"]} reset={frame["reset"]} '
@@ -207,7 +210,9 @@ def self_test():
             frames_json.append({'index': i, 'serial': 10 + i, 'sl_frame': 20 + i, 'delivered': True,
                                 'reset': bool(i), 'reset_reasons': 3 * i, 'jitter': [0.25, -0.125],
                                 'lighting_input': 12, 'color_scale': [1, 4][i], 'guide_test': 0,
-                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs})
+                                'responsivity_source': ['none', 'sky_edge'][i], 'inputs': inputs,
+                                'linear_depth': [None, {'scale': 0.1, 'offset': 0, 'sky': 1e5,
+                                                        'slice': 0.984375, 'knee': 2 ** -11}][i]})
         manifest = {'format': 'mw4-rr-capture', 'version': 1, 'frame_count': 2,
                     'render_width': width, 'render_height': height, 'output_width': 8,
                     'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True,
@@ -255,13 +260,17 @@ def self_test():
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
         expect('jitter=[0.25, -0.125] lighting_input=12\n' in text, 'frame 0 lighting, tests off')
-        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge\n' in text,
+        expect('lighting_input=12 color_scale=4 responsivity_source=sky_edge linear_depth=on\n' in text,
                'frame 1 tests that are on')
         expect('warning: the frames differ in lighting input or test settings' in text,
                'mixed test settings warned')
         same = {**manifest, 'frames': [manifest['frames'][0]] * 2}
         expect(not any(line.startswith('warning') for line in summary(same, frames)),
                'uniform test settings not warned')
+        linear = {**manifest, 'frames': [manifest['frames'][0],
+                                         {**manifest['frames'][0], 'linear_depth': {'scale': 1}}]}
+        expect('warning: the frames differ in lighting input or test settings' in
+               summary(linear, frames), 'weapon depth in some frames warned')
         expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         # Input states: a manifest without them (older builds) prints nothing new.

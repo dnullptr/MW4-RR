@@ -10,6 +10,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include "rr_weapon_depth.h"
 namespace rrcapture {
 // Device-free model of an RR input capture: what is saved, the files, the manifest and the
 // sequence that finds 8 consecutive delivered frames. The D3D12 side lives elsewhere.
@@ -118,10 +119,14 @@ struct Meta {
     // which ones RR took), and the water guide mode its guides were converted with.
     bool water_masks{};
     unsigned water_guide{};
-    bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
+    // Depth is linear view depth (weapon depth, rr_weapon_depth.h), not hardware depth, with
+    // this mapping: world depth = scale / (hardware depth + offset), sky = sky.
+    bool linear_depth{};
+    std::array<float, 3> linear_map{}; // scale, offset, sky
     // Tree-noise tests: the color brightness test's factor on RR's color (RR's output is in the
     // same scaled domain; 1 = off), the guide test mode this frame's guides were converted with,
-    // the depth sky was lifted to (0 = not lifted), and the responsivity mask RR took.
+    // the depth sky was lifted to (0 = not lifted; with linear_depth, the hardware depth its sky
+    // stands for, which no raw texel equals), and the responsivity mask RR took.
     float color_scale = 1.0f, depth_floor{};
     unsigned guide_test{}, responsivity_source{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
@@ -135,7 +140,7 @@ struct Meta {
 struct Header {
     std::string created;
     // create_flags: the flags RR was created with (rreval::CreateFlags drops the game's
-    // AutoExposure, and DepthInverted for the weapon depth test).
+    // AutoExposure, and DepthInverted with weapon depth's linear depth).
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{}, create_flags{};
     unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.
@@ -306,6 +311,20 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonNumber(f.Key("color_scale"), m.color_scale);
     JsonUint(f.Key("guide_test"), m.guide_test);
     JsonNumber(f.Key("depth_floor"), m.depth_floor);
+    // Weapon depth's mapping (rr_weapon_depth.h; tools/analyze_sky_edges.py undo_tests inverts
+    // it), or null for hardware depth.
+    f.Key("linear_depth");
+    if (m.linear_depth) {
+        o += '{';
+        JsonFields ld(o, ", ");
+        JsonNumber(ld.Key("scale"), m.linear_map[0]);
+        JsonNumber(ld.Key("offset"), m.linear_map[1]);
+        JsonNumber(ld.Key("sky"), m.linear_map[2]);
+        JsonNumber(ld.Key("slice"), rrweapondepth::Slice);
+        JsonNumber(ld.Key("knee"), rrweapondepth::Knee);
+        o += '}';
+    } else
+        o += "null";
     JsonString(f.Key("responsivity_source"), ResponsivitySourceName(m.responsivity_source));
     f.Key("stats");
     o += '{';

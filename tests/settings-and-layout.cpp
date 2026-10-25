@@ -25,7 +25,7 @@
 
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
-              defaults.preset == 6);
+              defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
 static_assert(!defaults.responsivity &&
               defaults.responsivity_strength == rrresponsivity::DefaultStrength);

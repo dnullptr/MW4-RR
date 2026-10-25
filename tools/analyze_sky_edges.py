@@ -2074,21 +2074,51 @@ GUIDE_TESTS = {1: 'flip back-facing normals', 2: 'all normals face the camera',
                8: 'sky normals + non-zero sky depth', 9: 'sky roughness 0'}
 
 
+def hardware_depth(depth, mapping, sky_depth=0.0):
+    """Weapon depth's linear view depth back to the game's hardware depth, in float32 as
+    src/rr_weapon_depth.h Hardware: mapping is a frame's linear_depth (world depth = scale /
+    (depth + offset), the weapon slice depth > slice in front of the near plane), sky_depth the
+    hardware depth sky stands for (the frame's depth_floor). World depth that was farther than sky
+    comes back as sky; depth linear depth never holds (NaN, infinite, zero or below) is returned
+    as it is, so it still counts as bad."""
+    f = np.float32
+    z = np.asarray(depth, np.float32)
+    scale, offset, sky = f(mapping['scale']), f(mapping['offset']), f(mapping['sky'])
+    cut, knee = f(mapping['slice']), f(mapping['knee'])
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        world = np.minimum(scale / z - offset, cut)   # Rounding never makes world the weapon.
+        t = knee * (scale / (f(1) + offset) / z - f(1))
+        weapon = cut + (f(1) - cut) * np.clip(t, f(0), f(1))
+        out = np.where(z < scale / (cut + offset), weapon, world)   # In front of all world depth.
+        out = np.where(z < sky, out, f(sky_depth))
+        return np.where((z > 0) & ~np.isinf(z), out, z).astype(np.float32)
+
+
 def undo_tests(manifest, frames):
-    """Frames captured with a tree-noise test on, brought back to the game's values: color and
-    rr_output RGB divided by the frame's color_scale (the color copy's constant alpha dropped), and
-    sky depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged
-    frames are the same objects."""
+    """Frames captured with a tree-noise test or weapon depth on, brought back to the game's
+    values: color and rr_output RGB divided by the frame's color_scale (the color copy's constant
+    alpha dropped), linear depth (a frame's linear_depth mapping) back to hardware depth, and sky
+    depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged frames
+    are the same objects."""
+    if (manifest.get('settings') or {}).get('weapon_depth') and \
+            any('linear_depth' not in f for f in manifest.get('frames') or [{}]):
+        raise ValueError('depth is linear view depth (weapon depth on) and this build did not record '
+                         'its mapping, so it cannot be read as hardware depth: take the capture '
+                         'with weapon depth off, or with a newer build')
     entries = manifest.get('frames') or []
-    out, scaled, floored, sources, guides = [], [], [], set(), {}
+    out, scaled, floored, linear, sources, guides = [], [], [], [], set(), {}
     for i, frame in enumerate(frames):
         meta = entries[i] if i < len(entries) else {}
         scale = meta.get('color_scale') or 1.0
         floor = meta.get('depth_floor') or 0.0
+        mapping = meta.get('linear_depth')
         sources.add(meta.get('responsivity_source') or 'unknown')
         guides.setdefault(meta.get('guide_test'), []).append(i)
-        if scale != 1.0 or floor > 0:
+        if scale != 1.0 or floor > 0 or mapping:
             frame = dict(frame)
+        if mapping:
+            linear.append(i)
+            frame['depth'] = hardware_depth(frame['depth'], mapping, floor)
         if scale != 1.0:
             scaled.append(i)
             for name in ('color', 'rr_output'):
@@ -2107,6 +2137,9 @@ def undo_tests(manifest, frames):
     if scaled:
         notes.append(f'color brightness test on in frames {scaled}: color and rr_output divided by '
                      'their color_scale (the SSS and transparency guides were withheld)')
+    if linear:
+        notes.append(f'weapon depth on in frames {linear}: linear view depth converted back to hardware '
+                     'depth')
     if floored:
         notes.append(f'sky depth floor on in frames {floored}: depth == depth_floor put back to sky (0)')
     shown = sources - {'unknown'}
@@ -2141,9 +2174,6 @@ def analyze(manifest, frames, out_dir, radius=2, crop=None):
         raise ValueError('every frame needs color and depth')
     if radius < 1:
         raise ValueError('radius must be >= 1')
-    if (manifest.get('settings') or {}).get('weapon_depth'):
-        raise ValueError('depth is linear view depth (weapon depth test on), so sky is not '
-                         'depth == 0: take the capture with the test off')
     frames, test_notes = undo_tests(manifest, frames)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
