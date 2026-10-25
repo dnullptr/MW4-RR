@@ -16,6 +16,13 @@ import numpy as np
 # dxgi_format -> (little-endian dtype, channels); 26 (R11G11B10_FLOAT) is unpacked from uint32.
 FORMATS = {2: ('<f4', 4), 10: ('<f2', 4), 16: ('<f4', 2), 26: ('<u4', 1), 34: ('<f2', 2),
            41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1)}
+# settings.lighting_input -> label, as in src/rr_lighting_source.h (9-12 need the SSS pre-denoise
+# build).
+LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from native temporal',
+            'Lobe 2 fill gaps', 'Both lobes fill gaps', 'Raw, cap bright samples (8x)',
+            'Raw, cap bright samples (4x)', 'Raw, AO fix A (fill gaps)', 'Raw, AO fix B (native)',
+            'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
+            'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
 
 
 def small_float(bits, mantissa_bits):
@@ -90,6 +97,10 @@ def summary(manifest, frames):
     lines = [f'{m["frame_count"]} frames, render {m["render_width"]}x{m["render_height"]}, '
              f'output {m["output_width"]}x{m["output_height"]}, quality {m["quality"]}, '
              f'preset {m["preset"]}, settings {json.dumps(m["settings"], separators=(",", ":"))}']
+    lobe = m['settings'].get('lighting_input')
+    if type(lobe) is int:
+        lines.append(f'lighting input {lobe}: '
+                     f'{LIGHTING[lobe] if 0 <= lobe < len(LIGHTING) else "unknown"}')
     for frame, arrays in zip(m['frames'], frames):
         names = [n for bit, n in m['reset_reason_bits'].items() if frame['reset_reasons'] & int(bit)]
         reasons = f'({"|".join(names)})' if names else ''
@@ -155,7 +166,8 @@ def self_test():
                                 'inputs': inputs})
         manifest = {'format': 'mw4-rr-capture', 'version': 1, 'frame_count': 2,
                     'render_width': width, 'render_height': height, 'output_width': 8,
-                    'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True},
+                    'output_height': 4, 'quality': 2, 'preset': 6, 'settings': {'sss_enabled': True,
+                                                                          'lighting_input': 12},
                     'reset_reason_bits': {'1': 'rejected', '2': 'cut', '4': 'generation', '8': 'gap'},
                     'frames': frames_json}
         (folder / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
@@ -193,6 +205,7 @@ def self_test():
         expect('  status: 0=0 1=1 2=0 3=0 4=0 other=2' in floats, 'status histogram on floats')
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
+        expect('lighting input 12: SSS pixels: both lobes fill gaps' in text, 'lighting label')
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
         with np.load(folder / 'out.npz') as npz:
