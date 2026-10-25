@@ -460,13 +460,18 @@ static void Names() {
     assert(std::string(names[NormalRoughness]) == "normal_roughness");
     assert(std::string(names[SpecularHitDistance]) == "specular_hit_distance");
     assert(std::string(names[InputCount - 1]) == "rr_output");
-    assert(RrOutput == 11 && InputCount == 12 && Frames == 8 && MaxAttempts == 600);
+    assert(std::string(names[DisocclusionMask]) == "disocclusion_mask");
+    assert(std::string(names[AnimatedTextureMask]) == "animated_texture_mask");
+    // The water masks are inputs, so they are copied before RR runs, like the others.
+    assert(AnimatedTextureMask + 1 == RrOutput);
+    assert(RrOutput == 13 && InputCount == 14 && Frames == 8 && MaxAttempts == 600);
 
     assert(Format(26) && std::string(Format(26)->name) == "R11G11B10_FLOAT");
     assert(Format(26)->bytes == 4);
     assert(Format(2)->bytes == 16 && Format(10)->bytes == 8 && Format(16)->bytes == 8);
     assert(Format(34)->bytes == 4 && Format(41)->bytes == 4 && Format(42)->bytes == 4);
     assert(Format(54)->bytes == 2);
+    assert(Format(61)->bytes == 1 && std::string(Format(61)->name) == "R8_UNORM");
     assert(!Format(0) && !Format(87));
     assert(FormatName(54) == "R16_FLOAT" && FormatName(42) == "R32_UINT");
     assert(FormatName(87) == "DXGI_87");
@@ -530,6 +535,8 @@ static Frame<int> Rich(unsigned serial) {
     f.meta.jitter[0] = 0.25f;
     f.meta.jitter[1] = -0.125f;
     f.meta.cpu_time_ms = 123456.789;
+    f.meta.water_masks = serial % 2 != 0;
+    f.meta.water_guide = serial % 4;
     f.meta.camera.far_plane = std::numeric_limits<float>::infinity(); // Not finite: null.
     f.meta.camera.near_plane = 0.1f;
     Region &c = f.regions[Color];
@@ -618,6 +625,9 @@ static void ManifestShape() {
     h.preset = 6;
     h.sss_enabled = true;
     h.responsivity_strength = -0.5f;
+    h.water_discard = true;
+    h.water_strength = 0.75f;
+    h.water_guide = 2;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
     const std::string m = Manifest(h, frames);
@@ -648,7 +658,9 @@ static void ManifestShape() {
                               "\"specular_hit_enabled\": false", "\"tolerate_isolated\": false",
                               "\"lighting_input\": 0",           "\"responsivity_enabled\": false",
                               "\"responsivity_strength\": -0.5", "\"guide_test\": 0",
-                              "\"sky_depth_test\": false"};
+                              "\"sky_depth_test\": false",       "\"water_responsivity\": false",
+                              "\"water_strength\": 0.75",        "\"water_discard\": true",
+                              "\"water_animated\": false",       "\"water_guide\": 2"};
     for (const char *s : settings)
         assert(Contains(m, s));
     assert(Contains(m, "\"2\": \"sky\""));
@@ -668,6 +680,10 @@ static void ManifestShape() {
                                 "\"reset\": false",
                                 "\"reset_reasons\"",
                                 "\"replaced_sr\"",
+                                "\"water_masks\": true",
+                                "\"water_masks\": false",
+                                "\"water_guide\": 3",
+                                "\"water_guide\": 0",
                                 "\"stats\"",
                                 "\"bad_frame\": 0",
                                 "\"copied_frame\": 1",
@@ -713,7 +729,7 @@ static void ManifestShape() {
     assert(Contains(m, "\"format\": \"DXGI_87\", \"dxgi_format\": 87"));
     assert(Contains(m, "\"source_size\": [8, 6]"));
     assert(Contains(m, "\"source_offset\": [0, 0]"));
-    // Ten absent inputs per frame, and "far".
+    // Twelve absent inputs per frame, and "far".
     assert(Count(m, "\": null") == 2 * (InputCount - 2) + 2);
     // No frames at all is still valid.
     const std::string empty = Manifest(h, std::vector<Frame<int>>{});
@@ -739,14 +755,14 @@ static void ManifestOutputSize() {
                        "\"R16G16B16A16_FLOAT\", \"dxgi_format\": 10, \"width\": 8, \"height\": 6, "
                        "\"bytes_per_pixel\": 8, \"source_offset\": [0, 0], "
                        "\"source_size\": [8, 6]}"));
-    // All 12 inputs in table order, and no others: two present, ten null.
+    // All 14 inputs in table order, and no others: two present, twelve null.
     std::size_t at = m.find("\"inputs\": {");
     assert(at != std::string::npos);
     for (unsigned i = 0; i < InputCount; ++i) {
         at = m.find("\"" + std::string(names[i]) + "\": ", at);
         assert(at != std::string::npos);
     }
-    assert(InputCount == 12 && Count(m, "\": null") == 10 && Count(m, "{\"file\": ") == 2);
+    assert(InputCount == 14 && Count(m, "\": null") == 12 && Count(m, "{\"file\": ") == 2);
 }
 
 // Writes two 4 x 3 frames: color (R11G11B10_FLOAT, every texel R=1 G=0.5 B=2) and status

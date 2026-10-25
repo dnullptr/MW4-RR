@@ -458,6 +458,8 @@ class Controller {
                     m.stats = v;
                     m.delivered = v[0] == 0 && v[1] != 0;
                     m.replaced_sr = s.replaced_sr;
+                    m.water_masks = s.water_used;
+                    m.water_guide = s.gpu.water_guide;
                     try {
                         capture.Complete(std::move(s.captured));
                     } catch (...) {
@@ -556,6 +558,8 @@ class Controller {
         sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
         sources[rrcapture::ResponsivityMask] = {r.responsivity};
         sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+        sources[rrcapture::DisocclusionMask] = {r.disocclusion};
+        sources[rrcapture::AnimatedTextureMask] = {r.animated};
         sources[rrcapture::RrOutput] = {r.output, 0, 0, o.out_width, o.out_height};
         return sources;
     }
@@ -726,6 +730,11 @@ class Controller {
             h.responsivity_strength = responsivity_strength;
             h.guide_test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
             h.sky_depth_test = rrskydepth::enabled.load(std::memory_order_relaxed);
+            h.water_responsivity = water.responsivity;
+            h.water_strength = water.strength;
+            h.water_discard = water.discard;
+            h.water_animated = water.animated;
+            h.water_guide = water.guide;
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {

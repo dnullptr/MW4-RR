@@ -26,6 +26,8 @@ enum Input : unsigned {
     ColorBeforeTransparency,
     ResponsivityMask,
     SpecularHitDistance,
+    DisocclusionMask,    // Water history discard test (rr_water.h).
+    AnimatedTextureMask, // Water animated texture mask test (rr_water.h).
     RrOutput,
     InputCount
 };
@@ -40,6 +42,8 @@ inline constexpr const char *names[InputCount] = {"color",
                                                   "color_before_transparency",
                                                   "responsivity_mask",
                                                   "specular_hit_distance",
+                                                  "disocclusion_mask",
+                                                  "animated_texture_mask",
                                                   "rr_output"};
 
 struct FormatInfo {
@@ -59,6 +63,7 @@ inline constexpr FormatInfo formats[] = {
     {41, "R32_FLOAT", 4, "float32"},
     {42, "R32_UINT", 4, "uint32"},
     {54, "R16_FLOAT", 2, "float16"},
+    {61, "R8_UNORM", 1, "uint8, 0-255 for 0-1"},
 };
 inline const FormatInfo *Format(unsigned dxgi) {
     for (const FormatInfo &f : formats)
@@ -86,6 +91,10 @@ struct Camera {
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
     bool delivered{}, reset{}, replaced_sr{};
+    // Water tests (rr_water.h): whether this frame computed the water masks (the settings say
+    // which ones RR took), and the water guide mode its guides were converted with.
+    bool water_masks{};
+    unsigned water_guide{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
     unsigned color_subrect[2]{}, depth_subrect[2]{}, motion_subrect[2]{};
@@ -101,6 +110,10 @@ struct Header {
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
         responsivity_enabled{}, sky_depth_test{};
     float responsivity_strength{};
+    // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
+    bool water_responsivity{}, water_discard{}, water_animated{};
+    float water_strength{};
+    unsigned water_guide{};
 };
 template <class Buffer> struct Frame {
     Buffer buffer{};
@@ -248,6 +261,8 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("reset"), m.reset);
     JsonUint(f.Key("reset_reasons"), m.reset_reasons);
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
+    JsonBool(f.Key("water_masks"), m.water_masks);
+    JsonUint(f.Key("water_guide"), m.water_guide);
     f.Key("stats");
     o += '{';
     JsonFields st(o, ", ");
@@ -323,6 +338,11 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonNumber(s.Key("responsivity_strength"), h.responsivity_strength);
     JsonUint(s.Key("guide_test"), h.guide_test);
     JsonBool(s.Key("sky_depth_test"), h.sky_depth_test);
+    JsonBool(s.Key("water_responsivity"), h.water_responsivity);
+    JsonNumber(s.Key("water_strength"), h.water_strength);
+    JsonBool(s.Key("water_discard"), h.water_discard);
+    JsonBool(s.Key("water_animated"), h.water_animated);
+    JsonUint(s.Key("water_guide"), h.water_guide);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";

@@ -3,7 +3,8 @@
 A capture folder holds manifest.json (written last) and frame<i>_<name>.bin raw texel files.
 From another script:  sys.path.insert(0, 'tools'); from read_capture import load
     manifest, frames = load(folder)   # frames[i] = {input_name: numpy array}, null inputs omitted
-Arrays are float32 (H, W[, C]) for float formats, uint32 (H, W) for R32_UINT, else uint8 (H, W, bpp).
+Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
+uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
 """
 import argparse
@@ -13,9 +14,10 @@ import tempfile
 
 import numpy as np
 
-# dxgi_format -> (little-endian dtype, channels); 26 (R11G11B10_FLOAT) is unpacked from uint32.
+# dxgi_format -> (little-endian dtype, channels); 26 (R11G11B10_FLOAT) is unpacked from uint32,
+# 61 (R8_UNORM) is scaled to 0-1.
 FORMATS = {2: ('<f4', 4), 10: ('<f2', 4), 16: ('<f4', 2), 26: ('<u4', 1), 34: ('<f2', 2),
-           41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1)}
+           41: ('<f4', 1), 42: ('<u4', 1), 54: ('<f2', 1), 61: ('<u1', 1)}
 # settings.lighting_input -> label, as in src/rr_lighting_source.h (9-12 need the SSS pre-denoise
 # build).
 LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from native temporal',
@@ -55,6 +57,8 @@ def decode_image(data, info, path):
     raw = np.frombuffer(data, dtype).reshape(height, width, channels)
     if fmt == 26:
         return decode_r11g11b10(raw[..., 0])
+    if fmt == 61:
+        return raw[..., 0].astype(np.float32) / 255
     out = raw.astype(np.uint32 if dtype == '<u4' else np.float32)
     return out[..., 0] if channels == 1 else out
 
@@ -142,13 +146,16 @@ def self_test():
     pair = (np.arange(16, dtype='<f4') * 0.1).reshape(height, width, 2)
     sss = (np.arange(8, dtype='<f2') - 4).reshape(height, width)
     odd = np.arange(24, dtype=np.uint8).reshape(height, width, 3)
+    water = np.array([0, 255, 0, 51, 255, 255, 0, 102], np.uint8).reshape(height, width)
+    discard = np.where(water == 255, 10000, 0).astype('<f2')
     output = (np.arange(128, dtype='<f2') / 64).reshape(4, 8, 4)  # output size, not render size
     names = ['color', 'depth', 'motion', 'normal_roughness', 'diffuse_albedo', 'specular_albedo',
              'status', 'sss_guide', 'color_before_transparency', 'responsivity_mask',
-             'specular_hit_distance', 'rr_output']
+             'specular_hit_distance', 'disocclusion_mask', 'animated_texture_mask', 'rr_output']
     images = [('color', color, 26), ('depth', depth, 41), ('motion', motion, 34),
               ('normal_roughness', normal, 10), ('specular_albedo', pair, 16),
               ('status', status, 42), ('sss_guide', sss, 54), ('specular_hit_distance', odd, 99),
+              ('disocclusion_mask', discard, 54), ('animated_texture_mask', water, 61),
               ('rr_output', output, 10)]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -195,6 +202,11 @@ def self_test():
         np.testing.assert_array_equal(frames[0]['status'], status)
         np.testing.assert_array_equal(frames[0]['specular_hit_distance'], odd)
         expect(frames[0]['specular_hit_distance'].dtype == np.uint8, 'unknown format is uint8')
+        got = frames[0]['animated_texture_mask']
+        expect(got.dtype == np.float32 and got.shape == (height, width), 'unorm8 dtype/shape')
+        np.testing.assert_array_equal(got, water.astype(np.float32) / 255)
+        expect(got.max() == 1 and got[1, 3] == np.float32(0.4), 'unorm8 scales to 0-1')
+        np.testing.assert_array_equal(frames[0]['disocclusion_mask'], discard.astype(np.float32))
         got = frames[0]['rr_output']
         expect(got.dtype == np.float32 and got.shape == (4, 8, 4), 'rr_output keeps its own size')
         np.testing.assert_array_equal(got, output.astype(np.float32))
@@ -209,7 +221,7 @@ def self_test():
         expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
         with np.load(folder / 'out.npz') as npz:
-            expect(len(npz.files) == 10 and 'frame1_color' in npz.files, 'npz keys')
+            expect(len(npz.files) == 12 and 'frame1_color' in npz.files, 'npz keys')
             expect(npz['frame0_rr_output'].shape == (4, 8, 4), 'npz rr_output shape')
             np.testing.assert_array_equal(npz['frame0_status'], status)
 

@@ -191,7 +191,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                                             : "waiting (needs preset F)");
     ImGui::TextWrapped("Session-only test. Tells RR to hold pixels where geometry meets sky "
                        "steadier over time; moving branches may ghost. While on, it replaces the "
-                       "SSS responsivity mask.");
+                       "SSS and water responsivity masks.");
     int color_scale = static_cast<int>(rrcolorscale::Valid(rrcolorscale::mode));
     if (ImGui::Combo("Color brightness test", &color_scale, rrcolorscale::labels,
                      rrcolorscale::Count)) {
@@ -301,9 +301,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
             ImGui::TextUnformatted("Water in the latest frame: measuring");
         if (water.responsivity)
             ImGui::Text("Water responsivity mask: %s",
-                        water_status.responsivity            ? "active"
-                        : rrwater::Clamp(water.strength) == 0 ? "off (strength 0)"
-                                                              : "waiting (needs preset F)");
+                        water_status.responsivity               ? "active"
+                        : sky_edge && edge == TestState::Active ? "replaced by sky edge mask"
+                        : rrwater::Clamp(water.strength) == 0   ? "off (strength 0)"
+                                                                : "waiting (needs preset F)");
         if (water.discard)
             ImGui::Text("Water history discard: %s", water_status.discard ? "active" : "waiting");
         if (water.animated)

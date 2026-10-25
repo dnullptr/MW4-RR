@@ -316,6 +316,8 @@ struct GpuFrame {
     static constexpr UINT WaterSlot = 16;
     // Guide test mode Convert used for this frame (rrguidetest::Mode).
     unsigned guide_test{};
+    // Water guide mode Convert used for this frame (rrwater::Guide).
+    unsigned water_guide{};
     // Water tests (rr_water.h), allocated only once a test wants them: the
     // guide shader's classification and the masks rr_water_masks.hlsl writes.
     // bytes is their own optional term in the pool reservations, like SSS.
@@ -515,8 +517,8 @@ struct GpuFrame {
         Change(cl, source, D3D12_RESOURCE_STATE_COPY_SOURCE, source_state);
         return true;
     }
-    // water_guide: rrwater::Guide for water pixels.
-    void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p, unsigned water_guide = 0) {
+    // guide: rrwater::Guide for water pixels.
+    void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p, unsigned guide = 0) {
         Order(cl);
         for (unsigned i = 2; i < 4; ++i)
             Change(cl, sources[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -539,7 +541,8 @@ struct GpuFrame {
             cl->SetComputeRootConstantBufferView(2 + i,
                                                  constants[i]->GetGPUVirtualAddress() + offsets[i]);
         cl->SetComputeRootDescriptorTable(4, Gpu(p, WaterSlot));
-        const UINT water_constants[4] = {rrwater::ValidGuide(water_guide), 0, 0, 0};
+        water_guide = rrwater::ValidGuide(guide);
+        const UINT water_constants[4] = {water_guide, 0, 0, 0};
         cl->SetComputeRoot32BitConstants(5, 4, water_constants, 0);
         cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         for (auto &r : guides)
