@@ -415,6 +415,7 @@ class Controller {
         sky_edge_test = color_test = depth_test = wide_output = weapon_test = {};
         weapon_linear = false;
         weapon_logged = {};
+        DropoutReconfigured();
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
@@ -796,6 +797,7 @@ class Controller {
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
 #include "rr_live_transparency.inl"
+#include "rr_live_dropout.inl"
 
     bool SssEnabled() {
         std::lock_guard lock(mutex);
@@ -1950,6 +1952,13 @@ class Controller {
                 evaluated.color_x = evaluated.color_y = 0;
             if (depth_on || weapon_on)
                 evaluated.depth_x = evaluated.depth_y = 0;
+            // Refraction dropout test (rr_live_dropout.inl): RR reads a copy of its color.
+            const auto dropout = rrdropout::Read();
+            const bool dropout_on = DropoutUse(*s, dropout, color_on, color_format);
+            if (dropout_on) {
+                resources.color = dropout_test.texture.Get();
+                evaluated.color_x = evaluated.color_y = 0;
+            }
             if (weapon_on && (weapon_map.scale != weapon_logged.scale ||
                               weapon_map.offset != weapon_logged.offset ||
                               weapon_map.sky != weapon_logged.sky)) {
@@ -1995,6 +2004,8 @@ class Controller {
             if (weapon_on)
                 s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
                                    o.depth_y, weapon_map);
+            if (dropout_on)
+                DropoutRecord(*s, cl.Get(), o, dropout);
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2032,6 +2043,8 @@ class Controller {
             for (auto *t : {&sky_edge_test, &color_test, &depth_test, &weapon_test})
                 if (t->active)
                     s->gpu.TestFinish(cl.Get(), t->texture.Get());
+            if (dropout_test.active)
+                s->gpu.TestFinish(cl.Get(), dropout_test.texture.Get());
             // Readable by the gate's Display (GateEnd), then back to COMMON below.
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

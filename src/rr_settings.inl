@@ -9,6 +9,7 @@
 #include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
+#include "rr_refraction_dropout.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -235,6 +236,36 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Session-only test. Sends RR the color darker or brighter and scales its "
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
+    bool dropout = rrdropout::enabled;
+    if (ImGui::Checkbox("Refraction dropout (window glass)", &dropout)) {
+        rrdropout::enabled = dropout;
+        ++rrdropout::changes;
+    }
+    float dropout_strength = rrdropout::ClampStrength(rrdropout::strength);
+    if (ImGui::SliderFloat("Dropout strength", &dropout_strength, 0.0f, rrdropout::MaxStrength,
+                           "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        rrdropout::strength = rrdropout::ClampStrength(dropout_strength);
+        ++rrdropout::changes;
+    }
+    bool dropout_before = rrdropout::before_transparency;
+    if (ImGui::Checkbox("Dropout: also color before transparency", &dropout_before)) {
+        rrdropout::before_transparency = dropout_before;
+        ++rrdropout::changes;
+    }
+    bool dropout_mask = rrdropout::show_mask;
+    if (ImGui::Checkbox("Dropout: show refraction mask (red)", &dropout_mask)) {
+        rrdropout::show_mask = dropout_mask;
+        ++rrdropout::changes;
+    }
+    const auto dropout_report = LiveRR().DropoutStatus();
+    ImGui::Text("Refraction dropout: %s", rrdropout::Label(dropout_report));
+    ImGui::TextWrapped("Session-only test for noise behind window glass. The game's refraction "
+                       "copies a noisy half-resolution image, so RR sees the same grain repeated "
+                       "in neighbouring pixels and keeps it as texture. This drops a random "
+                       "blue-noise share of those pixels every frame (strength = the share) and "
+                       "brightens the rest so the average stays the same. Judge it with frame "
+                       "generation off. Needs the transparency albedo blend's refraction "
+                       "capture; the color brightness test turns it off.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
         LiveRR().RequestCapture(requested_lobe);
     const auto capture = LiveRR().CaptureStatus();

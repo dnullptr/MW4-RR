@@ -31,6 +31,7 @@
 #include "rr_specular_distance.h"
 #include "rr_ray_density.h"
 #include "rr_water.h"
+#include "rr_refraction_dropout_gpu.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -338,6 +339,8 @@ struct GpuFrame {
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
     bool use_depth{}, hit_ready{}, water_written{};
+    // Refraction dropout test descriptors (rr_live_dropout.inl).
+    rrdropout::Gpu dropout;
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);

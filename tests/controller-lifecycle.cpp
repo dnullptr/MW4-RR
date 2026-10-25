@@ -136,12 +136,38 @@ struct ControllerCpuTest {
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
         c.color_test.blocked = c.sky_edge_test.active = c.wide_output.blocked = true;
+        c.dropout_test.blocked = c.dropout_unavailable = c.dropout_covered = true;
+        c.dropout_unavailable_changes = 5;
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
         assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
                c.applied_color_scale == 1.0f);
+        assert(!c.dropout_test.blocked && !c.dropout_unavailable && !c.dropout_covered &&
+               !c.dropout_unavailable_changes && !c.dropout_pipeline.state);
+        // The refraction dropout test is off by default and reports why it is not active.
+        assert(c.DropoutStatus() == rrdropout::Report::Off);
+        rrdropout::enabled = true;
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting); // RR not running
+        c.color_test.active = true;
+        assert(c.DropoutStatus() == rrdropout::Report::ColorTest);
+        c.color_test.active = false;
+        c.dropout_unavailable = true;
+        c.dropout_unavailable_changes = rrdropout::changes;
+        assert(c.DropoutStatus() == rrdropout::Report::Unavailable);
+        ++rrdropout::changes; // a setting change retries
+        assert(c.DropoutStatus() == rrdropout::Report::Waiting);
+        c.dropout_unavailable = false;
+        c.dropout_test.blocked = true;
+        c.dropout_test.changes = rrdropout::changes;
+        assert(c.DropoutStatus() == rrdropout::Report::Blocked);
+        // Wanted but off for the color brightness test: no device is touched.
+        Controller::Slot slot;
+        assert(!c.DropoutUse(slot, rrdropout::Read(), true, DXGI_FORMAT_R11G11B10_FLOAT) &&
+               !c.dropout_test.active);
+        c.dropout_test = {};
+        rrdropout::enabled = false;
         c.budget.limit = Budget::Minimum + 50;
         c.test_reserve = 200;
         c.QueueReconfigure();

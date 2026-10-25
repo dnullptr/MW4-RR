@@ -75,6 +75,9 @@ def main():
 
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
+    # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.
+    header(out / 'rr_refraction_dropout.generated.h', [
+        ('RRRefractionDropout', compile_hlsl('rr_refraction_dropout.hlsl', 'rr_refraction_dropout'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
