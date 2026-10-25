@@ -729,7 +729,7 @@ static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t 
     const auto binding = ShaderDispatches().Get(list->get_native());
     if (!binding.shader)
         return;
-    const bool known = binding.shader == rrspecular::DistanceBlur;
+    const bool known = rrspecular::DistanceBlur(binding.shader);
     auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
         reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
     if (!native)
@@ -739,7 +739,9 @@ static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t 
     if (known)
         stats.Dispatch();
     // Unknown shaders are examined once each, and only inside a live prepass recording.
-    else if (!LiveRR().CanRaw(native.Get()) || !stats.Scan(binding.shader))
+    // The native spatial denoiser also binds an R16 t10 and the prepass t13; skip it.
+    else if (rrbypass::Spatial == rrversion::Canonical(binding.shader) ||
+             !LiveRR().CanRaw(native.Get()) || !stats.Scan(binding.shader))
         return;
     auto reject = [&](S stage) {
         if (known)

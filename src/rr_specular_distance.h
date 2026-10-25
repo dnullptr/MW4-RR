@@ -9,7 +9,10 @@
 namespace rrspecular {
 // Native cs_ray_hit_distance_blur: t10 is the cs_raygen_sum_up specular hit
 // distance scalar, t13 is the prepass PackedSurface of the same frame.
-inline constexpr uint64_t DistanceBlur = 0xc9ca6daa80593f3aull;
+// 0x4894e5e7e717b468 is the build shipped with the 2026-10-25 game update.
+inline constexpr bool DistanceBlur(uint64_t hash) {
+    return hash == 0xc9ca6daa80593f3aull || hash == 0x4894e5e7e717b468ull;
+}
 // The copy is sized from the current prepass guides, not a fixed resolution.
 inline bool ValidSource(const D3D12_RESOURCE_DESC &d, UINT w, UINT h, D3D12_RESOURCE_STATES state) {
     constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
