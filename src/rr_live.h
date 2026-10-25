@@ -531,8 +531,9 @@ class Controller {
                 const bool sss = s.sss_used && !s.guides_withheld && s.sss.admission.accepted;
                 const bool glass =
                     s.transparency_used && !s.guides_withheld && s.transparency_accepted;
-                health.Frame(v,
-                             {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
+                // A frame whose gate never ran never reached RR: no guide counts for it.
+                health.Frame(v, {finite[0], finite[1], sss, glass, s.gate_recorded && s.hit_used,
+                                 s.gate_recorded && s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 if (s.gate_recorded && s.hit_conditioned)
