@@ -102,6 +102,17 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
     changed |= ImGui::Checkbox("Transparency albedo blend", &requested_blend);
+    if (requested_blend) {
+        // No hotkey; applied live through the blend tuning and saved on change.
+        ImGui::Indent();
+        auto &tuning = BlendTuning();
+        if (ImGui::Checkbox("Frosted glass pattern", &tuning.pattern)) {
+            LiveRR().SetTransparencyBlendTuning(tuning);
+            reshade::set_config_value(nullptr, SettingsSection, "TransparencyBlendPattern",
+                                      tuning.pattern);
+        }
+        ImGui::Unindent();
+    }
     changed |= ImGui::Checkbox("Specular hit distance", &requested_hit);
     if (changed) {
         ApplyEnabled();

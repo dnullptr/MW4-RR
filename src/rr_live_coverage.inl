@@ -157,8 +157,12 @@ void CoverageHarvest(Slot &s, ULONGLONG now) {
 // AfterSR, on the SR list after GateBegin (guides in NON_PIXEL_SHADER_RESOURCE)
 // and before evaluate. w x h is the render size, which BeforeSR proved equals
 // the slot's guides. Records the blend only when this frame's captures are
-// complete; nothing here may reach AfterSR's catch.
-void CoverageBlend(Slot &s, ID3D12GraphicsCommandList *cl, UINT w, UINT h) noexcept {
+// complete; nothing here may reach AfterSR's catch. color_origin: RR's colour
+// input (gpu.sr[0], NON_PIXEL_SHADER_RESOURCE here) starts at the render
+// origin, so the pattern can read it at the guides' coordinates; otherwise
+// the pattern is off for this frame.
+void CoverageBlend(Slot &s, ID3D12GraphicsCommandList *cl, UINT w, UINT h,
+                   bool color_origin = true) noexcept {
     try {
         const auto now = GetTickCount64();
         CoverageReportLocked(now);
@@ -173,7 +177,7 @@ void CoverageBlend(Slot &s, ID3D12GraphicsCommandList *cl, UINT w, UINT h) noexc
             CoverageRefused(rrblend::Reason::Extent);
             return;
         }
-        g.WriteDescriptors(pipelines, s.gpu.guides);
+        g.WriteDescriptors(pipelines, s.gpu.guides, color_origin ? s.gpu.sr[0].Get() : nullptr);
         g.WriteControl(rrblend::Make(blend_tuning, w, h)); // Admitted 0 until Seal
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;

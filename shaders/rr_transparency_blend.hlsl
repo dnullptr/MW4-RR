@@ -4,7 +4,9 @@
 // The CPU mirror is rrblend::Reference in src/rr_transparency_blend_policy.h.
 cbuffer Control : register(b0) {
     uint Admitted, Width, Height, Flags; // Flags bit0 blend sky (status 2), bit1 blend roughness,
-                                         // bit2 3x3 tent filter, bit3 debug (opacity as diffuse)
+                                         // bit2 3x3 tent filter, bit3 debug (opacity as diffuse),
+                                         // bit4 pattern (diffuse target from Color; set only
+                                         // when t2 is a real SRV of RR's input colour)
     float4 Diffuse;                      // rgb = diffuse target
     float4 Params;                       // x specular target, y roughness target, z strength, w floor
     uint4 Reserved;                      // unused
@@ -12,6 +14,7 @@ cbuffer Control : register(b0) {
 };
 Texture2DMS<float4, 4> Coverage : register(t0);
 Texture2D<uint> Status : register(t1);
+Texture2D<float4> Color : register(t2); // RR's render-resolution input colour, origin (0, 0)
 RWTexture2D<float4> NormalRoughness : register(u0);
 RWTexture2D<float4> DiffuseAlbedo : register(u1);
 RWTexture2D<float4> SpecularAlbedo : register(u2);
@@ -24,6 +27,27 @@ static const float3 kLuma = float3(0.299, 0.587, 0.114);
 float3 Opacity(int2 q) {
     precise float3 o = 1.0 - Coverage.Load(q >> 1, (q.x & 1) | ((q.y & 1) << 1)).rgb;
     return saturate(o);
+}
+// Pattern diffuse target of render pixel p: Diffuse * colour / M, saturated, where M is the
+// mean luma of the 5x5 colour box around p over the taps inside the extent. A non-finite
+// colour or M gives Diffuse. Precise, so that no fast-math (no-NaN/no-Inf) flag lets the
+// compiler drop the finiteness test.
+float3 PatternTarget(int2 p) {
+    precise float sum = 0.0;
+    float count = 0.0;
+    [unroll] for (int dy = -2; dy <= 2; ++dy) [unroll] for (int dx = -2; dx <= 2; ++dx) {
+        const int2 q = p + int2(dx, dy);
+        if (q.x >= 0 && q.y >= 0 && q.x < int(Width) && q.y < int(Height)) {
+            sum += dot(Color.Load(int3(q, 0)).rgb, kLuma);
+            count += 1.0;
+        }
+    }
+    precise float m = sum / count;
+    precise float3 color = Color.Load(int3(p, 0)).rgb;
+    if (!all(isfinite(color)) || !isfinite(m))
+        return Diffuse.rgb;
+    precise float3 target = Diffuse.rgb * color / max(m, 1e-4);
+    return saturate(target);
 }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // Submission-time gate. Admitted lives in an upload-heap CBV that the CPU writes, and every
@@ -68,7 +92,7 @@ float3 Opacity(int2 q) {
         float4 d = DiffuseAlbedo[id.xy];
         float4 s = SpecularAlbedo[id.xy];
         if (covered) {
-            d.rgb = lerp(d.rgb, Diffuse.rgb, c);
+            d.rgb = lerp(d.rgb, (Flags & 16u) ? PatternTarget(int2(id.xy)) : Diffuse.rgb, c);
             s.rgb = lerp(s.rgb, Params.xxx, c);
             if (Flags & 2u) {
                 float4 n = NormalRoughness[id.xy];

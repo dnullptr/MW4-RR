@@ -38,6 +38,9 @@ struct Tuning {
     bool sky = true;
     bool filter = true;
     bool debug = false;
+    // Covered pixels take a detail albedo from RR's input colour (PatternFlag)
+    // instead of the constant diffuse target.
+    bool pattern = true;
 };
 inline float ClampUnit(float value, float fallback) {
     return std::isnan(value) ? fallback : std::clamp(value, 0.f, 1.f);
@@ -51,10 +54,15 @@ inline Tuning Clamp(Tuning t) {
     return t;
 }
 
-inline constexpr uint32_t SkyFlag = 1u, RoughnessFlag = 2u, FilterFlag = 4u, DebugFlag = 8u;
+inline constexpr uint32_t SkyFlag = 1u, RoughnessFlag = 2u, FilterFlag = 4u, DebugFlag = 8u,
+                          PatternFlag = 16u;
 // Opacity at or below two 10-bit steps is quantization noise of the coverage target.
 inline constexpr float OpacityFloor = 2.f / 1023.f;
 // Mirrors the blend shader's cbuffer. Word 0 is written at submission time.
+// flags: SkyFlag blends sky (status 2), RoughnessFlag blends roughness,
+// FilterFlag applies the 3x3 tent, DebugFlag shows opacity as diffuse, and
+// PatternFlag derives the diffuse target from the colour input (t2). Gpu
+// clears PatternFlag for a dispatch without a usable colour SRV.
 struct Control {
     uint32_t admitted, width, height, flags;
     float diffuse[4]; // rgb diffuse target, w unused (0)
@@ -74,7 +82,8 @@ inline Control Make(const Tuning &tuning, uint32_t width, uint32_t height) {
     c.width = width;
     c.height = height;
     c.flags = (t.sky ? SkyFlag : 0u) | (t.roughness >= 0.f ? RoughnessFlag : 0u) |
-              (t.filter ? FilterFlag : 0u) | (t.debug ? DebugFlag : 0u);
+              (t.filter ? FilterFlag : 0u) | (t.debug ? DebugFlag : 0u) |
+              (t.pattern ? PatternFlag : 0u);
     c.diffuse[0] = c.diffuse[1] = c.diffuse[2] = t.diffuse;
     c.params[0] = t.specular;
     c.params[1] = t.roughness >= 0.f ? t.roughness : 0.f;
@@ -347,11 +356,39 @@ inline float Lerp(float x, float y, float s) {
 inline float Luma(const float (&c)[3]) {
     return c[0] * 0.299f + c[1] * 0.587f + c[2] * 0.114f;
 }
+// Smallest local mean luma the pattern target divides by.
+inline constexpr float PatternFloor = 1e-4f;
+// The pattern diffuse target of render pixel (x, y): Diffuse * colour / M,
+// saturated, where M is the mean luma of the 5x5 box of colour around the
+// pixel, over the taps inside width x height. color[dy + 2][dx + 2] is the
+// colour at (x + dx, y + dy). A non-finite colour or M gives Diffuse.
+inline void PatternTarget(const Control &control, uint32_t x, uint32_t y,
+                          const float (&color)[5][5][3], float (&target)[3]) {
+    float sum = 0.f, count = 0.f;
+    for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx) {
+            const int64_t qx = int64_t(x) + dx, qy = int64_t(y) + dy;
+            if (qx < 0 || qy < 0 || qx >= int64_t(control.width) || qy >= int64_t(control.height))
+                continue;
+            sum += Luma(color[dy + 2][dx + 2]);
+            count += 1.f;
+        }
+    const float mean = sum / count;
+    const auto &c = color[2][2];
+    const bool finite =
+        std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]) && std::isfinite(mean);
+    for (int ch = 0; ch < 3; ++ch)
+        target[ch] = finite ? Saturate(control.diffuse[ch] * c[ch] / (std::max)(mean, PatternFloor))
+                            : control.diffuse[ch];
+}
 // transmittance[dy + 1][dx + 1] is t(q) for q = (x + dx, y + dy), the coverage
 // sample that maps to render pixel q. Taps outside width x height are ignored;
-// each tap's opacity is saturated, so NaN counts as clear.
+// each tap's opacity is saturated, so NaN counts as clear. color is the colour
+// box of PatternTarget; without it the pattern flag has no effect, as when Gpu
+// clears the flag for a dispatch without a colour SRV.
 inline void Reference(const Control &control, uint32_t x, uint32_t y, uint32_t status,
-                      const float (&transmittance)[3][3][3], Guides &inout) {
+                      const float (&transmittance)[3][3][3], Guides &inout,
+                      const float (*color)[5][5][3] = nullptr) {
     if (control.admitted != 1 || x >= control.width || y >= control.height)
         return;
     const bool eligible = status == 1 || status == 3 || (status == 2 && (control.flags & SkyFlag));
@@ -382,8 +419,11 @@ inline void Reference(const Control &control, uint32_t x, uint32_t y, uint32_t s
     for (int ch = 0; ch < 3; ++ch)
         c[ch] = Saturate(Saturate((o[ch] - noise) / (1.f - noise)) * strength);
     if ((std::max)(c[0], (std::max)(c[1], c[2])) > 0.f) {
+        float target[3] = {control.diffuse[0], control.diffuse[1], control.diffuse[2]};
+        if ((control.flags & PatternFlag) && color)
+            PatternTarget(control, x, y, *color, target);
         for (int ch = 0; ch < 3; ++ch) {
-            inout.diffuse[ch] = Lerp(inout.diffuse[ch], control.diffuse[ch], c[ch]);
+            inout.diffuse[ch] = Lerp(inout.diffuse[ch], target[ch], c[ch]);
             inout.specular[ch] = Lerp(inout.specular[ch], control.params[0], c[ch]);
         }
         if (control.flags & RoughnessFlag)
