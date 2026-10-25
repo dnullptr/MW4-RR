@@ -464,8 +464,8 @@ inline rrstatus::State StatusOf(bool enabled, bool failed, bool unavailable, boo
     return !enabled                            ? State::Off
            : !rr_on || rr_failed || rr_retired ? State::ParentOff
            : failed                            ? State::Error
-           : unavailable                       ? State::Unavailable
            : fresh_ran                         ? State::Active
+           : unavailable                       ? State::Unavailable
                                                : State::Waiting;
 }
 } // namespace rrblend

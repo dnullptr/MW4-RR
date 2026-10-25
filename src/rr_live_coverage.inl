@@ -48,6 +48,7 @@ void CoverageReset(Slot &s, ID3D12GraphicsCommandList *cl) {
     // holds nothing of this frame.
     if (!s.coverage.submitted) {
         s.coverage.cleared = false;
+        s.coverage.capture.Reset();
         s.coverage.captures_oit = s.coverage.captures_refr = s.coverage.captures_refr_alpha = 0;
     }
 }

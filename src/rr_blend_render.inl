@@ -26,6 +26,7 @@ enum class CoverageNote : unsigned {
     NoVariant,
     Context,
     Outputs,
+    Query,
     Depth,
     Target,
     View,
@@ -104,6 +105,10 @@ static bool CoverageProven(reshade::api::command_list *list, bool indirect,
         snapshot.command != native.Get() || snapshot.generation != snapshot.proof.generation ||
         !snapshot.proof.Available()) {
         CoverageLog(path, CoverageNote::Outputs, "native outputs not proven", snapshot.status);
+        return false;
+    }
+    if (snapshot.proof.queries_known && !snapshot.proof.query_count) {
+        CoverageLog(path, CoverageNote::Query, "a counting query is active on the list");
         return false;
     }
     if (entry->depth == rrblend::DepthClass::KeepDsv && !snapshot.DepthTarget().ptr) {
@@ -262,6 +267,7 @@ static void CoverageAfterIndirect(const rrcompute::IndirectCall &call) noexcept 
 // equivalent. Never suppresses the draw.
 static void CoverageDraw(reshade::api::command_list *list,
                          const rrsss::ProducerDraw &draw) noexcept {
+    auto path = CoveragePath::RefractionDraw;
     try {
         if (draw.count != 3 || draw.instances != 1 ||
             list->get_device()->get_api() != reshade::api::device_api::d3d12)
@@ -270,6 +276,8 @@ static void CoverageDraw(reshade::api::command_list *list,
         CoverageArmState arm;
         if (!CoverageProven(list, false, native, arm))
             return;
+        path = arm.kind == rrblend::Kind::Oit ? CoveragePath::OitDraw
+                                              : CoveragePath::RefractionDraw;
         auto token = LiveRR().CoverageCapture(native.Get(), arm.scene.Get(), arm.entry->sample);
         if (!token)
             return;
@@ -279,7 +287,7 @@ static void CoverageDraw(reshade::api::command_list *list,
             return true;
         });
     } catch (...) {
-        CoverageLog(CoveragePath::RefractionDraw, CoverageNote::Exception, "draw exception");
+        CoverageLog(path, CoverageNote::Exception, "draw exception");
     }
 }
 // Hidden tuning keys, read once with the other settings and never written.
