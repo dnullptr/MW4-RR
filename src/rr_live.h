@@ -316,10 +316,14 @@ class Controller {
         responsivity_enabled = enabled;
         responsivity_strength = rrresponsivity::Clamp(strength);
     }
-    // Whether the latest evaluation sent the mask.
+    // Whether the latest evaluation sent the mask and it would still be sent now;
+    // the flag alone goes stale once RR stops evaluating.
     bool ResponsivityActive() {
         std::lock_guard lock(mutex);
-        return responsivity_active;
+        return responsivity_active && enabled && !failed && !retired && sss_enabled &&
+               !sss_failed &&
+               rrresponsivity::Use(responsivity_enabled, responsivity_strength, true,
+                                   preset.has_effective, preset.effective);
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
