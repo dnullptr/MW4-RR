@@ -34,6 +34,11 @@ static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");
+static_assert(rrsettings::HotkeyToggles(true, false, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, true, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, true, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, false, false));
+static_assert(!rrsettings::HotkeyToggles(false, false, false, true));
 
 int main() {
     assert(rrvrsconfig::Allowed("VRS@0;123 = true // preserved\n", true, true));
