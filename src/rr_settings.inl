@@ -68,7 +68,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
-    // Always on now: its panel checkbox is gone, and the saved key is rewritten as on.
+    // Always on now: its panel checkbox is gone; the saved key reads on from the next save.
     requested_tolerate = true;
     reshade::get_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
     reshade::get_config_value(nullptr, SettingsSection, "ResponsivityMask", requested_responsivity);

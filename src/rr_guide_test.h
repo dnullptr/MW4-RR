@@ -33,7 +33,7 @@ inline constexpr float DepthFloor(unsigned f) {
 inline constexpr unsigned Valid(unsigned mode) {
     return mode < Count ? mode : Off;
 }
-// Modes the panel still offers, under "Older tests"; the others were ruled out. Hidden, never
+// Modes the panel still offers, under "Tree noise tests"; the others were ruled out. Hidden, never
 // renumbered, as captures record the mode.
 inline constexpr unsigned panel[] = {Off, AllFlat, SkySurface};
 inline std::atomic<unsigned> mode{};
