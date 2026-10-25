@@ -31,6 +31,10 @@ RayWhy ray_why = RayWhy::Mode; // the last resolve's refusal; None after a patch
 bool ray_announced{};
 std::array<RayMark, 4> ray_marks{};
 unsigned ray_next_mark{};
+// Applies in a row, in every mode, that read the Budget their own recording's resolve wrote
+// before them (A2: the governor then bounds the frame that consumes the Budget it governed). A
+// resolve patches only from rrraybudget::ProofFrames on; any other apply in a RawSlot resets it.
+unsigned ray_placement{};
 UINT ray_next_serial{};
 // Every cs_vrrt_resolve dispatch PreserveRayBudget sees (RayBudgetResolveSeen, lock-free: it is
 // counted before the RR-enabled check, without the mutex).
@@ -477,9 +481,13 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         s.ray_resolved = true;
         s.ray_resolve_cb = in.settings.address;
         RaySerial(s);
-        // This resolve writes its Budget natively unless the patch below succeeds (A4).
-        if (in.budget_resource)
+        // This resolve writes its Budget natively unless the patch below succeeds (A4). Its
+        // identity, whatever the refusal below, is what a same-frame apply must read (A2).
+        if (in.budget_resource) {
             RayClearMark(in.budget_resource, in.budget_offset);
+            s.ray_resolve_budget_resource = in.budget_resource;
+            s.ray_resolve_budget_offset = in.budget_offset;
+        }
         ray_summary.Resolve(s.ray_applied, s.ray_applied && s.ray_apply_cb == in.settings.address);
         unsigned logged = 0;
         if (in.constants && now >= ray_retry_after && !ray_log_failed)
@@ -493,11 +501,18 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
             return RayRefuse(RayWhy::Mode, m);
         if (!same_budget)
             return RayRefuse(RayWhy::BudgetIdentity, m);
+        // A2: the Budget this resolve governs must be read by this recording's apply, after it.
+        // A resolve after the apply would govern the next recording's frame instead, and the
+        // placement streak shows that the applies read the Budget their own resolve wrote.
+        if (s.ray_applied)
+            return RayRefuse(RayWhy::AfterApply, m);
+        if (ray_placement < rrraybudget::ProofFrames)
+            return RayRefuse(RayWhy::Placement, m);
         if (NeedsReconfigure())
             return RayRefuse(RayWhy::Reconfigure, m);
         if (now < ray_retry_after)
             return RayRefuse(RayWhy::Memory, m);
-        const auto plan = ray_gate.Decide(m, now, s.ray_applied ? &s.ray_lists : nullptr);
+        const auto plan = ray_gate.Decide(m, now, nullptr); // no apply in this recording yet
         if (plan.why != RayWhy::None)
             return RayRefuse(plan.why, m);
         // Patch only when this recording's LogResolve copied the governor's input (t0) for
@@ -586,6 +601,17 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
         }
         s.ray_apply_cb = log.settings.address;
         s.ray_applied = true;
+        // A2 placement: a proven apply that reads the Budget its own recording's resolve wrote
+        // before it. Any other apply breaks the streak (lagged consumption, a skipped resolve, a
+        // ping-pong Budget read a frame late, an unproven apply).
+        const bool same_frame = lists.why == RayWhy::None && s.ray_resolved &&
+                                s.ray_resolve_budget_resource &&
+                                s.ray_resolve_budget_resource == lists.budget_resource &&
+                                s.ray_resolve_budget_offset == lists.budget_offset;
+        if (!same_frame)
+            ray_placement = 0;
+        else if (ray_placement < UINT_MAX)
+            ++ray_placement;
         // A raised Budget stays raised for the recording even if a later apply reads another.
         const auto consumed = RayConsumed(lists.budget_resource, lists.budget_offset);
         if (consumed.mask) {
@@ -596,6 +622,8 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
             ray_summary.SameBlock(s.ray_resolve_cb == s.ray_apply_cb);
         ray_gate.Apply(lists, now);
         ray_summary.Lists(lists);
+        if (same_frame)
+            ray_summary.SameFrame();
         for (unsigned k = 0; k < 2; ++k) {
             const bool table = lists.v[k].binding == rrraybudget::Binding::Table;
             ray_list_offsets[k] = table ? lists.v[k].offset : 0;

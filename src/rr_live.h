@@ -70,9 +70,11 @@ class Controller {
         // this recording's apply proof, ray_budget/ray_armed the raised lobes and arming snapshot
         // of the Budget that apply read, ray_patched/ray_written/ray_patch_armed the patch's,
         // ray_serial the recording's ray-log serial (0 until a ray site ran), ray_done that the
-        // recording was judged or counted unverified.
+        // recording was judged or counted unverified. ray_resolve_budget_* is the Budget identity
+        // its resolve proved (0 when not proven): an apply reading it is same-frame (A2).
         rrraybudget::Lists ray_lists;
         UINT64 ray_apply_cb{}, ray_resolve_cb{};
+        UINT64 ray_resolve_budget_resource{}, ray_resolve_budget_offset{};
         unsigned ray_logged{}, ray_patched{}, ray_budget{};
         std::array<UINT, 2> ray_written{};
         bool ray_resolved{}, ray_applied{}, ray_done{};

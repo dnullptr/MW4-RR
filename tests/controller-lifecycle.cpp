@@ -187,6 +187,169 @@ struct ControllerCpuTest {
         return a.w == b.w && a.h == b.h && a.capacity == b.capacity && a.margin == b.margin &&
                a.pixels == b.pixels && a.counter == b.counter;
     }
+    // The controller's 10 s line for the window so far, which this ends. Each call reports later
+    // than every earlier one, so a window that has not started yet starts and is reported at once.
+    static std::string RayLine(Controller &c) {
+        static UINT64 clock = 0;
+        std::string controller, lists;
+        for (int i = 0; i < 2; ++i) {
+            clock += rrraybudget::Summary::Interval;
+            if (c.ray_summary.Report(clock, c.ray_gate, c.StatusLocked(clock), controller, lists))
+                return controller;
+        }
+        return {};
+    }
+    // The window's refusals: the line after " | refused " ("" when nothing was refused).
+    static std::string RayRefused(Controller &c) {
+        const auto line = RayLine(c);
+        const auto at = line.find(" | refused ");
+        return at == std::string::npos ? std::string() : line.substr(at + 11);
+    }
+    // A measured, unraised frame of `l`: the reader counted every pixel (lobe 1 requested at rate
+    // 1, lobe 2 not requested), and the game's target 0.4, the governor's input and register 253
+    // (no second segment) were copied.
+    static rrraybudget::Completed RayMeasured(const rrraybudget::Lists &l) {
+        rrraybudget::Completed c;
+        c.lists = l;
+        const std::uint32_t pixels = l.w * l.h;
+        c.rates[1] = pixels;
+        c.rates[rrdensity::Buckets] = pixels;
+        c.rates[rrdensity::Settings1] = 1;
+        c.rates[rrdensity::Limits] = c.rates[rrdensity::Limits + 2] = 9;
+        c.log[0] = c.log[1] = std::bit_cast<std::uint32_t>(0.4f);
+        c.logged = rrraybudget::LogResolveTarget | rrraybudget::LogResolveStats |
+                   rrraybudget::LogApplyScene253;
+        return c;
+    }
+    // The game's resolve as PreserveRayBudget reports it: counted, then given to the controller
+    // while RR is enabled. It proves the Budget (resource, offset) and the hook refused nothing;
+    // with no GPU here it is never patched.
+    static void RayResolve(Controller &c, UINT64 resource = 0x5000, UINT64 offset = 64) {
+        rrvrrt::RayResolve in;
+        in.why = rrraybudget::Why::None;
+        in.budget_resource = resource;
+        in.budget_offset = offset;
+        c.RayBudgetResolveSeen();
+        bool dispatched = false;
+        const bool patched = c.Enabled() && c.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched);
+        assert(!patched && !dispatched);
+    }
+    // `n` recordings on slot 0, each a resolve that proves the Budget `l` names and then the apply
+    // of `l`: same-frame placement (A2).
+    static void RayFrames(Controller &c, const rrraybudget::Lists &l, unsigned n) {
+        for (unsigned i = 0; i < n; ++i) {
+            RayNext(c);
+            RayResolve(c, l.budget_resource, l.budget_offset);
+            c.RayBudgetApply(nullptr, l, {});
+        }
+    }
+    // A gate that arms at `l`: ProofFrames same-frame recordings, then ProofFrames measured frames.
+    static void RayPrime(Controller &c, const rrraybudget::Lists &l) {
+        RayFrames(c, l, rrraybudget::ProofFrames);
+        for (unsigned i = 0; i < rrraybudget::ProofFrames; ++i)
+            c.ray_gate.Complete(RayMeasured(l));
+    }
+    // F1 (A2): the apply that consumes a governed Budget runs in the same recording, after the
+    // patch. A resolve after its recording's apply is refused (AfterApply), and a resolve patches
+    // only after ProofFrames applies in a row read the Budget their own resolve wrote (Placement).
+    // There is no GPU here: a resolve that passes every check up to Decide then waits for its stats
+    // copy (statsUnverified), which is where a patch would follow.
+    static void RayPlacement() {
+        using rrraybudget::Why;
+        const auto l = RayLists();
+        // The normal order arms. The streak counts in every mode: this one is primed with the test
+        // off.
+        rrraybudget::mode = rrraybudget::Off;
+        {
+            Controller c;
+            RayPrime(c, l);
+            assert(c.ray_placement == rrraybudget::ProofFrames);
+            rrraybudget::mode = rrraybudget::Times2;
+            RayLine(c);
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "statsUnverified=1");
+        }
+        // 119 same-frame applies (after 5 without a resolve, so the gate's own streak is long):
+        // the resolve is refused although the gate would arm; its apply is the 120th, and the next
+        // resolve arms. An apply whose recording had no resolve then resets the streak.
+        {
+            Controller c;
+            for (unsigned i = 0; i < 5; ++i) {
+                RayNext(c);
+                c.RayBudgetApply(nullptr, l, {});
+            }
+            RayFrames(c, l, rrraybudget::ProofFrames - 1);
+            for (unsigned i = 0; i < rrraybudget::ProofFrames; ++i)
+                c.ray_gate.Complete(RayMeasured(l));
+            RayLine(c);
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "placement=1");
+            assert(c.ray_gate.Decide(rrraybudget::Times2, GetTickCount64(), nullptr).why ==
+                   Why::None);
+            c.RayBudgetApply(nullptr, l, {});
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "statsUnverified=1");
+            // An unproven apply that reads the Budget its own resolve wrote resets the streak, and
+            // so does a proven apply in a recording without a resolve.
+            auto unproven = l;
+            unproven.why = Why::ListsUnproven;
+            c.RayBudgetApply(nullptr, unproven, {});
+            assert(c.ray_placement == 0);
+            RayFrames(c, l, 1);
+            assert(c.ray_placement == 1);
+            RayNext(c);
+            c.RayBudgetApply(nullptr, l, {});
+            assert(c.ray_placement == 0);
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "placement=2");
+        }
+        // A resolve after its recording's apply is refused, and nothing is dispatched (RayResolve
+        // asserts that); that apply was not same-frame either.
+        {
+            Controller c;
+            RayPrime(c, l);
+            RayLine(c);
+            RayNext(c);
+            c.RayBudgetApply(nullptr, l, {});
+            RayResolve(c);
+            assert(RayRefused(c) == "afterApply=1" && c.ray_placement == 0);
+        }
+        // A ping-pong Budget read a frame late: every apply reads the identity the other resolve
+        // wrote, in another resource or at another offset in the same one. The gate knows both and
+        // would arm, but the resolve never does.
+        for (const UINT64 offset : {UINT64(0), UINT64(128)}) {
+            Controller c;
+            auto other = l;
+            other.budget_resource = offset ? l.budget_resource : 0x6000;
+            other.budget_offset = offset;
+            for (unsigned i = 0; i < 2 * rrraybudget::ProofFrames; ++i) {
+                RayNext(c);
+                const auto &wrote = i & 1 ? other : l, &read = i & 1 ? l : other;
+                RayResolve(c, wrote.budget_resource, wrote.budget_offset);
+                c.RayBudgetApply(nullptr, read, {});
+            }
+            for (unsigned i = 0; i < rrraybudget::ProofFrames; ++i)
+                c.ray_gate.Complete(RayMeasured(l));
+            assert(c.ray_placement == 0 && c.ray_gate.KnownBudget(0x5000, 64) &&
+                   c.ray_gate.KnownBudget(other.budget_resource, other.budget_offset));
+            assert(c.ray_gate.Decide(rrraybudget::Times2, GetTickCount64(), nullptr).why ==
+                   Why::None);
+            RayLine(c);
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "placement=1");
+            // The 10 s line counts the window's same-frame applies of all its applies.
+            RayFrames(c, l, 3);
+            RayNext(c);
+            c.RayBudgetApply(nullptr, l, {});
+            assert(RayLine(c).find(" sameFrame=3/4 | ") != std::string::npos);
+        }
+        rrraybudget::mode = rrraybudget::Off;
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -1383,6 +1546,7 @@ struct ControllerCpuTest {
         assert(guide->refs == 1);
         guide->Release();
         RayBudget();
+        RayPlacement();
     }
 };
 } // namespace rrlive

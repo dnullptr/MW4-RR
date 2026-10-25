@@ -180,6 +180,10 @@ static_assert(Pinned(rb::Why::AfterSR, "controller ran after RR recorded this fr
 static_assert(Pinned(rb::Why::Repeated, "controller ran twice in one recording", "repeated"));
 static_assert(Pinned(rb::Why::Ambiguous, "more than one RR recording on this command list",
                      "ambiguous"));
+static_assert(Pinned(rb::Why::AfterApply, "controller ran after the VRRT apply in this recording",
+                     "afterApply"));
+static_assert(Pinned(rb::Why::Placement,
+                     "the VRRT apply did not read the Budget its own resolve wrote", "placement"));
 static_assert(Pinned(rb::Why::ListsUnproven, "ray lists not proven at the VRRT apply",
                      "listsUnproven"));
 static_assert(Pinned(rb::Why::ListsRoot, "a ray list is a root UAV (no bounds checks)",
@@ -226,7 +230,7 @@ static_assert(Pinned(rb::Why::Pipeline, "governor pipeline could not be created"
 static_assert(Pinned(rb::Why::Readback, "ray budget readback failed", "readback"));
 static_assert(Pinned(rb::Why::Exception, "internal error", "exception"));
 static_assert(unsigned(rb::Why::Exception) + 1 == unsigned(rb::Why::Count) &&
-              unsigned(rb::Why::Count) == 42 &&
+              unsigned(rb::Why::Count) == 44 &&
               std::string_view(rb::Text(rb::Why::Count)) == "unknown");
 
 // The governor's premise. A pixel gets no ray when not requested, 1 + extra rays at a code of 16 or
@@ -1376,6 +1380,8 @@ static void SummaryWindow() {
     broken.why = rb::Why::ListsView;
     sm.Lists(broken);
     sm.Lists(l);
+    for (unsigned i = 0; i < 5; ++i) // five of the eight applies read their own resolve's Budget
+        sm.SameFrame();
     // Five patched frames: three verified, one with a different word, one that never executed.
     // One (f3) asks for more raw rays than both lobes' margins, and its statistics were not copied
     // to cover them; f2 and f5 copied the readers' second segment. The apply's register 251 .y
@@ -1407,16 +1413,17 @@ static void SummaryWindow() {
     assert(!sm.Report(1000 + Interval - 1, gate, status, controller, lists));
     assert(controller.empty() && lists.empty());
     assert(sm.Report(1000 + Interval, gate, status, controller, lists));
-    Expect(controller, "RR ray budget (10s): test=2x the game's rays state=active patched=5/12 "
-                       "verified=3 | resolve seen=17 inRecording=12 afterApply=10 beforeApply=2 "
-                       "outside=2 beforePrepass=1 afterSR=1 repeated=1 clears=4/5 "
-                       "sameB1AsApply=11/14 sameBudget=7/8 | target native=0.400/0.450 "
-                       "(0.250..0.500/0.400..0.600) apply=0.500/0.800 written=0.500/0.800 "
-                       "scene=1920x1080 match=4/5 settings36.w=0x10000 scene251.x=0x400 "
-                       "scene251.y=5 changes=3 scene253.x=2100000 stats=4/5 uncounted=0 | "
-                       "consumers lobe1=0 lobe2=0 dispatch=0 "
-                       "rays=0 other=0 last=n/a | refused listsStable=12 heap=3 outside=2 "
-                       "afterSR=1 repeated=1 ambiguous=1");
+    Expect(controller,
+           "RR ray budget (10s): test=2x the game's rays state=active patched=5/12 "
+           "verified=3 | resolve seen=17 inRecording=12 afterApply=10 beforeApply=2 "
+           "outside=2 beforePrepass=1 afterSR=1 repeated=1 clears=4/5 "
+           "sameB1AsApply=11/14 sameBudget=7/8 sameFrame=5/8 | target native=0.400/0.450 "
+           "(0.250..0.500/0.400..0.600) apply=0.500/0.800 written=0.500/0.800 "
+           "scene=1920x1080 match=4/5 settings36.w=0x10000 scene251.x=0x400 "
+           "scene251.y=5 changes=3 scene253.x=2100000 stats=4/5 uncounted=0 | "
+           "consumers lobe1=0 lobe2=0 dispatch=0 "
+           "rays=0 other=0 last=n/a | refused listsStable=12 heap=3 outside=2 "
+           "afterSR=1 repeated=1 ambiguous=1");
     // Area is the extent's W*H (2073600); capacity and need are the gate's (Gate::Capacity and
     // Gate::Need); worst fill = requested pixels plus extra rays over the frame's own entries:
     // lobe 1 (1036800 + 1000) / 2188960, lobe 2 (2073600 + 20000) / 2188960. INT_MIN (f5) is a
@@ -1456,7 +1463,8 @@ static void SummaryFormat() {
            "RR ray budget (10s): test=2x the game's rays state=waiting: waiting for 120 proven "
            "ray-list applies patched=0/0 verified=0 | resolve seen=0 inRecording=0 afterApply=0 "
            "beforeApply=0 outside=0 beforePrepass=0 afterSR=0 repeated=0 clears=0/0 "
-           "sameB1AsApply=0/0 sameBudget=0/0 | target native=n/a apply=n/a written=-/- "
+           "sameB1AsApply=0/0 sameBudget=0/0 sameFrame=0/0 | target native=n/a apply=n/a "
+           "written=-/- "
            "scene=n/a match=0/0 settings36.w=n/a scene251.x=n/a scene251.y=n/a changes=0 "
            "scene253.x=n/a stats=0/0 uncounted=0 | consumers lobe1=0 lobe2=0 dispatch=0 rays=0 "
            "other=0 last=n/a");
@@ -1608,13 +1616,15 @@ static void SummaryRefusals() {
     Expect(controller, "resolve seen=4 inRecording=0 afterApply=0 beforeApply=0 outside=1 "
                        "beforePrepass=0 afterSR=1 repeated=1");
     // Each reason has its own key (the enum's name in lower camel case) and its own text; equal
-    // counts keep the enum's order. All 41 fit here, where the targets and scene fields are n/a;
-    // with real values the line can be cut (below).
+    // counts keep the enum's order. All of them fit here, where the targets and scene fields are
+    // n/a; with real values the line can be cut (below). Max: the longest line the buffer holds.
+    constexpr std::size_t Max = rb::Summary::ControllerBytes - 1;
     std::string expected;
     for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
         expected += std::string(w > 1 ? " " : "") + rb::keys[w] + "=1";
     Expect(controller, " | refused " + expected);
-    assert(controller.size() < 1023 && controller.ends_with(" | refused " + expected));
+    assert(controller.size() < Max && controller.ends_with(" | refused " + expected));
+    const std::size_t ones = controller.size(); // every reason at 1
     for (unsigned a = 0; a < unsigned(rb::Why::Count); ++a) {
         assert(rb::keys[a][0] >= 'a' && rb::keys[a][0] <= 'z' && rb::Text(rb::Why(a))[0] != 0);
         for (unsigned b = a + 1; b < unsigned(rb::Why::Count); ++b) {
@@ -1622,8 +1632,8 @@ static void SummaryRefusals() {
             assert(std::string(rb::Text(rb::Why(a))) != rb::Text(rb::Why(b)));
         }
     }
-    // The line is one 1024-char buffer built from whole pieces: the first piece that does not fit
-    // ends it with " ..." (room for it is kept), so no count is ever cut short. With 100000 of
+    // The line is one ControllerBytes buffer built from whole pieces: the first piece that does not
+    // fit ends it with " ..." (room for it is kept), so no count is ever cut short. With 100000 of
     // each reason the refusal list no longer fits.
     for (unsigned k = 0; k < 100000; ++k)
         for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
@@ -1635,42 +1645,49 @@ static void SummaryRefusals() {
     const auto at = controller.find(" | refused mode=100000 stopped=100000 unverified=100000 ");
     assert(at != std::string::npos && controller.starts_with("RR ray budget (10s): test=2x"));
     const std::string uncut = controller.substr(0, at) + " | refused " + expected;
-    assert(uncut.size() > 1100 && controller.size() <= 1023 && controller.ends_with(" ..."));
+    assert(uncut.size() > Max + 50 && controller.size() <= Max && controller.ends_with(" ..."));
     const auto kept = controller.substr(0, controller.size() - 4);
     assert(uncut.starts_with(kept) && kept.ends_with("=100000") && uncut[kept.size()] == ' ');
     const auto token = uncut.substr(kept.size(), uncut.find(' ', kept.size() + 1) - kept.size());
-    assert(token.ends_with("=100000") && kept.size() + token.size() + 4 > 1023); // it did not fit
+    assert(token.ends_with("=100000") && kept.size() + token.size() + 4 > Max); // it did not fit
     assert(kept.find(" ...") == std::string::npos);
-    // At the boundary: a line that fits whole is printed whole up to 1019 characters; from 1020
-    // on it would leave no room for the marker, so it is cut there too. Reasons at 10 instead of 1
-    // lengthen the line one character each.
+    // At the boundary: a line that fits whole is printed whole up to Max - 4 characters; from
+    // Max - 3 on it would leave no room for the marker, so it is cut there too. Every reason at
+    // `low` (10^digits) is `digits` characters per reason longer than at 1, and each reason at
+    // `high` (10 * low) instead lengthens it one more: the sweep crosses the boundary.
+    const unsigned reasons = unsigned(rb::Why::Count) - 1;
+    const std::size_t digits = (Max - 3 - ones) / reasons;
+    unsigned low = 1;
+    for (std::size_t d = 0; d < digits; ++d)
+        low *= 10;
+    const unsigned high = 10 * low;
     bool boundary = false;
     for (unsigned tens = 0; tens < unsigned(rb::Why::Count); ++tens) {
         rb::Summary edge;
         assert(!edge.Report(0, gate, status, controller, lists));
         std::string list;
         for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
-            for (unsigned k = 0; k < (w <= tens ? 10u : 1u); ++k)
+            for (unsigned k = 0; k < (w <= tens ? high : low); ++k)
                 edge.Refused(rb::Why(w));
-        for (unsigned pass = 0; pass < 2; ++pass) // the tens first, then the ones, in enum order
+        for (unsigned pass = 0; pass < 2; ++pass) // the highs first, then the lows, in enum order
             for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
                 if ((w <= tens) == (pass == 0))
-                    list += std::string(list.empty() ? "" : " ") + rb::keys[w] +
-                            (w <= tens ? "=10" : "=1");
+                    list += std::string(list.empty() ? "" : " ") + rb::keys[w] + "=" +
+                            std::to_string(w <= tens ? high : low);
         assert(edge.Report(Interval, gate, status, controller, lists));
         const auto refused = controller.find(" | refused ");
         assert(refused != std::string::npos);
         const auto whole = controller.substr(0, refused) + " | refused " + list;
-        boundary |= whole.size() >= 1020 && whole.size() <= 1023;
-        if (whole.size() <= 1019) {
+        boundary |= whole.size() >= Max - 3 && whole.size() <= Max;
+        if (whole.size() <= Max - 4) {
             assert(controller == whole);
             continue;
         }
-        assert(controller.size() <= 1023 && controller.ends_with(" ..."));
+        assert(controller.size() <= Max && controller.ends_with(" ..."));
         const auto cut = controller.substr(0, controller.size() - 4);
         assert(whole.starts_with(cut) && whole[cut.size()] == ' ');
         const auto next = whole.find(' ', cut.size() + 1); // the end of the piece that did not fit
-        assert((next == std::string::npos ? whole.size() : next) + 4 > 1023);
+        assert((next == std::string::npos ? whole.size() : next) + 4 > Max);
     }
     assert(boundary);
 }
@@ -1881,7 +1898,7 @@ static void SummaryTiming() {
     status.mode = rb::Times15;
     assert(sm.Report(4000 + 6 * Interval, gate, status, controller, lists));
     // The quiet window still started over: its counters are gone.
-    Expect(controller, " clears=0/0 sameB1AsApply=0/0 sameBudget=0/0 | ");
+    Expect(controller, " clears=0/0 sameB1AsApply=0/0 sameBudget=0/0 sameFrame=0/0 | ");
     Expect(controller, "| consumers lobe1=0 lobe2=0 dispatch=0 rays=0 other=0 last=n/a");
 }
 

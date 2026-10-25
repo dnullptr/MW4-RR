@@ -57,6 +57,9 @@ enum class Why : unsigned {
     AfterSR,
     Repeated,
     Ambiguous,
+    // Same-frame placement (A2): the governed Budget must be read by its own recording's apply.
+    AfterApply,
+    Placement,
     ListsUnproven,
     ListsRoot,
     ListsView,
@@ -103,6 +106,8 @@ inline constexpr const char *texts[] = {
     "controller ran after RR recorded this frame",
     "controller ran twice in one recording",
     "more than one RR recording on this command list",
+    "controller ran after the VRRT apply in this recording",
+    "the VRRT apply did not read the Budget its own resolve wrote",
     "ray lists not proven at the VRRT apply",
     "a ray list is a root UAV (no bounds checks)",
     "a ray list is not a raw table buffer view",
@@ -133,18 +138,20 @@ inline constexpr const char *texts[] = {
     "internal error"};
 static_assert(sizeof(texts) / sizeof(texts[0]) == unsigned(Why::Count), "one text per Why");
 // The enum names in lower camel case: the keys of the 10 s line's `refused <why>=<n>` list.
+// clang-format off
 inline constexpr const char *keys[] = {
-    "none",          "mode",           "stopped",         "unverified",
-    "context",       "shape",          "constants",       "heap",
-    "budgetBinding", "budgetIdentity", "outside",         "afterSR",
-    "repeated",      "ambiguous",      "listsUnproven",   "listsRoot",
-    "listsView",     "listsOverlap",   "listsSmall",      "listsStable",
-    "listsStale",    "listsChanged",   "evidence",        "vrrtOff",
-    "resolution",    "targetUnknown",  "statsUnverified", "remapUnknown",
-    "targetRange",   "atCap",          "memory",          "reconfigure",
-    "governorCache", "governor",       "patchMismatch",   "listsAfterArming",
-    "unsupported",   "statsMismatch",  "overflow",        "pipeline",
-    "readback",      "exception"};
+    "none",             "mode",             "stopped",          "unverified",
+    "context",          "shape",            "constants",        "heap",
+    "budgetBinding",    "budgetIdentity",   "outside",          "afterSR",
+    "repeated",         "ambiguous",        "afterApply",       "placement",
+    "listsUnproven",    "listsRoot",        "listsView",        "listsOverlap",
+    "listsSmall",       "listsStable",      "listsStale",       "listsChanged",
+    "evidence",         "vrrtOff",          "resolution",       "targetUnknown",
+    "statsUnverified",  "remapUnknown",     "targetRange",      "atCap",
+    "memory",           "reconfigure",      "governorCache",    "governor",
+    "patchMismatch",    "listsAfterArming", "unsupported",      "statsMismatch",
+    "overflow",         "pipeline",         "readback",         "exception"};
+// clang-format on
 static_assert(sizeof(keys) / sizeof(keys[0]) == unsigned(Why::Count), "one key per Why");
 inline constexpr const char *Text(Why w) {
     return unsigned(w) < unsigned(Why::Count) ? texts[unsigned(w)] : "unknown";
@@ -660,6 +667,7 @@ class Summary {
     };
     struct Window {
         unsigned in_recording{}, after_apply{}, before_prepass{}, patched{}, verified{};
+        unsigned same_frame{}; // applies that read the Budget their own recording's resolve wrote
         std::array<unsigned, unsigned(Why::Count)> refused{}; // per reason, including placement
         Ratio clears, same_b1, same_budget, scene_match, stats;
         unsigned applies{}, proven{};
@@ -750,7 +758,7 @@ class Summary {
                w.refused[unsigned(Why::Ambiguous)];
     }
     std::string ControllerLine(unsigned long long seconds, const Status &status) const {
-        Line<1024> c;
+        Line<ControllerBytes> c;
         c.Add("RR ray budget (%llus): test=%s state=", seconds, labels[Valid(status.mode)]);
         switch (State(status)) {
         case Phase::Off:
@@ -772,8 +780,9 @@ class Summary {
         c.Add(" outside=%u beforePrepass=%u afterSR=%u repeated=%u",
               w.refused[unsigned(Why::Outside)], w.before_prepass,
               w.refused[unsigned(Why::AfterSR)], w.refused[unsigned(Why::Repeated)]);
-        c.Add(" clears=%u/%u sameB1AsApply=%u/%u sameBudget=%u/%u", w.clears.yes, w.clears.all,
-              w.same_b1.yes, w.same_b1.all, w.same_budget.yes, w.same_budget.all);
+        c.Add(" clears=%u/%u sameB1AsApply=%u/%u sameBudget=%u/%u sameFrame=%u/%u", w.clears.yes,
+              w.clears.all, w.same_b1.yes, w.same_b1.all, w.same_budget.yes, w.same_budget.all,
+              w.same_frame, w.applies);
         if (w.have_native) {
             c.Add(" | target native=%.3f/%.3f (", D(w.native_last[0]), D(w.native_last[1]));
             for (unsigned l = 0; l < 2; ++l) {
@@ -841,7 +850,7 @@ class Summary {
         return c.Str();
     }
     std::string ListsLine(unsigned long long seconds, const Gate &gate) const {
-        Line<1024> c;
+        Line<ListsBytes> c;
         const auto area = last.Pixels(); // the extent: threads past it append nothing
         c.Add("RR ray lists (%llus): applies=%u proven=%u streak=%u", seconds, w.applies, w.proven,
               gate.Streak());
@@ -877,6 +886,9 @@ class Summary {
   public:
     static constexpr std::uint64_t Interval = rrdensity::Tracker::Interval;
     static constexpr unsigned IdleWarnings = 3;
+    // The line buffers, NUL included: the controller line holds every refusal key at small
+    // counts while the target and scene fields are n/a; with real values its tail can be cut.
+    static constexpr std::size_t ControllerBytes = 1152, ListsBytes = 1024;
     // A resolve inside the RR guide recording; `after_apply` when this recording's VRRT apply came
     // first, in which case `same_b1` says whether it read the same constant block.
     void Resolve(bool after_apply, bool same_b1) noexcept {
@@ -902,6 +914,11 @@ class Summary {
     }
     void Budget(bool same) noexcept {
         w.same_budget.Add(same);
+    }
+    // An apply in the recording (counted by Lists) that read the Budget this recording's own
+    // resolve wrote, after it: the placement the governor's same-frame bound needs (A2).
+    void SameFrame() noexcept {
+        ++w.same_frame;
     }
     void Clear(bool in_recording) noexcept {
         w.clears.Add(in_recording);
@@ -1014,7 +1031,7 @@ class Summary {
             const unsigned long long seconds = (now - since) / 1000;
             if (!seen && w.applies && warned < IdleWarnings) {
                 ++warned;
-                Line<1024> warning;
+                Line<ListsBytes> warning;
                 warning.Add("RR ray budget (%llus): cs_vrrt_resolve 0x%llx not seen while %u VRRT "
                             "applies were (game update?); the ray budget test is unavailable",
                             seconds, U(rrraybudget::Resolve), w.applies);
