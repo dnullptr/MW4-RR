@@ -27,6 +27,11 @@
 #else
 #define RR_ANIMATED_TEXTURE_MASK_KEY "AnimatedTextureMask"
 #endif
+#ifdef NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#define RR_FREE_MEM_ON_RELEASE_KEY NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#else
+#define RR_FREE_MEM_ON_RELEASE_KEY "FreeMemOnReleaseFeature"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -61,12 +66,22 @@ inline bool Valid(const Options &v) {
            v.exposure_scale > 0;
 }
 
+// The game creates SR with AutoExposure; RR supports neither exposure nor auto-exposure. Only the
+// creation parameters drop it: Options::flags keeps the game's value for SameCreation. Linear
+// depth (the weapon depth test, see CreateParameters) also drops DepthInverted.
+inline constexpr int CreateFlags(int game_flags, bool linear_depth = false) {
+    return game_flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) &
+           ~(linear_depth ? int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : 0);
+}
+static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) == 64 && CreateFlags(75) == 11);
+static_assert(CreateFlags(11) == 11 && CreateFlags(0x1ff) == 0x1bf && CreateFlags(64) == 0);
+static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) == 8 && CreateFlags(75, true) == 3);
+static_assert(CreateFlags(11, true) == 3 && CreateFlags(0x1ff, true) == 0x1b7 &&
+              CreateFlags(3, true) == 3);
+
 // linear_depth: RR reads view-space depth (the weapon depth test, src/rr_weapon_depth.h)
 // instead of the game's hardware depth. Nearer is then smaller, so the game's inverted-depth
 // flag is cleared for RR.
-inline int CreateFlags(int flags, bool linear_depth) {
-    return linear_depth ? flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : flags;
-}
 inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6,
                              bool linear_depth = false) {
     rrpreset::Set(p, preset);
@@ -78,6 +93,8 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_OutHeight, v.out_height);
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
     p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, CreateFlags(v.flags, linear_depth));
+    // A released feature frees its VRAM instead of staying cached in NGX (Streamline does too).
+    p.Set(RR_FREE_MEM_ON_RELEASE_KEY, 1);
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));

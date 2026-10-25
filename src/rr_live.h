@@ -18,6 +18,7 @@
 #include "rr_inputs.h"
 #include "rr_internal.h"
 #include "rr_ngx_api.h"
+#include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
 #include "rr_capture.h"
@@ -46,6 +47,7 @@ class Controller {
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
         bool guides_withheld{};
+        bool responsivity_used{}; // RR was given a responsivity mask (sky edge test, water or SSS)
         GpuFrame gpu;
         bool busy{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
@@ -159,6 +161,12 @@ class Controller {
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
+    // A creation attempt's runtime, logged by Poll after it releases the mutex: module and DXGI
+    // queries never run under it. The probe pins the NGX core module.
+    struct RuntimeReport {
+        HMODULE core{};
+        ComPtr<ID3D12Device> device;
+    } runtime_report;
     rreval::Api api;
     NVSDK_NGX_Parameter *parameters{};
     NVSDK_NGX_Handle *feature{};
@@ -319,6 +327,17 @@ class Controller {
         Log(why);
         CaptureFailed("RR failed");
     }
+    // A failed retirement call logs its NGX result; a missing export has none.
+    bool RetirementFailed(const char *what, bool exported, NVSDK_NGX_Result result) {
+        char line[160];
+        if (exported)
+            snprintf(line, sizeof(line), "%s (%s); allocations retained", what,
+                     rrngxlog::Code(result).text);
+        else
+            snprintf(line, sizeof(line), "%s (export missing); allocations retained", what);
+        Failure(line);
+        return false;
+    }
     void Initialize(ID3D12Device *d) {
         if (initialized) {
             Require(fg::SameNativeObject(pipelines.device.Get(), d),
@@ -362,7 +381,8 @@ class Controller {
                (weapon_hold == WeaponHold::None ||
                 weapon_hold_changes != rrweapondepth::changes.load(std::memory_order_relaxed));
     }
-    void HoldWeaponDepth(WeaponHold why, unsigned changes) {
+    // outcome (Refused): why NGX refused, an rrngxlog::Code text, "null handle" or "threw".
+    void HoldWeaponDepth(WeaponHold why, unsigned changes, const char *outcome = nullptr) {
         // Frames already in flight on the same RR repeat the same hold: log it once.
         if (weapon_hold == why && weapon_hold_changes == changes)
             return;
@@ -372,9 +392,14 @@ class Controller {
         if (why == WeaponHold::Projection)
             Log("Weapon depth test: the game's projection does not map to linear depth; test "
                 "off until its setting changes");
-        else if (why == WeaponHold::Refused)
-            Log("Weapon depth test: RR did not accept linear depth; test off until its setting "
-                "changes, RR runs with hardware depth");
+        else if (why == WeaponHold::Refused) {
+            char line[200];
+            snprintf(line, sizeof(line),
+                     "Weapon depth test: RR did not accept linear depth%s%s%s; test off until its "
+                     "setting changes, RR runs with hardware depth",
+                     outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
+            Log(line);
+        }
     }
     void QueueReconfigure() {
         layout_pending = true;
@@ -407,18 +432,18 @@ class Controller {
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
         if (feature) {
-            if (!api.release || NVSDK_NGX_FAILED(api.release(feature))) {
-                Failure("RR feature retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.release != nullptr;
+            const auto r = exported ? api.release(feature) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR feature retirement failed", exported, r);
             feature = nullptr;
             preset.Retired();
         }
         if (parameters) {
-            if (!api.destroy || NVSDK_NGX_FAILED(api.destroy(parameters))) {
-                Failure("RR parameter retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.destroy != nullptr;
+            const auto r = exported ? api.destroy(parameters) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR parameter retirement failed", exported, r);
             parameters = nullptr;
         }
         for (auto &s : slots) {
@@ -499,7 +524,13 @@ class Controller {
             if (s.recorded && s.sealed && !s.reported && Complete(s, done)) {
                 auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
                 s.reported = true;
-                health.Frame(v);
+                // After reported, as the readers below: a failed map is then reported once.
+                const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
+                const bool sss = s.sss_used && !s.guides_withheld && s.sss.admission.accepted;
+                const bool glass =
+                    s.transparency_used && !s.guides_withheld && s.transparency_accepted;
+                health.Frame(v,
+                             {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
                 if (s.gate_recorded && s.hit_conditioned)
@@ -509,11 +540,7 @@ class Controller {
                                     UINT64((std::min)(s.options.width, s.gpu.w)) *
                                         (std::min)(s.options.height, s.gpu.h));
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
-                                 s.sss_used && !s.guides_withheld && s.sss.admission.accepted,
-                                 s.transparency_used && !s.guides_withheld &&
-                                     s.transparency_accepted,
-                                 s.replaced_sr,
-                                 s.hit_used);
+                                 sss, glass, s.replaced_sr, s.hit_used);
                 if (s.captured.buffer) {
                     auto &m = s.captured.meta;
                     m.stats = v;
@@ -1567,12 +1594,22 @@ class Controller {
     }
 
     void Poll() {
-        std::lock_guard lock(mutex);
-        try {
-            PollLocked();
-        } catch (const std::exception &e) {
-            Failure(e.what());
+        RuntimeReport report;
+        {
+            std::lock_guard lock(mutex);
+            try {
+                PollLocked();
+            } catch (const std::exception &e) {
+                Failure(e.what());
+            }
+            report = std::exchange(runtime_report, {});
         }
+        if (report.core)
+            try {
+                Log(rrngxlog::RuntimeLine(report.core, report.device.Get()).c_str());
+            } catch (...) {
+                // A line that cannot be built is dropped: nothing may escape into ReShade.
+            }
     }
     // All native identity/binding/view/constant/context proofs are required at
     // the call site. Prepare completes before dispatch; once native dispatch is
@@ -2076,12 +2113,16 @@ class Controller {
                 runtime = mod;
                 runtime_epoch = epoch;
                 public_device = pub;
+                // Logged by the next Poll whether or not this attempt creates RR.
+                runtime_report = {mod, pub};
                 selected_view = scope.viewport;
                 key = o;
                 api = resolve(mod);
                 Require(api.Valid(), "live NGX exports missing");
-                Require(NVSDK_NGX_SUCCEED(api.allocate(&parameters)) && parameters,
-                        "live NGX parameter allocation failed");
+                const auto allocated = api.allocate(&parameters);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
+                                  "live NGX parameter allocation failed",
+                                  rrngxlog::Returned(allocated, parameters));
                 rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
@@ -2089,24 +2130,32 @@ class Controller {
                                           parameters, &feature);
                 if (weapon_on && (NVSDK_NGX_FAILED(created) || !feature)) {
                     // RR refused linear depth: hold the test and create RR as before.
-                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes,
+                                    rrngxlog::Returned(created, feature).text);
                     weapon_on = weapon_test.active = false;
                     feature = nullptr;
                     rreval::CreateParameters(*parameters, o, preset.desired);
                     created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
                                          parameters, &feature);
                 }
-                Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
+                char line[200];
+                rrngxlog::CapabilityLine(api, line, sizeof(line));
+                Log(line);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
+                                  "live RR feature creation failed",
+                                  rrngxlog::Returned(created, feature));
                 preset.Created();
                 weapon_linear = weapon_on;
+                rrngxlog::DescribeCreation(o, preset.desired, weapon_on, line, sizeof(line));
+                Log(line);
                 if (weapon_on) {
                     int sent = -1;
                     parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
-                    char line[160];
+                    // Read back from the parameters; decimal, as the "RR created" line above.
                     snprintf(line, sizeof(line),
                              "Weapon depth test: RR created with linear depth (game create flags "
-                             "0x%x, sent 0x%x)",
-                             unsigned(o.flags), unsigned(sent));
+                             "%d, sent %d)",
+                             o.flags, sent);
                     Log(line);
                 }
             }
@@ -2201,6 +2250,7 @@ class Controller {
                                         water_discard ? s->gpu.water.disocclusion.Get()
                                                       : nullptr,
                                         water_animated ? s->gpu.water.mask.Get() : nullptr};
+            s->responsivity_used = resources.responsivity != nullptr;
             // The test copies are read at their own origin.
             auto evaluated = o;
             if (color_on)
@@ -2276,9 +2326,11 @@ class Controller {
             }
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
+            bool threw = false; // then evaluated_result is the sentinel above, not NGX's
             try {
                 evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
             } catch (...) {
+                threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
             }
             s->inference_ok = NVSDK_NGX_SUCCEED(evaluated_result);
@@ -2311,13 +2363,19 @@ class Controller {
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
             if (!s->inference_ok) {
+                const rrngxlog::Code code(evaluated_result);
+                const char *outcome = threw ? "threw" : code.text;
                 // A linear-depth RR that fails: restart it with hardware depth rather than
                 // turning RR off.
                 if (weapon_on) {
-                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes, outcome);
                     QueueReconfigure();
-                } else
-                    Failure("RR inference failed; native SR retained");
+                } else {
+                    char line[128];
+                    snprintf(line, sizeof(line), "RR inference failed (%s); native SR retained",
+                             outcome);
+                    Failure(line);
+                }
             }
             return s->inference_ok;
         } catch (const std::exception &e) {

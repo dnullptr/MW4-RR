@@ -15,6 +15,7 @@
 #include "rr_sss_pipeline.h"
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
+#include "rr_game_config.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -208,6 +209,11 @@ static void AfterNgxShutdown(HMODULE m, ID3D12Device *d, bool ok) {
 }
 static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
                         const NVSDK_NGX_Parameter *p, NVSDK_NGX_Result r) {
+    // Frame generation is counted for the health line only, lock-free: never the controller.
+    if (k == rrtrace::Kind::FG) {
+        rrhealth::presentation.fg_evaluations.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (k != rrtrace::Kind::SR)
         return;
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
@@ -932,22 +938,47 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     return false;
 }
-static bool VrsConfigAllowsRR() {
+// The campaign settings file: read-only flag and text, for the RR gate and the config report.
+static rrgameconfig::File ReadGameConfig() {
+    rrgameconfig::File file;
     wchar_t local[32768]{};
     auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
     if (!size || size >= 32768)
-        return false;
+        return file;
     const auto path =
         std::filesystem::path(local) / L"Activision/Call of Duty/players/s.1.0.cod26.txt";
     const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_READONLY))
-        return false;
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return file;
+    file.readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    file.state = rrgameconfig::FileState::Unreadable;
     std::ifstream input(path);
     if (!input)
-        return false;
+        return file;
     std::ostringstream text;
     text << input.rdbuf();
-    return rrvrsconfig::Allowed(text.str(), true, true);
+    file.text = text.str();
+    file.state = rrgameconfig::FileState::Read;
+    return file;
+}
+static bool VrsGateAllows(const rrgameconfig::File &file) {
+    return file.state == rrgameconfig::FileState::Read &&
+           rrvrsconfig::Allowed(file.text, file.readonly, true);
+}
+static bool VrsConfigAllowsRR() { return VrsGateAllows(ReadGameConfig()); }
+// Once per session, from LoadSettings, with the file the RR gate read and its answer. Logs and
+// counts only: RR is never blocked by it.
+static unsigned ReportGameConfig(const rrgameconfig::File &file, bool gate_allows) {
+    try {
+        std::vector<std::string> lines;
+        const auto warnings = rrgameconfig::Report(file, gate_allows, lines);
+        for (const auto &line : lines)
+            WriteLog(line.c_str());
+        return warnings;
+    } catch (...) {
+        WriteLog("Game config check failed; RR is not affected");
+        return 0;
+    }
 }
 #include "rr_settings.inl"
 static bool RegisterRuntimeCallbacks(HMODULE module) {
@@ -980,7 +1011,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::draw>(&AuditDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
-    reshade::register_event<reshade::addon_event::reshade_present>(&OnRuntime);
+    reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
     return true;
 }
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

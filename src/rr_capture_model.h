@@ -159,7 +159,8 @@ struct Lighting {
 };
 struct Header {
     std::string created;
-    // create_flags: the flags RR was created with (the weapon depth test clears DepthInverted).
+    // create_flags: the flags RR was created with (rreval::CreateFlags drops the game's
+    // AutoExposure, and DepthInverted for the weapon depth test).
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{}, create_flags{};
     unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.

@@ -33,6 +33,7 @@
 #include "rr_hit_condition.h"
 #include "rr_ray_density.h"
 #include "rr_water.h"
+#include "rr_gate_stats.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -455,6 +456,11 @@ struct GpuFrame {
         Check(header->Map(0, &empty, &m), "live association upload map failed");
         header_map = (UINT *)m;
         memset(m, 0, 256);
+        // stats bytes (rr_live_gate.hlsl): 0 bad, 4 copied, 8 isolated, 12 sanitized SSS
+        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20..63 hit
+        // distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..227 ray density
+        // (ReadRates); 228 non-finite color, 232 non-finite displayed output (rr_gate_stats.h,
+        // ReadFinite).
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
@@ -695,7 +701,9 @@ struct GpuFrame {
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Change(cl, guides[3].Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // Zero the rate statistics from the header's never-written tail.
+        // Zero the rate statistics from the header's never-written tail. This also clears the
+        // gate's non-finite counts (rr_gate_stats.h): fine, as it runs on the pre list, before
+        // the gate's BeginFrame on the SR list.
         constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 256 - rrdensity::Offset;
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(stats.Get(), rates, header.Get(), rates, rate_bytes);
@@ -987,6 +995,23 @@ struct GpuFrame {
         D3D12_RANGE r{0, 16};
         Check(readback->Map(0, &r, &m), "live stats map failed");
         memcpy(v.data(), m, 16);
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
+    // Pixels with a non-finite channel: in the color RR receives, in the RR output the gate
+    // displays (none if rejected or blocked). Their stats bytes follow the hit distance
+    // statistics and the ray density.
+    static constexpr UINT FiniteOffset = RR_STATS_NON_FINITE_COLOR;
+    static_assert(rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
+                  rrdensity::Offset + 4 * rrdensity::Count <= FiniteOffset &&
+                  RR_STATS_NON_FINITE_OUTPUT == FiniteOffset + 4 && FiniteOffset + 8 <= 256);
+    std::array<UINT, 2> ReadFinite() {
+        std::array<UINT, 2> v{};
+        void *m{};
+        D3D12_RANGE r{FiniteOffset, FiniteOffset + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live finite statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + FiniteOffset, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;

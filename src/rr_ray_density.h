@@ -9,14 +9,30 @@ namespace rrdensity {
 // then lobe 1 and lobe 2 budget threshold/boundary, then enabled/promote/clamp.
 inline constexpr unsigned Buckets = 17, Offset = 64, Count = 2 * Buckets + 7;
 using Frame = std::array<std::uint32_t, Count>;
-// CPU-only summary of how many rays the game's VRRT schedules, logged
-// periodically to show how sparse the lighting RR receives is.
+// CPU-only summary of how many rays the game's VRRT schedules, logged periodically to show how
+// sparse the lighting RR receives is. Bucket 0 (not requested) is left out of Density, which is
+// per requested pixel, but counts in ScreenDensity and in every Share, which are of all pixels.
 class Tracker {
     std::array<std::uint64_t, 2 * Buckets> pixels{};
     std::array<std::uint32_t, 7> last{};
     unsigned frames{};
     std::uint64_t since{};
     bool started{};
+    // Expected rays per frame for one lobe: a pixel at inverse rate i gets a ray with
+    // probability 1/i, a not-requested pixel (bucket 0) none.
+    double Rays(unsigned lobe) const {
+        double rays = 0;
+        for (unsigned i = 1; i < Buckets; ++i)
+            rays += double(pixels[lobe * Buckets + i]) / i;
+        return rays;
+    }
+    // One lobe's pixels from bucket first on (0: all pixels, 1: the requested ones).
+    double Pixels(unsigned lobe, unsigned first) const {
+        double n = 0;
+        for (unsigned i = first; i < Buckets; ++i)
+            n += double(pixels[lobe * Buckets + i]);
+        return n;
+    }
 
   public:
     static constexpr std::uint64_t Interval = 10000;
@@ -29,13 +45,14 @@ class Tracker {
     }
     // Expected rays per requested pixel per frame for one lobe, 0..1.
     double Density(unsigned lobe) const {
-        double rays = 0, requested = 0;
-        for (unsigned i = 1; i < Buckets; ++i) {
-            const double n = double(pixels[lobe * Buckets + i]);
-            rays += n / i;
-            requested += n;
-        }
-        return requested ? rays / requested : 0;
+        const double requested = Pixels(lobe, 1);
+        return requested ? Rays(lobe) / requested : 0;
+    }
+    // Expected rays per screen pixel per frame for one lobe, 0..1. 1 - this is the no-fresh-ray
+    // share.
+    double ScreenDensity(unsigned lobe) const {
+        const double all = Pixels(lobe, 0);
+        return all ? Rays(lobe) / all : 0;
     }
     double Share(unsigned lobe, unsigned first, unsigned end) const {
         std::uint64_t part = 0, total = 0;
@@ -57,17 +74,20 @@ class Tracker {
             return false;
         const bool active = frames != 0;
         if (active) {
-            char text[512];
+            char text[1024];
             int at = std::snprintf(text, sizeof(text), "RR ray density (%llus): frames=%u",
                                    static_cast<unsigned long long>((now - since) / 1000), frames);
-            for (unsigned lobe = 0; lobe < 2 && at > 0 && at < int(sizeof(text)); ++lobe)
+            for (unsigned lobe = 0; lobe < 2 && at > 0 && at < int(sizeof(text)); ++lobe) {
+                const double screen = ScreenDensity(lobe);
                 at += std::snprintf(
                     text + at, sizeof(text) - at,
-                    " | lobe%u raysPerPixel=%.3f full=%.1f%% 1/2-1/4=%.1f%% 1/5-1/8=%.1f%% "
-                    "1/9-1/15=%.1f%% 1/16+=%.1f%% none=%.1f%% threshold=%d boundary=%d",
-                    lobe + 1, Density(lobe), Share(lobe, 1, 2), Share(lobe, 2, 5),
-                    Share(lobe, 5, 9), Share(lobe, 9, 16), Share(lobe, 16, 17), Share(lobe, 0, 1),
-                    int(last[lobe * 2]), int(last[lobe * 2 + 1]));
+                    " | lobe%u raysPerRequestedPixel=%.3f raysPerScreenPixel=%.3f "
+                    "noFreshRay=%.1f%% allPixels[full=%.1f%% 1/2-1/4=%.1f%% 1/5-1/8=%.1f%% "
+                    "1/9-1/15=%.1f%% 1/16+=%.1f%% notRequested=%.1f%%] threshold=%d boundary=%d",
+                    lobe + 1, Density(lobe), screen, 100.0 * (1 - screen), Share(lobe, 1, 2),
+                    Share(lobe, 2, 5), Share(lobe, 5, 9), Share(lobe, 9, 16), Share(lobe, 16, 17),
+                    Share(lobe, 0, 1), int(last[lobe * 2]), int(last[lobe * 2 + 1]));
+            }
             if (at > 0 && at < int(sizeof(text)))
                 std::snprintf(text + at, sizeof(text) - at, " | enabled=%d promote=%d clamp=%d",
                               int(last[4]), int(last[5]), int(last[6]));

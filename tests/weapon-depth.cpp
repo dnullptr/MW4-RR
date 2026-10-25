@@ -160,9 +160,13 @@ static void Creation() {
            flags == (NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
     assert(NVSDK_NGX_SUCCEED(linear.Get(NVSDK_NGX_Parameter_Use_HW_Depth, &depth)) &&
            depth == NVSDK_NGX_DLSS_Depth_Type_Linear);
-    // CreateFlags is what RR is created with, and what a capture's manifest reports.
-    assert(rreval::CreateFlags(v.flags, false) == v.flags);
-    assert(rreval::CreateFlags(v.flags, true) == flags);
+    // CreateFlags is what RR is created with, and what a capture's manifest reports: v.flags is
+    // IsHDR | MVLowRes | DepthInverted (11), so 11, and 3 for linear depth. The game's
+    // AutoExposure (64) is never sent.
+    assert(rreval::CreateFlags(v.flags, false) == 11);
+    assert(rreval::CreateFlags(v.flags, true) == flags && flags == 3);
+    assert(rreval::CreateFlags(v.flags | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure, false) == 11);
+    assert(rreval::CreateFlags(v.flags | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure, true) == 3);
     assert(rreval::CreateFlags(NVSDK_NGX_DLSS_Feature_Flags_IsHDR, true) ==
            NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
     // Nothing else changes.
