@@ -14,8 +14,11 @@ CLI:  python tools/water_probe.py CAPTURE_DIR [--region X0 Y0 X1 Y1] [--control 
 Coordinates are render pixels, half-open [X0,X1) x [Y0,Y1). Output goes to --out (default
 CAPTURE_DIR/water-probe): panels_frame0.png, report.json, report.txt. Without --region only the
 pictures and a whole-frame summary are written. Without --control the same-size window that does not
-touch the region (CONTROL_MARGIN) with the most status==1 pixels, then the fewest transparency-delta
-pixels, is used; the report says which. If Pillow is missing the tiles are saved as tile_<name>.npy.
+touch the region (CONTROL_MARGIN) with the most pixels that pass the temporal tests, then the fewest
+transparency-delta pixels, then the mean view depth closest to the region's, then the nearest, is used
+(without colour_before_transparency nothing tells water from bank: check the box or give --control);
+the report says which. report.txt starts with a SUMMARY of the hints and the jitter decision. If Pillow
+is missing the tiles are saved as tile_<name>.npy.
 
 Assumptions (the report repeats the ones that were decided from data):
 - Static statistics are from frame 0 over status==1 pixels (the histogram and depth range cover the
@@ -48,11 +51,27 @@ Assumptions (the report repeats the ones that were decided from data):
   static surface look like it changes. Per pair the round trip |warp(warp(frame i, +f), -f) -
   frame i| / 2, f = frac(mv + jitter offset), measures that on frame i itself (guides, colour and
   delta; reported as *_resampling_floor, taken over the same pixels as the residual, whose taps are
-  depth-tested like the residual's); the animation hints also need the region residual above
-  HINT_FLOOR_RATIO x this floor. The round trip underestimates the error of one warp by up to about
-  2.2x near Nyquist, so patterns under about 2.5 px wavelength and aliased normals can still read
-  as animation. The residual can also not tell flow or waves from the per-frame blue-noise dither
-  the game applies to water normals; hence the wording of those hints.
+  depth-tested like the residual's). The round trip underestimates the error of one warp by up to
+  about 2.2x near Nyquist, so patterns under about 2.5 px wavelength and aliased normals can still
+  read as animation. The residual can also not tell flow or waves from the per-frame blue-noise
+  dither the game applies to water normals; hence the wording of those hints.
+- Hints (HEURISTIC): True needs clear evidence, False clear evidence of none, None means the data
+  cannot decide. The two animation hints compare the region's excess over its own resampling floor,
+  r = residual / floor, with the control's, c, as factor = r / max(c, 1): a sharp static control
+  sits at c ~ 1 and is a fair reference for smooth moving water, which the raw residual ratio is
+  not. True: factor > HINT_RESIDUAL_RATIO and r > HINT_FLOOR_RATIO (and the residual above
+  MIN_RESIDUAL; colour also MIN_RELATIVE_COLOUR of the luminance). False: r < HINT_UNDECIDED_RATIO,
+  or the residual below that resolution. In between the hint is None: slow flow, per-frame dither
+  and fine static detail land there, so does a control that is itself HINT_NOISE_RATIO x its floor
+  (noise-limited colour) and a transparency-delta check whose control has no transparency layer
+  (its delta residual is ~0 whatever the region's noise: no noise reference). Raw and normalised
+  numbers are in report.json (hints[].numbers) and the hint details.
+- Frame-gap ratio (static camera only: mean |mv| < GAP_STATIC_MV in the window): per window and kind
+  (guides, colour, delta) the mean residual of warping frame i-2 into frame i (sum of the two motion
+  fields and the two jitter offsets) divided by that of i-1 into i, over the same pixels. Flow
+  doubles the shift, so the ratio grows towards 2; noise and per-frame dither do not (about 1).
+  Above HINT_GAP_GUIDES (colour: HINT_GAP_COLOUR, noise dilutes it) and HINT_GAP_MARGIN over the
+  control's, an undecided animation hint becomes True (never False); the gap_growth hint states it.
 - normal_roughness: rgb = signed world-space normal, a = linear roughness. Colour is pre-exposed HDR
   (scene * pre_exposure): colour residuals use colour / pre_exposure so that exposure changes do not
   count as animation. R11G11B10 (6-bit mantissa) alone leaves about 0.1 % of the luminance as residual
@@ -95,9 +114,20 @@ HINT_RESIDUAL_RATIO = 3.0       # animates beyond the motion vectors: region res
 MIN_RESIDUAL = 1e-3             # ... and above this absolute floor (so 0 vs 1e-9 noise does not count)
 MIN_RELATIVE_COLOUR = 0.01      # colour hint: ... and above this fraction of the region's mean luminance
 HINT_FLOOR_RATIO = 3.0          # ... and above this x the region's own resampling floor (see temporal_stats)
+HINT_UNDECIDED_RATIO = 1.6      # a residual below this x its resampling floor is "not indicated"; above it
+                                # but not clearly above the control (or the floor ratio) the hint is None
+HINT_NOISE_RATIO = 4.0          # a control residual this many x its own floor is noise or change
+FLOOR_EPS = 1e-4                # floors below this count as this when forming residual / floor
+HINT_GAP_GUIDES = 1.5           # frame-gap ratio of the guides above this: change grows with the gap (flow)
+HINT_GAP_COLOUR = 1.12          # ... of the colour / delta (the box-filtered noise dilutes the growth)
+HINT_GAP_MARGIN = 0.15          # ... and above the control's ratio by this much
+HINT_GAP_FLAT = 1.2             # guides ratio below this: no growth (noise or dither: 1.00-1.03 with Halton
+                                # jitter, up to 1.15 when the jitter alternates 0 / 0.5 px)
+GAP_STATIC_MV = 0.05            # frame-gap ratios only where the mean |mv| in the window is below this (px)
 DISOCCLUSION_TOLERANCE = 0.05   # a bilinear tap's source depth may differ from the pixel's by this fraction
 BOX_SIZE = 5                    # box filter that suppresses lighting noise before comparing colour
 CONTROL_MARGIN = 4              # automatic control keeps this many pixels away from the region
+CONTROL_DEPTH_BIN = 0.05        # ... and prefers the depth closest to the region's, in steps of this fraction
 COLOUR_GUARD = BOX_SIZE // 2 + 1    # colour/delta residuals this near an unusable pixel are left out
 MV_TINY_PIXELS = 0.05           # mean |mv_px| below this while the camera moved: try other scalings
 ALT_IMPROVEMENT = 0.8           # an alternative (MV scaling, jitter sign) must drop the residual below this x
@@ -682,10 +712,25 @@ def clip_window(window, width, height, name, notes):
     return clipped
 
 
-def pick_control(region, ordinary, delta):
-    """Same-size window clear of the region (CONTROL_MARGIN) with the most status==1 pixels, then the
-    fewest pixels whose transparency delta exceeds DELTA_THRESHOLD, counted in the window grown by
-    CONTROL_MARGIN (the box filter and bilinear taps reach that far); first in raster order on ties."""
+def usable_pixels(frames, metas, derived):
+    """Pixels of the first usable pair that pass the temporal tests (status, depth agreement, edge
+    guard) with the motion vectors alone, or None for a single frame."""
+    pair = first_usable_pair(metas)
+    if pair is None:
+        return None
+    maps = pair_maps(frames[pair - 1], frames[pair], make_taps(derived[pair]['mv']), derived[pair - 1],
+                     derived[pair])[0]
+    return np.isfinite(maps['colour']) & np.isfinite(maps['normal_roughness'])
+
+
+def pick_control(region, ordinary, delta, usable=None, depth=None):
+    """Same-size window clear of the region (CONTROL_MARGIN) with the most pixels that pass the
+    temporal tests (`usable`, else status==1), then the fewest pixels whose transparency delta exceeds
+    DELTA_THRESHOLD, counted in the window grown by CONTROL_MARGIN (the box filter and bilinear taps
+    reach that far), then the mean depth closest to the region's (in CONTROL_DEPTH_BIN steps of relative
+    difference; a bank beside a river is at the river's depth, a window up the river is not), then the
+    nearest to the region; first in raster order on ties. Without a transparency delta nothing tells
+    water from bank, so the control can land in the water: give --control then."""
     height, width = ordinary.shape
     x0, y0, x1, y1 = region
     w, h = x1 - x0, y1 - y0
@@ -694,24 +739,37 @@ def pick_control(region, ordinary, delta):
     ys, xs = np.indices((height - h + 1, width - w + 1))
 
     def window_sums(mask, grow=0):
-        total = np.zeros((height + 1, width + 1), np.int64)
-        total[1:, 1:] = mask.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
+        total = np.zeros((height + 1, width + 1), np.int64 if mask.dtype != np.float64 else np.float64)
+        total[1:, 1:] = mask.astype(total.dtype).cumsum(axis=0).cumsum(axis=1)
         top, bottom = np.clip(ys - grow, 0, height), np.clip(ys + h + grow, 0, height)
         left, right = np.clip(xs - grow, 0, width), np.clip(xs + w + grow, 0, width)
         return total[bottom, right] - total[top, right] - total[bottom, left] + total[top, left]
 
     count = window_sums(ordinary)
+    passing = window_sums(usable & ordinary) if usable is not None else count
     changed = window_sums(delta > DELTA_THRESHOLD, CONTROL_MARGIN) if delta is not None \
         else np.zeros_like(count)
     clear = (xs + w <= x0 - CONTROL_MARGIN) | (xs >= x1 + CONTROL_MARGIN) | \
         (ys + h <= y0 - CONTROL_MARGIN) | (ys >= y1 + CONTROL_MARGIN)
     if not clear.any():
         return None
+    distance = (xs + w / 2 - (x0 + x1) / 2) ** 2 + (ys + h / 2 - (y0 + y1) / 2) ** 2
+    gap = np.zeros(count.shape, np.int64)
+    if depth is not None:
+        known = ordinary & np.isfinite(depth)
+        mean_depth = window_sums(np.where(known, depth, 0.0).astype(np.float64)) / np.maximum(
+            window_sums(known), 1)
+        inside = (slice(y0, y1), slice(x0, x1))
+        if known[inside].any():
+            reference = float(depth[inside][known[inside]].mean())
+            gap = np.floor(np.abs(mean_depth - reference) / (CONTROL_DEPTH_BIN * max(abs(reference), 1e-9))
+                           ).astype(np.int64)
     candidates = np.flatnonzero(clear)
-    best = candidates[np.lexsort((changed.ravel()[candidates], -count.ravel()[candidates]))[0]]
+    best = candidates[np.lexsort((distance.ravel()[candidates], gap.ravel()[candidates],
+                                  changed.ravel()[candidates], -passing.ravel()[candidates]))[0]]
     y, x = divmod(int(best), count.shape[1])
     return {'window': (x, y, x + w, y + h), 'ordinary_pixels': int(count[y, x]),
-            'changed_pixels': int(changed[y, x])}
+            'usable_pixels': int(passing[y, x]), 'changed_pixels': int(changed[y, x])}
 
 
 def normal_stats(rows):
@@ -786,12 +844,35 @@ def window_stats(frame, item, delta, matrix, layout, window):
     return stats
 
 
+def window_motion(item, window):
+    """Mean |mv| (render pixels) over the status==1 pixels of the window, or None."""
+    x0, y0, x1, y1 = window
+    magnitude = np.linalg.norm(item['mv'][y0:y1, x0:x1].astype(np.float64), axis=-1)
+    values = magnitude[item['ordinary'][y0:y1, x0:x1] & np.isfinite(magnitude)]
+    return float(values.mean()) if values.size else None
+
+
+def gap_kind_maps(maps):
+    """The residual maps per kind for the frame-gap ratio."""
+    kinds = {'guides': combined_residual(maps, GUIDE_KEYS), 'colour': maps['colour']}
+    if 'transparency_delta' in maps:
+        kinds['delta'] = maps['transparency_delta']
+    return kinds
+
+
 def temporal_stats(frames, metas, derived, windows, jitter_signs):
     """Per window: residuals after warping frame i-1 into frame i with i's motion vectors (plus the
     jitter compensation), averaged over the pairs, and the resampling-only floor of the same
-    warps (what bilinear resampling at the same fractional shifts does to frame i itself). Also
-    returns the maps and index of the first usable pair, for the pictures."""
+    warps (what bilinear resampling at the same fractional shifts does to frame i itself). Also the
+    frame-gap ratio per kind (guides, colour, delta): the mean residual of warping frame i-2 into frame
+    i divided by the mean residual of i-1 into i over the same pixels. Change that is noise or per-frame
+    dither is the same at both gaps (ratio ~1); flow grows with the gap (ratio towards 2). It uses the
+    sum of the two frames' motion vectors plus the two jitter offsets, so it is only measured where the
+    camera is static (mean |mv| < GAP_STATIC_MV in the window, both frames); elsewhere the composition
+    would add its own error. Returns the maps and index of the first usable pair, for the pictures."""
     per_pair = {name: {} for name in windows}
+    gaps = {name: {} for name in windows}
+    gap_reasons = {name: set() for name in windows}
     skipped, used, first = [], 0, None
     for i in range(1, len(frames)):
         if metas[i].get('reset'):
@@ -802,6 +883,36 @@ def temporal_stats(frames, metas, derived, windows, jitter_signs):
                                 derived[i - 1], derived[i], floor=True)
         used += 1
         first = first or (maps, i)
+        gap_windows = {}
+        if i < 2 or metas[i - 1].get('reset'):
+            for name in windows:
+                gap_reasons[name].add('needs 3+ frames in a row without a reset')
+        else:
+            for name, window in windows.items():
+                still = [window_motion(derived[j], window) for j in (i, i - 1)]
+                if None in still:
+                    gap_reasons[name].add('no status==1 pixels')
+                elif max(still) >= GAP_STATIC_MV:
+                    gap_reasons[name].add(f'camera or content moves in the window (mean |mv| >= '
+                                          f'{GAP_STATIC_MV} px): the two-frame composition is not trusted')
+                else:
+                    gap_windows[name] = window
+        if gap_windows:
+            first_leg, second_leg = (pair_offset(derived[j], jitter_signs) for j in (i, i - 1))
+            maps2, _ = pair_maps(frames[i - 2], frames[i],
+                                 make_taps(derived[i]['mv'] + derived[i - 1]['mv'],
+                                           (first_leg[0] + second_leg[0], first_leg[1] + second_leg[1])),
+                                 derived[i - 2], derived[i])
+            kinds1, kinds2 = gap_kind_maps(maps), gap_kind_maps(maps2)
+            for name, (x0, y0, x1, y1) in gap_windows.items():
+                for kind, one in kinds1.items():
+                    a, b = one[y0:y1, x0:x1], kinds2[kind][y0:y1, x0:x1]
+                    common = np.isfinite(a) & np.isfinite(b)
+                    if common.sum() >= MIN_HINT_PIXELS:
+                        gaps[name].setdefault(kind, []).append((float(a[common].mean()),
+                                                                float(b[common].mean())))
+                    else:
+                        gap_reasons[name].add(f'fewer than {MIN_HINT_PIXELS} common pixels')
         for name, (x0, y0, x1, y1) in windows.items():
             per_pair[name].setdefault('valid_pixels', []).append(float(valid[y0:y1, x0:x1].sum()))
             per_pair[name].setdefault('colour_valid_pixels', []).append(
@@ -819,6 +930,10 @@ def temporal_stats(frames, metas, derived, windows, jitter_signs):
     result = {}
     for name in windows:
         means = {key: mean(values) for key, values in per_pair[name].items()}
+        gap = {f'gap_ratio_{kind}': (sum(b for _, b in pairs) / sum(a for a, _ in pairs)
+                                     if sum(a for a, _ in pairs) > 0 else None)
+               for kind, pairs in gaps[name].items()}
+        gap_pairs = max((len(pairs) for pairs in gaps[name].values()), default=0)
         guides = [means[k] for k in ('normal_roughness', 'diffuse_albedo') if means.get(k) is not None]
         guide_floors = [means[f'{k}_floor'] for k in ('normal_roughness', 'diffuse_albedo')
                         if means.get(f'{k}_floor') is not None]
@@ -832,7 +947,12 @@ def temporal_stats(frames, metas, derived, windows, jitter_signs):
                         'transparency_delta_residual': means.get('transparency_delta'),
                         'guide_resampling_floor': mean(guide_floors),
                         'colour_resampling_floor': means.get('colour_floor'),
-                        'transparency_delta_resampling_floor': means.get('transparency_delta_floor')}
+                        'transparency_delta_resampling_floor': means.get('transparency_delta_floor'),
+                        'gap_ratio_guides': gap.get('gap_ratio_guides'),
+                        'gap_ratio_colour': gap.get('gap_ratio_colour'),
+                        'gap_ratio_delta': gap.get('gap_ratio_delta'), 'gap_pairs': gap_pairs,
+                        'gap_status': 'ok' if gap_pairs else '; '.join(sorted(gap_reasons[name])) or
+                        'needs 3+ frames'}
     return result, first
 
 
@@ -846,11 +966,115 @@ def dig(data, *keys):
     return data
 
 
-def animates(region_value, control_value, floor=None):
-    """Region residual above HINT_RESIDUAL_RATIO x control, MIN_RESIDUAL and HINT_FLOOR_RATIO x the
-    region's resampling floor (when known)."""
-    return region_value > HINT_RESIDUAL_RATIO * control_value and region_value > MIN_RESIDUAL and \
-        (floor is None or region_value > HINT_FLOOR_RATIO * floor)
+def excess(value, floor):
+    """residual / resampling floor, the floor counted as at least FLOOR_EPS (None stays None)."""
+    return None if value is None else value / max(floor or 0.0, FLOOR_EPS)
+
+
+def judge_change(region_value, region_floor, control_value, control_floor, relative=None, reference=True):
+    """Verdict on one residual kind (guides, colour or delta): (fires, code, numbers).
+
+    Everything is compared as excess over the window's own resampling floor, so a sharp static control
+    (residual = its floor) is a fair reference for smooth moving water (residual many x its floor):
+        r = region residual / region floor, c = control residual / control floor,
+        factor = r / max(c, 1)   (the region's excess in units of the control's).
+    True needs factor > HINT_RESIDUAL_RATIO and r > HINT_FLOOR_RATIO (and the two resolution gates
+    below). False needs clear evidence that nothing is there: the residual below MIN_RESIDUAL (or below
+    MIN_RELATIVE_COLOUR of the luminance), or r < HINT_UNDECIDED_RATIO (resampling alone explains it).
+    Everything else is None: 'band' (above the floor but not clearly above the control: slow flow,
+    per-frame dither, fine static detail), 'control_changes' (the control is itself HINT_NOISE_RATIO x its
+    floor: noise or change, so no reference), and 'no_reference' (reference=False: e.g. a transparency
+    layer the control does not have). The round-trip floor underestimates the error of one warp by up to
+    about 2.2x near Nyquist, so a bigger gap than that is needed before a comparison can say False."""
+    numbers = {'region': region_value, 'region_floor': region_floor, 'region_over_floor': None,
+               'control': control_value, 'control_floor': control_floor, 'control_over_floor': None,
+               'factor': None, 'code': None}
+
+    def done(fires, code):
+        numbers['code'] = code
+        return fires, code, numbers
+
+    if region_value is None:
+        return done(None, 'missing')
+    numbers['region_over_floor'] = r = excess(region_value, region_floor)
+    c = factor = None
+    if control_value is not None:
+        numbers['control_over_floor'] = c = excess(control_value, control_floor)
+        numbers['factor'] = factor = r / max(c, 1.0)
+    if region_value <= MIN_RESIDUAL or (relative is not None and relative <= MIN_RELATIVE_COLOUR):
+        return done(False, 'below_resolution')
+    if r < HINT_UNDECIDED_RATIO:
+        return done(False, 'at_floor')
+    if not reference:
+        return done(None, 'no_reference')
+    if control_value is None:
+        return done(None, 'missing')
+    if factor > HINT_RESIDUAL_RATIO and r > HINT_FLOOR_RATIO:
+        return done(True, 'clear')
+    return done(None, 'control_changes' if c > HINT_NOISE_RATIO else 'band')
+
+
+JUDGE_TEXT = {
+    'below_resolution': 'residual below the resolution (needs > %s absolute and, for colour, > %s of the '
+                        'luminance)' % (MIN_RESIDUAL, MIN_RELATIVE_COLOUR),
+    'at_floor': 'residual at its resampling floor (< %s x): bilinear resampling alone explains it' %
+                HINT_UNDECIDED_RATIO,
+    'no_reference': 'no noise reference for the transparency layer in the control',
+    'control_changes': 'noise-limited: the control residual is itself > %s x its floor (noise or change), '
+                       'so it is no reference' % HINT_NOISE_RATIO,
+    'band': 'above the resampling floor but inside the safety margin (slow flow, per-frame dither, or fine '
+            'static detail)',
+    'clear': 'clearly above the control and the resampling floor',
+    'missing': 'not enough data',
+}
+
+
+def judgement_text(label, fires, code, n):
+    """One readable line: the raw numbers, the floor-normalised ones and the reason."""
+    def g(value):
+        return 'n/a' if value is None else format(value, '.3g')
+
+    def floor(value):
+        return g(max(value or 0.0, FLOOR_EPS))
+
+    text = (f'{label}: region {g(n["region"])} = {g(n["region_over_floor"])} x its floor '
+            f'{floor(n["region_floor"])}')
+    if n['control'] is not None:
+        text += (f', control {g(n["control"])} = {g(n["control_over_floor"])} x its floor '
+                 f'{floor(n["control_floor"])}, factor {g(n["factor"])}')
+    floors = [n['region_floor'] or 0.0] + ([n['control_floor'] or 0.0] if n['control'] is not None else [])
+    if min(floors) < FLOOR_EPS:
+        text += f' (floors under {FLOOR_EPS:g} count as {FLOOR_EPS:g})'
+    return f'{text} -> {fires}: {JUDGE_TEXT[code]}'
+
+
+def fixed(value, digits=2):
+    return 'n/a' if value is None else format(value, f'.{digits}f')
+
+
+def upgrade_text(label, ratio, control_ratio, threshold):
+    return (f'; upgraded by the frame-gap test: the {label} change grows x{fixed(ratio)} from gap 1 to gap 2 '
+            f'(control {fixed(control_ratio)}; needs >= {threshold} and {HINT_GAP_MARGIN} above the control)')
+
+
+GAP_KEYS = {'guides': ('guide_residual', None), 'colour': ('colour_residual', 'colour_residual_relative'),
+            'delta': ('transparency_delta_residual', 'transparency_delta_residual_relative')}
+
+
+def gap_flow(region, control, kind):
+    """(True/False/None, ratio, control ratio): does the change of this kind grow from frame gap 1 to 2
+    (flow) clearly more than the control's? None if the region's residual is below the resolution of the
+    measurement (MIN_RESIDUAL, and MIN_RELATIVE_COLOUR of the luminance for colour), where a ratio of
+    two tiny numbers means nothing, or if the ratio was not measured."""
+    threshold = HINT_GAP_GUIDES if kind == 'guides' else HINT_GAP_COLOUR
+    ratio, other = dig(region, 'temporal', f'gap_ratio_{kind}'), dig(control, 'temporal', f'gap_ratio_{kind}')
+    residual_key, relative_key = GAP_KEYS[kind]
+    residual = dig(region, 'temporal', residual_key)
+    relative = dig(region, 'temporal', relative_key) if relative_key else None
+    if ratio is None or residual is None or residual <= MIN_RESIDUAL or \
+            (relative_key and (relative is None or relative <= MIN_RELATIVE_COLOUR)):
+        return None, ratio, other
+    return ratio >= threshold and ratio - (1.0 if other is None else other) >= HINT_GAP_MARGIN, ratio, other
 
 
 def make_hints(region, control, jitter_undecided=False):
@@ -859,9 +1083,9 @@ def make_hints(region, control, jitter_undecided=False):
     animation hints when the jitter changes between frames but no compensation could be decided."""
     hints = []
 
-    def add(hint_id, fires, statement, detail, low_sample=False):
+    def add(hint_id, fires, statement, detail, low_sample=False, numbers=None):
         hints.append({'id': hint_id, 'fires': fires, 'statement': statement, 'detail': detail,
-                      'low_sample': low_sample})
+                      'low_sample': low_sample, 'numbers': numbers})
 
     def few(*counts, what='too few valid pixels'):
         """Detail text if any of the (name, pixel count) pairs is below the floor, else None."""
@@ -908,10 +1132,17 @@ def make_hints(region, control, jitter_undecided=False):
     not_compensated = ('jitter not compensated: the sub-pixel jitter changes between frames and no axis '
                        'sign pair could be decided from the guides, so the residuals would mostly '
                        'measure the jitter')
+    limits = (f'True needs factor > {HINT_RESIDUAL_RATIO} and > {HINT_FLOOR_RATIO} x the floor, False is '
+              f'< {HINT_UNDECIDED_RATIO} x the floor, in between undecided')
+
+    def verdict_statement(statement, fires):
+        return statement if fires else (f'not indicated: {statement}' if fires is False else
+                                        f'undecided: {statement}')
+
     statement = ('guides change frame to frame beyond the motion vectors (flow, waves or per-frame '
                  'dither)')
-    r, c = dig(region, 'temporal', 'guide_residual'), dig(control, 'temporal', 'guide_residual')
-    floor = dig(region, 'temporal', 'guide_resampling_floor')
+    guide_keys = ('guide_residual', 'guide_resampling_floor')
+    r, c = dig(region, 'temporal', guide_keys[0]), dig(control, 'temporal', guide_keys[0])
     if r is None or c is None:
         add('guides_animate', None, f'not evaluated: {statement}', 'needs a control window and 2+ frames')
     elif jitter_undecided:
@@ -919,23 +1150,35 @@ def make_hints(region, control, jitter_undecided=False):
     elif few(*moving):
         add('guides_animate', None, f'not evaluated: {statement}', few(*moving), True)
     else:
-        fires = animates(r, c, floor)
-        add('guides_animate', fires, statement if fires else f'not indicated: {statement}',
-            f'region guide residual {r:.3g}, control {c:.3g}, region resampling floor '
-            f'{"n/a" if floor is None else format(floor, ".3g")} (needs > {HINT_RESIDUAL_RATIO} x control, '
-            f'> {MIN_RESIDUAL} and > {HINT_FLOOR_RATIO} x the floor; patterns under about 2.5 px and '
-            'aliased normals can still read as animation: near Nyquist the round-trip floor '
-            'underestimates the error of one warp)')
+        fires, code, numbers = judge_change(r, dig(region, 'temporal', guide_keys[1]), c,
+                                            dig(control, 'temporal', guide_keys[1]))
+        detail = judgement_text('guides', fires, code, numbers)
+        flow, gap, gap_control = gap_flow(region, control, 'guides')
+        if fires is None and code in ('band', 'control_changes') and flow:
+            fires = True
+            detail += upgrade_text('guide', gap, gap_control, HINT_GAP_GUIDES)
+        add('guides_animate', fires, verdict_statement(statement, fires),
+            f'{detail} ({limits}; patterns under about 2.5 px and aliased normals can still read as '
+            'animation: near Nyquist the round-trip floor underestimates the error of one warp)',
+            numbers=numbers)
 
     statement = ('colour or transparency layer changes frame to frame beyond the motion vectors (flow, '
                  'waves, per-frame dither or noise)')
-    checks = [(label, dig(region, 'temporal', key), dig(control, 'temporal', key),
-               dig(region, 'temporal', f'{key}_relative'), dig(control, 'temporal', f'{key}_relative'),
-               dig(region, 'temporal', floor_key))
-              for label, key, floor_key in (('colour', 'colour_residual', 'colour_resampling_floor'),
-                                            ('delta', 'transparency_delta_residual',
-                                             'transparency_delta_resampling_floor'))]
-    checks = [check for check in checks if check[1] is not None and check[2] is not None]
+    kinds = (('colour', 'colour_residual', 'colour_resampling_floor', 'colour_residual_relative', 'colour'),
+             ('delta', 'transparency_delta_residual', 'transparency_delta_resampling_floor',
+              'transparency_delta_residual_relative', 'delta'))
+    layer_in_control = (dig(control, 'transparency_delta', 'fraction_above') or 0) >= HINT_DELTA_CONTROL
+    checks = []
+    for label, key, floor_key, relative_key, gap_kind in kinds:
+        r, c = dig(region, 'temporal', key), dig(control, 'temporal', key)
+        if r is None or c is None:
+            continue
+        # The control must have a transparency layer of its own to say how much that layer's residual
+        # is noise; without one its delta residual is ~0 whatever the region's noise is.
+        reference = label == 'colour' or (layer_in_control and c > MIN_RESIDUAL)
+        checks.append((label, gap_kind) + judge_change(
+            r, dig(region, 'temporal', floor_key), c, dig(control, 'temporal', floor_key),
+            dig(region, 'temporal', relative_key), reference))
     if not checks:
         reason = few(*moving) or guard_few
         if reason and dig(region, 'temporal', 'pairs_used') and dig(control, 'temporal', 'pairs_used'):
@@ -948,21 +1191,52 @@ def make_hints(region, control, jitter_undecided=False):
     elif few(*moving) or guard_few:
         add('colour_animates', None, f'not evaluated: {statement}', few(*moving) or guard_few, True)
     else:
-        def part(label, r, c, relative_r, relative_c, floor):
-            text = f'region {label} residual {r:.3g}, control {c:.3g}'
-            if floor is not None:
-                text += f', region resampling floor {floor:.3g}'
-            if relative_r is None or relative_c is None:
-                return text
-            return text + (f' (relative to mean luminance {dig(region, "mean_luminance"):.3g} / '
-                           f'{dig(control, "mean_luminance"):.3g}: {relative_r:.3g} / {relative_c:.3g})')
+        results = [check[2] for check in checks]
+        fires = True if True in results else (None if None in results else False)
+        detail = '; '.join(judgement_text(check[0], check[2], check[3], check[4]) for check in checks)
+        if fires is None:
+            for label, gap_kind, check_fires, code, _ in checks:
+                flow, gap, gap_control = gap_flow(region, control, gap_kind)
+                if check_fires is None and code in ('band', 'control_changes', 'no_reference') and flow:
+                    fires = True
+                    detail += upgrade_text(label, gap, gap_control, HINT_GAP_COLOUR)
+                    break
+        add('colour_animates', fires, verdict_statement(statement, fires),
+            f'{detail} ({limits}; also > {MIN_RESIDUAL} and > {MIN_RELATIVE_COLOUR} of the region luminance; '
+            'luminance / pre_exposure after a 5x5 box filter)',
+            numbers={check[0]: check[4] for check in checks})
 
-        fires = any(animates(r, c, floor) and (rr is None or rr > MIN_RELATIVE_COLOUR)
-                    for _, r, c, rr, _, floor in checks)
-        add('colour_animates', fires, statement if fires else f'not indicated: {statement}',
-            '; '.join(part(*check) for check in checks) + f' (needs > {HINT_RESIDUAL_RATIO} x control, > '
-            f'{MIN_RESIDUAL}, > {MIN_RELATIVE_COLOUR} of the region luminance and > {HINT_FLOOR_RATIO} x '
-            'the floor; luminance / pre_exposure after a 5x5 box filter)')
+    # Frame-gap ratio: does the change grow when the previous frame is two frames back? Flow does,
+    # per-frame noise and dither do not. Never used to say False for the two hints above.
+    statement = 'change grows with the frame gap (flow-like) or does not (noise- or dither-like)'
+    status = dig(region, 'temporal', 'gap_status')
+    guides_flow, ratio, other = gap_flow(region, control, 'guides')
+    colour_flow, colour_ratio, _ = gap_flow(region, control, 'colour')
+    delta_flow, delta_ratio, _ = gap_flow(region, control, 'delta')
+    gap_numbers = {'guides': ratio, 'colour': colour_ratio, 'delta': delta_ratio, 'guides_control': other,
+                   'colour_control': dig(control, 'temporal', 'gap_ratio_colour')}
+    guide_excess = excess(dig(region, 'temporal', 'guide_residual'),
+                          dig(region, 'temporal', 'guide_resampling_floor'))
+    if ratio is None and colour_ratio is None and delta_ratio is None:
+        add('gap_growth', None, f'not evaluated: {statement}',
+            f'frame-gap ratio not available: {status or "needs 3+ frames"}')
+    elif guides_flow or colour_flow or delta_flow:
+        add('gap_growth', True, 'change grows with frame gap (flow-like)',
+            f'residual(frame i-2 -> i) / residual(i-1 -> i): guides {fixed(ratio)} (control {fixed(other)}; '
+            f'flow >= {HINT_GAP_GUIDES}), colour {fixed(colour_ratio)} (flow >= {HINT_GAP_COLOUR}); measured '
+            f'only where the camera is static (mean |mv| < {GAP_STATIC_MV} px)', numbers=gap_numbers)
+    elif ratio is not None and ratio <= HINT_GAP_FLAT and guide_excess is not None and \
+            guide_excess >= HINT_UNDECIDED_RATIO and \
+            (dig(region, 'temporal', 'guide_residual') or 0) > MIN_RESIDUAL:
+        add('gap_growth', False, 'change does not grow with frame gap (noise- or dither-like)',
+            f'guide change {guide_excess:.2g} x its floor, but gap-2 / gap-1 residual {ratio:.2f} <= '
+            f'{HINT_GAP_FLAT} (flow >= {HINT_GAP_GUIDES}); measured only where the camera is static',
+            numbers=gap_numbers)
+    else:
+        add('gap_growth', None, f'undecided: {statement}',
+            f'gap-2 / gap-1 residual: guides {fixed(ratio)}, colour {fixed(colour_ratio)}; nothing above '
+            f'the resampling floor to classify, or between "does not grow" (<= {HINT_GAP_FLAT}) and flow '
+            f'(>= {HINT_GAP_GUIDES} guides / {HINT_GAP_COLOUR} colour)', numbers=gap_numbers)
     return hints
 
 
@@ -1153,13 +1427,20 @@ def analyse(manifest, frames, region, control, mv_tiny_pixels=MV_TINY_PIXELS):
                     region[1] < control[3] and control[1] < region[3]):
                 notes.append('control overlaps the region')
         else:
-            picked = pick_control(region, derived[0]['ordinary'], delta)
+            picked = pick_control(region, derived[0]['ordinary'], delta,
+                                  usable_pixels(frames, metas, derived), derived[0]['depth'])
             if picked is None:
                 notes.append('no control window of the region size fits clear of the region; give --control')
             else:
                 control_info = {'window': picked['window'], 'selection': (
                     f'picked automatically: same size as the region, {picked["ordinary_pixels"]} status==1 '
-                    f'pixels, {picked["changed_pixels"]} pixels with transparency delta > {DELTA_THRESHOLD}')}
+                    f'pixels ({picked["usable_pixels"]} pass the temporal tests), '
+                    f'{picked["changed_pixels"]} pixels with transparency delta > {DELTA_THRESHOLD}; closest '
+                    'in depth, then nearest, to the region among equals')}
+                if delta is None:
+                    notes.append('no colour_before_transparency: nothing tells water from bank in the '
+                                 'automatically picked control; check its box in the pictures or '
+                                 'give --control')
         if control_info:
             windows['control'] = tuple(control_info['window'])
     jitter_signs, jitter = choose_jitter(frames, metas, derived, windows)
@@ -1182,6 +1463,10 @@ def analyse(manifest, frames, region, control, mv_tiny_pixels=MV_TINY_PIXELS):
                 residual, mean_luminance = temporal[name][f'{key}_residual'], stats[name]['mean_luminance']
                 temporal[name][f'{key}_residual_relative'] = \
                     residual / mean_luminance if residual is not None and mean_luminance else None
+            for key, floor_key in (('guide', 'guide'), ('colour', 'colour'),
+                                   ('transparency_delta', 'transparency_delta')):
+                temporal[name][f'{key}_over_floor'] = excess(temporal[name][f'{key}_residual'],
+                                                             temporal[name][f'{floor_key}_resampling_floor'])
     clip = {'layout': None, 'used': 'hardware depth (no usable clip_to_view / view_to_clip)'}
     if layout is not None:
         clip = {key: layout[key] for key in ('layout', 'ambiguous', 'source', 'structure_layout',
@@ -1262,6 +1547,11 @@ def render_text(report):
         lines.append(f'region {report["region"]}')
     if report['control']:
         lines.append(f'control {report["control"]["window"]}: {report["control"]["selection"]}')
+    if report['hints']:
+        lines += ['', 'SUMMARY (HEURISTIC readings; True = clear evidence, False = clear evidence of none, '
+                      'None = undecided or not measurable)']
+        lines += [f'  {h["id"]}: {h["fires"]}  {h["statement"]}' for h in report['hints']]
+        lines += [f'  {note}' for note in jitter_notes(report['conventions']['jitter'])]
     if report['notes']:
         lines += ['', 'NOTES'] + [f'  {note}' for note in report['notes']]
     lines += ['', 'CONVENTIONS'] + list(dict_lines(report['conventions'], 2)) + \
@@ -1341,15 +1631,19 @@ def synthetic_projection():
     return m, np.linalg.inv(m)
 
 
-def scene_jitter(t, jitter, jitter_y=0.0, start=0):
+def scene_jitter(t, jitter, jitter_y=0.0, start=0, series=None):
     """Jitter of frame t in render pixels: alternates between 0 and `jitter` in x and between -0.125
-    and -0.125 + `jitter_y` in y, but only from frame `start` on (before it: 0 and -0.125)."""
+    and -0.125 + `jitter_y` in y, but only from frame `start` on (before it: 0 and -0.125). `series`
+    (one (x, y) per frame) overrides all of that."""
+    if series is not None:
+        return tuple(series[t])
     odd = t % 2 if t >= start else 0
     return jitter * odd, -0.125 + jitter_y * odd
 
 
 def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, flip_y=False,
-                    period=SYN_WATER_PERIOD, noise=0.0, jitter_start=0, flat_x=False, flush=False):
+                    period=SYN_WATER_PERIOD, noise=0.0, jitter_start=0, flat_x=False, flush=False,
+                    ground_period=None, layer_noise=0.0, dither=0.0, water_box=SYN_REGION, series=None):
     """Frame t of the synthetic scene as float arrays, rendered at the frame's jitter.
 
     Default: static camera, zero motion; sky rows on top; a ground plane (control); a static
@@ -1362,15 +1656,19 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, fli
     the colour before transparency, new every frame, like ray-traced lighting). jitter_start: first
     frame with a jitter. flat_x: every texture depends on y only (and the terrain strip spans the
     whole width), so nothing outside the water has a gradient along x. flush: the water is at the
-    depth of the ground, so its hard edge has no depth step."""
+    depth of the ground, so its hard edge has no depth step. ground_period: the ground gets a static
+    normal texture of this (x, y) wavelength (a sharp control). layer_noise: colour noise inside the
+    water only, new every frame and not in the colour before transparency (reflection noise of a layer
+    drawn after the snapshot). dither: per-frame noise on the water's normals. water_box: the water
+    rectangle (a narrow one is a river). series: explicit per-frame jitter, see scene_jitter."""
     yy, xx = np.mgrid[0:SYN_H, 0:SYN_W].astype(np.float64)
     fy = 1 / math.tan(SYN_FOV / 2)
-    jx, jy = scene_jitter(t, jitter, jitter_y, jitter_start)
+    jx, jy = scene_jitter(t, jitter, jitter_y, jitter_start, series)
     sx, sy = xx + sign * jx, yy + (-sign if flip_y else sign) * jy
     tx = np.full(sx.shape, 5.0) if flat_x else sx     # x as the textures see it
     ndc_y = 1 - (sy + 0.5) / SYN_H * 2
     none = np.zeros(yy.shape, bool)
-    x0, y0, x1, y1 = SYN_REGION
+    x0, y0, x1, y1 = water_box
     cx, cy = sx + 0.5, sy + 0.5
     water = none if drift else (cx >= x0) & (cx < x1) & (cy >= y0) & (cy < y1)
     sky = none if drift else cy < 12
@@ -1386,11 +1684,18 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, fli
         phase = np.where(strip, 2 * np.pi * tx / 20, phase)
         ground = 6.0 / ((0.3 * ndc_y / fy + 1) / math.hypot(0.3, 1))
         z = ground if flush else np.where(water, 5.0, ground)
+        if ground_period is not None:
+            bumps = ~water & ~sky & ~strip
+            phase = np.where(bumps, 2 * np.pi * (tx / ground_period[0] + sy / ground_period[1]), phase)
+            wave = np.where(bumps, np.sin(phase), wave)
     tilt = np.stack([0.1 * wave, 0.1 * np.cos(phase), np.ones_like(wave)], axis=-1)
+    if dither:
+        tilt[..., :2] += np.where(water[..., None], dither * np.random.default_rng(3000 + t).standard_normal(
+            water.shape + (2,)), 0.0)
     tilt /= np.linalg.norm(tilt, axis=-1, keepdims=True)
     normal = np.zeros((SYN_H, SYN_W, 4))
     normal[..., 2], normal[..., 3] = 1.0, 0.5
-    textured = water | strip | bool(drift)
+    textured = water | strip | bool(drift) | (ground_period is not None and ~sky)
     normal[..., :3] = np.where(textured[..., None], tilt, normal[..., :3])
     albedo = np.full((SYN_H, SYN_W, 4), 0.5)
     specular = np.full((SYN_H, SYN_W, 4), 0.04)
@@ -1403,6 +1708,9 @@ def synthetic_scene(t, drift, scroll=1.0, jitter=0.25, sign=1, jitter_y=0.0, fli
         before = before + noise * np.random.default_rng(1000 + t).standard_normal(before.shape)
     color = before + np.where(water, 0.3 + 0.2 * wave, 0.0)[..., None] + \
         np.where(patch & ~water, 0.2, 0.0)[..., None]
+    if layer_noise:
+        color = color + np.where(water, layer_noise, 0.0)[..., None] * \
+            np.random.default_rng(2000 + t).standard_normal(before.shape)
     motion = np.zeros((SYN_H, SYN_W, 2))
     motion[..., 0] = drift / SYN_W
     return {'color': color, 'before': before, 'depth': np.where(sky, 0.0, SYN_NEAR / z),
@@ -1414,14 +1722,15 @@ def write_capture(folder, frames=8, before=True, drift=0, scroll=1.0, jitter=0.2
                   exposure=1.0, **scene_options):
     """Write a synthetic capture that follows capture-format.md (manifest.json last). Odd frames
     have pre_exposure `exposure` (colours scaled to match) and jitter `jitter`; scene_options
-    (jitter_y, flip_y, period, noise, jitter_start, flat_x, flush) go to synthetic_scene."""
+    (jitter_y, flip_y, period, noise, jitter_start, flat_x, flush, ground_period, layer_noise, dither,
+    water_box, series) go to synthetic_scene."""
     projection, c2v = synthetic_projection()
     folder.mkdir(parents=True, exist_ok=True)
     manifest_frames = []
     for t in range(frames):
         scene = synthetic_scene(t, drift, scroll, jitter, sign, **scene_options)
         frame_jitter = list(scene_jitter(t, jitter, scene_options.get('jitter_y', 0.0),
-                                         scene_options.get('jitter_start', 0)))
+                                         scene_options.get('jitter_start', 0), scene_options.get('series')))
         pre_exposure = exposure if t % 2 else 1.0
         color = encode_r11g11b10(scene['color'] * pre_exposure)
         prior = encode_r11g11b10(scene['before'] * pre_exposure)
@@ -1573,8 +1882,31 @@ def self_test():
     expect(np.array_equal(~near_unusable(ten, 7), np.pad(np.ones((4, 4), bool), 3)) and
            near_unusable(np.pad(np.ones((4, 4), bool), 3), 3)[0, 0],
            'outside the image counts as unusable for the colour guard')
-    expect(animates(2.0, 0.0, None) and animates(2.0, 0.0, 0.6) and not animates(2.0, 0.0, 0.8) and
-           not animates(2.0, 1.0, None), 'animates: control ratio and floor ratio')
+
+    def verdict(r, c, relative=None, reference=True, floor=0.01, control_floor=0.01):
+        """judge_change for a region r x its floor against a control c x its floor."""
+        fires, code, _ = judge_change(r * floor, floor, c * control_floor, control_floor, relative, reference)
+        return fires, code
+
+    expect(verdict(1.5, 0) == (False, 'at_floor') and verdict(1.0, 3) == (False, 'at_floor') and
+           verdict(1.7, 0) == (None, 'band') and verdict(2.9, 1.0) == (None, 'band') and
+           verdict(3.1, 1.0) == (True, 'clear') and verdict(3.1, 0.2) == (True, 'clear') and
+           verdict(3.1, 1.2) == (None, 'band') and verdict(9.5, 3.0) == (True, 'clear') and
+           verdict(8.9, 3.0) == (None, 'band') and verdict(20, 5) == (True, 'clear') and
+           verdict(14, 5) == (None, 'control_changes') and verdict(1.8, 9) == (None, 'control_changes'),
+           'judge_change: False only at the floor, True only above both ratios, None between and when '
+           'the control changes itself')
+    expect(verdict(5, 0, reference=False) == (None, 'no_reference') and
+           verdict(1.2, 0, reference=False) == (False, 'at_floor') and
+           judge_change(0.0005, 0.0001, 0.0, 0.0)[:2] == (False, 'below_resolution') and
+           judge_change(0.02, 0.001, 0.0, 0.0, relative=0.005)[:2] == (False, 'below_resolution') and
+           judge_change(0.02, 0.001, None, None)[:2] == (None, 'missing') and
+           judge_change(0.02, 0.0, 0.0, 0.0)[:2] == (True, 'clear'),
+           'judge_change: no reference, resolution gates, missing control, zero floors')
+    sharp_control = judge_change(0.01, 0.002, 0.004, 0.004)     # raw ratio 2.5 < 3, normalised 5
+    expect(sharp_control[0] is True and abs(sharp_control[2]['factor'] - 5.0) < 1e-9 and
+           abs(sharp_control[2]['control_over_floor'] - 1.0) < 1e-9,
+           'a sharp static control is a fair reference')
     rough = make_hints({'ordinary_pixels': 1000, 'plane_fit': {'rms_over_median_view_depth': 0.05},
                         'normals': {'mean_angle_deg': 3.0}}, None)
     flat_hint = next(h for h in rough if h['id'] == 'flat_surface')
@@ -1582,26 +1914,78 @@ def self_test():
            'rough geometry hint')
     expect(all(h['fires'] is None for h in rough if h['id'] != 'flat_surface'), 'no control, no hints')
 
+    def window(guide=(0.0, None), colour=(0.0, None), delta=None, fraction=None, gap=None,
+               colour_pixels=900, luminance=0.8):
+        """Crafted window statistics: (residual, floor) per kind, delta layer fraction, frame-gap ratios."""
+        temporal = {'valid_pixels': 900, 'colour_valid_pixels': colour_pixels, 'pairs_used': 7,
+                    'guide_residual': guide[0], 'guide_resampling_floor': guide[1],
+                    'colour_residual': colour[0], 'colour_resampling_floor': colour[1],
+                    'colour_residual_relative': colour[0] / luminance}
+        if delta:
+            temporal.update(transparency_delta_residual=delta[0],
+                            transparency_delta_resampling_floor=delta[1],
+                            transparency_delta_residual_relative=delta[0] / luminance)
+        temporal.update({f'gap_ratio_{kind}': value for kind, value in (gap or {}).items()})
+        stats = {'ordinary_pixels': 1000, 'mean_luminance': luminance, 'temporal': temporal}
+        if fraction is not None:
+            stats['transparency_delta'] = {'fraction_above': fraction}
+        return stats
+
     def moving_stats(guide_floor, colour_floor, colour_pixels=900):
-        region = {'ordinary_pixels': 1000, 'mean_luminance': 0.8,
-                  'temporal': {'valid_pixels': 900, 'colour_valid_pixels': colour_pixels,
-                               'pairs_used': 7, 'guide_residual': 0.01,
-                               'guide_resampling_floor': guide_floor, 'colour_residual': 0.02,
-                               'colour_residual_relative': 0.025, 'colour_resampling_floor': colour_floor}}
-        quiet = {'ordinary_pixels': 1000, 'mean_luminance': 0.5,
-                 'temporal': {'valid_pixels': 900, 'colour_valid_pixels': 900, 'pairs_used': 7,
-                              'guide_residual': 0.0, 'colour_residual': 0.0,
-                              'colour_residual_relative': 0.0}}
-        return region, quiet
+        return window((0.01, guide_floor), (0.02, colour_floor), colour_pixels=colour_pixels), window()
 
     def fires(hints, hint_id):
         return next(h for h in hints if h['id'] == hint_id)['fires']
 
+    def one(hints, hint_id):
+        return next(h for h in hints if h['id'] == hint_id)
+
     above = make_hints(*moving_stats(0.003, 0.005))     # residuals 3.3x and 4x their floors
-    below = make_hints(*moving_stats(0.006, 0.015))     # 1.7x and 1.3x
+    slow = make_hints(*moving_stats(0.0045, 0.009))     # 2.2x: above the floor, inside the safety margin
+    below = make_hints(*moving_stats(0.007, 0.0154))    # 1.4x and 1.3x: resampling alone explains it
     expect(fires(above, 'guides_animate') is True and fires(above, 'colour_animates') is True and
+           fires(slow, 'guides_animate') is None and fires(slow, 'colour_animates') is None and
            fires(below, 'guides_animate') is False and fires(below, 'colour_animates') is False,
-           'animation hints need HINT_FLOOR_RATIO x the resampling floor')
+           'animation hints: True above HINT_FLOOR_RATIO x the floor, None above HINT_UNDECIDED_RATIO, '
+           'False below')
+    expect(one(slow, 'guides_animate')['statement'].startswith('undecided') and
+           'above the resampling floor but inside the safety margin (slow flow, per-frame dither, or fine '
+           'static detail)' in one(slow, 'guides_animate')['detail'] and
+           'region 0.01 = 2.22 x its floor 0.0045' in one(slow, 'guides_animate')['detail'],
+           'slow flow: reason')
+    flowing = make_hints(window((0.01, 0.0045), (0.02, 0.009), gap={'guides': 1.9, 'colour': 1.4}),
+                         window(gap={'guides': 1.0, 'colour': 1.0}))
+    dithered = make_hints(window((0.01, 0.0045), (0.02, 0.009), gap={'guides': 1.0, 'colour': 1.0}),
+                          window(gap={'guides': 1.0, 'colour': 1.0}))
+    at_floor = make_hints(window((0.01, 0.007), (0.02, 0.0154), gap={'guides': 1.9, 'colour': 1.4}),
+                          window(gap={'guides': 1.0, 'colour': 1.0}))
+    expect(fires(flowing, 'guides_animate') is True and fires(flowing, 'colour_animates') is True and
+           'frame-gap test' in one(flowing, 'guides_animate')['detail'] and
+           fires(flowing, 'gap_growth') is True and
+           fires(dithered, 'guides_animate') is None and fires(dithered, 'colour_animates') is None and
+           fires(dithered, 'gap_growth') is False and
+           fires(at_floor, 'guides_animate') is False and fires(at_floor, 'colour_animates') is False,
+           'the frame-gap ratio turns an undecided hint into True, never into False, and never at the floor')
+    sharp = make_hints(window((0.01, 0.002)), window((0.004, 0.004)))     # raw ratio 2.5, normalised 5
+    expect(fires(sharp, 'guides_animate') is True, 'sharp static control: normalised comparison')
+    noisy = make_hints(window(guide=(0.0, None), colour=(0.02, 0.003)), window(colour=(0.02, 0.003)))
+    expect(fires(noisy, 'colour_animates') is None and
+           'noise-limited' in one(noisy, 'colour_animates')['detail'],
+           'control colour at 6.7x its floor: no reference')
+    layer = 'no noise reference for the transparency layer in the control'
+    blended = make_hints(window(colour=(0.02, 0.0154), delta=(0.02, 0.003), fraction=1.0),
+                         window(colour=(0.0, None), delta=(0.0, 0.0), fraction=0.0))
+    with_layer = make_hints(window(colour=(0.02, 0.0154), delta=(0.02, 0.003), fraction=1.0),
+                            window(colour=(0.0, None), delta=(0.004, 0.003), fraction=0.6))
+    expect(fires(blended, 'colour_animates') is None and
+           layer in one(blended, 'colour_animates')['detail'] and
+           fires(with_layer, 'colour_animates') is True,
+           'the delta check needs a transparency layer in the control')
+    flat_layer = make_hints(window(colour=(0.02, 0.0154), delta=(0.02, 0.003), fraction=1.0),
+                            window(colour=(0.0, None), delta=(0.0, 0.0), fraction=0.6))
+    expect(fires(flat_layer, 'colour_animates') is None and
+           layer in one(flat_layer, 'colour_animates')['detail'],
+           'a control layer with no delta residual is no reference')
     guarded = make_hints(*moving_stats(0.003, 0.005, colour_pixels=30))
     expect(fires(guarded, 'guides_animate') is True and fires(guarded, 'colour_animates') is None and
            'too few colour pixels after the edge guard' in
@@ -1612,6 +1996,23 @@ def self_test():
     expect(all(fires(unsure, name) is None for name in ('guides_animate', 'colour_animates')) and
            all('jitter not compensated' in h['detail'] for h in unsure if h['id'] in
                ('guides_animate', 'colour_animates')), 'undecided jitter: animation hints not evaluated')
+    expect(fires(make_hints(*moving_stats(0.003, 0.005)), 'gap_growth') is None,
+           'no gap ratio: gap_growth None')
+
+    # pick_control: nearest among equals, windows that pass the temporal tests, depth like the region's.
+    ones = np.ones((SYN_H, SYN_W), bool)
+    corner = (60, 30, 76, 46)
+    expect(pick_control(corner, ones, None)['window'] == (60, 10, 76, 26),
+           'equal windows: the nearest (first in raster order of the equally near), not the top-left corner')
+    usable = ones.copy()
+    usable[:27] = False
+    picked = pick_control(corner, ones, None, usable)
+    expect(picked['window'] == (40, 30, 56, 46) and picked['usable_pixels'] == 256,
+           f'windows whose pixels fail the temporal tests lose: {picked}')
+    depth = np.where(np.arange(SYN_H)[:, None] < 27, 9.0, 5.0) * np.ones((SYN_H, SYN_W))
+    picked = pick_control(corner, ones, None, None, depth)
+    expect(picked['window'] == (40, 30, 56, 46),
+           f'a window at the region\'s depth beats a nearer one: {picked}')
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1621,7 +2022,7 @@ def self_test():
         # Region plus automatic control, end to end.
         report = run_probe(tmp / 'water', region=SYN_REGION, out_dir=out)
         region, control = region_of(report, 'region'), region_of(report, 'control')
-        expect(report['control']['window'] == [12, 12, 44, 44], f'automatic control {report["control"]}')
+        expect(report['control']['window'] == [12, 15, 44, 47], f'automatic control {report["control"]}')
         expect(control['ordinary_pixels'] == 32 * 32, 'control is all status==1')
         expect(region['transparency_delta']['fraction_above'] > 0.5, 'region delta fraction')
         expect(control['transparency_delta']['fraction_above'] < 0.1, 'control delta fraction')
@@ -1654,15 +2055,24 @@ def self_test():
                info['axes']['x']['decided_on'] == 'outside_region' and info['axes']['y']['changes'] is False,
                f'jitter sign is found from the textured terrain: {info}')
         expect(0 < rt['colour_valid_pixels'] < rt['valid_pixels'] and
-               0 < ct['colour_valid_pixels'] < ct['valid_pixels'],
+               0 < ct['colour_valid_pixels'] <= ct['valid_pixels'],
                f'colour pixels are counted after the edge guard: {rt} {ct}')
         expect(region['mean_luminance'] > control['mean_luminance'] and
-               'relative to mean luminance' in hint(report, 'colour_animates')['detail'], 'luminance detail')
+               'of the region luminance' in hint(report, 'colour_animates')['detail'], 'luminance detail')
         expect(len(report['frames']) == 8 and report['frames'][1]['jitter'] == [0.25, -0.125] and
                report['frames'][1]['pre_exposure'] == 1, 'frames')
         text = (out / 'report.txt').read_text(encoding='utf-8')
         expect(text.count('HEURISTIC') >= 4 and 'frame 0' in text, 'report.txt hints')
         expect('runner-up' in text and 'sign flipped' in text, 'the jitter note prints the runner-up')
+        summary = text[text.index('SUMMARY'):text.index('NOTES')]
+        expect(text.index('control ') < text.index('SUMMARY') < text.index('HINTS (HEURISTIC') and
+               all(f'{h["id"]}: {h["fires"]}' in summary for h in report['hints']) and
+               'jitter x: sign -1 decided' in summary,
+               f'report.txt: SUMMARY with the hints and the jitter decision after the windows: {summary}')
+        expect(all(f'{key}' in text for key in ('guide_over_floor', 'gap_ratio_guides', 'gap_status')) and
+               'region 0.' in hint(report, 'guides_animate')['detail'] and
+               hint(report, 'guides_animate')['numbers']['factor'] > HINT_RESIDUAL_RATIO,
+               'raw and floor-normalised numbers are reported')
         # Residual and floor are taken over the same pixels, with a half-pixel offset (the border is out
         # of reach for some taps) and the non-finite texels (frames 0 and 1 only) on either side.
         manifest, frames = load(tmp / 'water')
@@ -1696,6 +2106,9 @@ def self_test():
         expect(given['region'] == [80, 40, 96, 64] and given['control']['window'] == [8, 12, 40, 44],
                'explicit control and clipped region')
         expect(any('clipped' in note for note in given['notes']), 'clipping is reported')
+        edged = region_of(given, 'control')['temporal']     # touches the sky edge and the patch
+        expect(0 < edged['colour_valid_pixels'] < edged['valid_pixels'],
+               f'the guard applies to the control: {edged}')
 
         # No region: whole-frame summary and pictures only.
         whole = run_probe(tmp / 'water', out_dir=out)
@@ -1741,6 +2154,9 @@ def self_test():
         expect('transparency_delta' not in region_of(nob, 'region'), 'no delta statistics')
         expect(hint(nob, 'drawn_after_snapshot')['fires'] is None and
                hint(nob, 'guides_animate')['fires'] is True, 'hints without before')
+        expect(any('nothing tells water from bank' in note for note in nob['notes']) and
+               not any('nothing tells water from bank' in note for note in report['notes']),
+               'no delta: the automatic control comes with a warning')
         write_capture(tmp / 'single', frames=1)
         single = run_probe(tmp / 'single', region=SYN_REGION, out_dir=out)
         expect(region_of(single, 'region')['temporal'] is None, 'one frame has no temporal statistics')
@@ -1797,8 +2213,10 @@ def self_test():
                            for axis in ('x', 'y') if info['axes'][axis]['changes']),
                        f'{label}, {motion}: jitter signs {info}')
             temporal = region_of(runs['static'], 'region')['temporal']
-            expect(all(hint(runs['static'], name)['fires'] is False
-                       for name in ('guides_animate', 'colour_animates')),
+            # (colour noise leaves the colour check undecided, "noise-limited", not False)
+            colour_expected = None if 'noise' in options else False
+            expect(hint(runs['static'], 'guides_animate')['fires'] is False and
+                   hint(runs['static'], 'colour_animates')['fires'] is colour_expected,
                    f'{label}: static water must not animate: {temporal}')
             expect(all(hint(runs['scrolling'], name)['fires'] is True
                        for name in ('guides_animate', 'colour_animates')),
@@ -1829,6 +2247,21 @@ def self_test():
             expect(all(hint(late, name)['fires'] is (motion == 'scrolling')
                        for name in ('guides_animate', 'colour_animates')),
                    f'late jitter, {motion}: {region_of(late, "region")["temporal"]}')
+
+        # Unequal jitter deltas: x changes by 0.1 at pair 3 and by 0.5 at pair 4, y by 0.125 at pair 2 and
+        # by 0.5 at pair 5 (then stays): each axis is decided on the pair where it changes most, not on
+        # the first pair that changes.
+        series = [(0.0, -0.125), (0.0, -0.125), (0.0, 0.0), (0.1, 0.0), (0.6, 0.0), (0.6, 0.5), (0.6, 0.5),
+                  (0.6, 0.5)]
+        for motion, scroll in (('static', 0), ('scrolling', 1.0)):
+            write_capture(tmp / f'unequal-{motion}', scroll=scroll, flip_y=True, series=series,
+                          ground_period=(8.0, 12.0))
+            unequal = run_probe(tmp / f'unequal-{motion}', **args)
+            info = unequal['conventions']['jitter']
+            expect(info['sign'] == [-1, 1] and not info['undecided'] and info['axes']['x']['pair'] == 4 and
+                   info['axes']['y']['pair'] == 5, f'unequal jitter deltas, {motion}: {info}')
+            expect(hint(unequal, 'guides_animate')['fires'] is (motion == 'scrolling'),
+                   f'unequal jitter deltas, {motion}: {region_of(unequal, "region")["temporal"]}')
 
         # A texture with no gradient along x outside the region: x jitter changes but the x sign
         # cannot be decided (the candidate order must not decide it), the y sign can; the animation
@@ -1896,7 +2329,7 @@ def self_test():
         still = region_of(sharp['static'], 'region')['temporal']
         quiet = region_of(sharp['static'], 'control')['temporal']
         expect(sharp['static']['conventions']['jitter']['applied'] and
-               animates(still['guide_residual'], quiet['guide_residual']) and
+               still['guide_residual'] > max(MIN_RESIDUAL, HINT_RESIDUAL_RATIO * quiet['guide_residual']) and
                hint(sharp['static'], 'guides_animate')['fires'] is False and
                0.7 < still['guide_residual'] / still['guide_resampling_floor'] < 1.5,
                f'sharp static pattern is resampling, not animation: {still} control {quiet}')
@@ -1905,6 +2338,125 @@ def self_test():
                hint(sharp['scrolling'], 'colour_animates')['fires'] is True and
                moving['guide_residual'] > 5 * moving['guide_resampling_floor'],
                f'sharp scrolling pattern animates: {moving}')
+
+        # Round 4: what the data cannot decide is None, never False. Frame-gap ratio = residual(i-2 -> i) /
+        # residual(i-1 -> i): ~1 for noise and dither, ~2 for flow (a shift twice as far).
+        halton = [(0.0, -0.1667), (-0.25, 0.1667), (0.25, -0.3889), (-0.375, -0.0556), (0.125, 0.2778),
+                  (-0.125, -0.2778), (0.375, 0.0556), (-0.4375, 0.3889)]
+
+        def probe(name, **options):
+            write_capture(tmp / name, **options)
+            return run_probe(tmp / name, **args)
+
+        def numbers_of(report, hint_id, label=None):
+            numbers = hint(report, hint_id)['numbers']
+            return numbers if label is None else numbers[label]
+
+        # (A) A sharp static control (its residual is its resampling floor, above the raw ratio's reach):
+        # smooth scrolling water is a clear True against it, static water is not.
+        flowing = probe('sharp-control-scrolling', scroll=1.0, jitter=0.5, ground_period=(8.0, 12.0))
+        rt, ct = (region_of(flowing, name)['temporal'] for name in ('region', 'control'))
+        expect(rt['guide_residual'] < HINT_RESIDUAL_RATIO * ct['guide_residual'] and
+               numbers_of(flowing, 'guides_animate')['control_over_floor'] > 0.9 and
+               hint(flowing, 'guides_animate')['fires'] is True,
+               f'sharp static control, scrolling water: {rt} control {ct} {hint(flowing, "guides_animate")}')
+        expect(hint(probe('sharp-control-static', scroll=0, jitter=0.5, ground_period=(8.0, 12.0)),
+                    'guides_animate')['fires'] is False, 'sharp static control, static water')
+        short = probe('sharp-control-two', frames=2, scroll=1.0, jitter=0.5, ground_period=(8.0, 12.0))
+        expect(hint(short, 'guides_animate')['fires'] is True and
+               numbers_of(short, 'guides_animate')['code'] == 'clear',
+               f'sharp static control, two frames (no frame-gap rescue): {hint(short, "guides_animate")}')
+
+        # (B) Water alpha-blended after the snapshot over colour noise that is not in colour_before, static:
+        # the control has no layer, so its zero delta residual is no noise reference.
+        blend = probe('blend-static', scroll=0, jitter=0.5, noise=0.15, layer_noise=0.1)
+        rt, ct = (region_of(blend, name)['temporal'] for name in ('region', 'control'))
+        expect(rt['transparency_delta_residual'] >
+               10 * max(ct['transparency_delta_residual'], MIN_RESIDUAL) and
+               region_of(blend, 'control')['transparency_delta']['fraction_above'] < HINT_DELTA_CONTROL and
+               hint(blend, 'colour_animates')['fires'] is not True and
+               numbers_of(blend, 'colour_animates', 'delta')['code'] == 'no_reference' and
+               hint(blend, 'guides_animate')['fires'] is False,
+               f'static blended water over noise: {rt} {ct} {hint(blend, "colour_animates")}')
+
+        # (C) Opaque-pass water (no colour_before_transparency), colour noise 0.15, scrolling: the noisy
+        # control leaves the colour check undecided, never False; the frame-gap ratio shows the flow.
+        opaque = probe('opaque-scrolling', scroll=1.0, jitter=0.5, noise=0.15, before=False)
+        expect(hint(opaque, 'colour_animates')['fires'] is not False and
+               numbers_of(opaque, 'colour_animates', 'colour')['code'] == 'control_changes' and
+               hint(opaque, 'guides_animate')['fires'] is True,
+               f'opaque scrolling water under noise: {hint(opaque, "colour_animates")}')
+        still_opaque = probe('opaque-static', scroll=0, jitter=0.5, noise=0.15, before=False)
+        expect(hint(still_opaque, 'colour_animates')['fires'] is None and
+               hint(still_opaque, 'guides_animate')['fires'] is False, 'opaque static water under noise')
+
+        # (D) Slow flow: a sharp-textured water scrolling 0.2 px per frame is above its resampling floor
+        # (2.3x) but inside the safety margin. With two frames there is no frame-gap ratio and the hint is
+        # None; with eight the ratio shows the flow and the hint is True.
+        slow_options = dict(scroll=0.2, jitter=0.5, period=(8.0, 12.0))
+        two = probe('slow-two', frames=2, **slow_options)
+        numbers = numbers_of(two, 'guides_animate')
+        expect(1.6 < numbers['region_over_floor'] < 3.0 and hint(two, 'guides_animate')['fires'] is None and
+               numbers['code'] == 'band' and
+               hint(two, 'guides_animate')['statement'].startswith('undecided') and
+               hint(two, 'gap_growth')['fires'] is None,
+               f'slow flow, two frames: {hint(two, "guides_animate")}')
+        eight = probe('slow-eight', **slow_options)
+        expect(hint(eight, 'guides_animate')['fires'] is True and
+               numbers_of(eight, 'guides_animate')['code'] == 'band' and
+               'frame-gap test' in hint(eight, 'guides_animate')['detail'] and
+               hint(eight, 'gap_growth')['fires'] is True and
+               region_of(eight, 'region')['temporal']['gap_ratio_guides'] > HINT_GAP_GUIDES,
+               f'slow flow, eight frames: {hint(eight, "guides_animate")}')
+
+        # Below the resolution of the measurement (residual under MIN_RESIDUAL) the ratio of two tiny
+        # numbers means nothing: water scrolling 0.3 px per frame is False and gap_growth is not evaluated.
+        tiny = probe('slow-tiny', scroll=0.3, jitter=0.5)
+        expect(region_of(tiny, 'region')['temporal']['guide_residual'] <= MIN_RESIDUAL and
+               hint(tiny, 'guides_animate')['fires'] is False and hint(tiny, 'gap_growth')['fires'] is None,
+               f'below the resolution: {region_of(tiny, "region")["temporal"]}')
+
+        # (E) Per-frame normal dither on a sharp water over a sharp control (the region's residual is
+        # several times the control's, its excess over the floor just under HINT_FLOOR_RATIO): not False,
+        # and the frame-gap ratio is ~1 (noise-like), not ~2.
+        dither = probe('dither', scroll=0, series=halton, dither=0.035, period=(8.0, 12.0),
+                       ground_period=(8.0, 12.0))
+        rt, ct = (region_of(dither, name)['temporal'] for name in ('region', 'control'))
+        expect(rt['guide_residual'] > 5 * ct['guide_residual'] and
+               hint(dither, 'guides_animate')['fires'] is None and
+               1.6 < numbers_of(dither, 'guides_animate')['region_over_floor'] < 3.0 and
+               0.9 < rt['gap_ratio_guides'] < 1.1 and hint(dither, 'gap_growth')['fires'] is False,
+               f'dither: {rt} control {ct} {hint(dither, "guides_animate")} {hint(dither, "gap_growth")}')
+
+        # (F) Flow: the ratio is ~2 for scrolling water, near 1 or below for static water, in the control too.
+        flow = probe('flow', scroll=1.0, series=halton)
+        rt = region_of(flow, 'region')['temporal']
+        expect(rt['gap_ratio_guides'] > 1.8 and rt['gap_ratio_colour'] > 1.8 and rt['gap_pairs'] == 6 and
+               hint(flow, 'gap_growth')['fires'] is True, f'flow: gap ratios {rt}')
+        static = probe('flow-static', scroll=0, series=halton, ground_period=(8.0, 12.0))
+        expect(hint(static, 'gap_growth')['fires'] is None and
+               (region_of(static, 'control')['temporal']['gap_ratio_guides'] or 0) < HINT_GAP_GUIDES,
+               'static: no flow in the gap ratio')
+
+        # (G) A 5 px river nearer than its banks, scrolling, region = the river: the guides animate (the
+        # depth test must not throw the whole river away); its static twin sits on its resampling floor.
+        river_box = (44, 14, 49, 58)
+        river_args = dict(region=river_box, control=(12, 20, 36, 44), out_dir=out)
+        for motion, scroll in (('static', 0), ('scrolling', 1.0)):
+            write_capture(tmp / f'river-{motion}', scroll=scroll, jitter=0.5, jitter_y=0.4, flip_y=True,
+                          water_box=river_box)
+            river = run_probe(tmp / f'river-{motion}', **river_args)
+            rt = region_of(river, 'region')['temporal']
+            expect(rt['valid_pixels'] >= 100, f'river, {motion}: pixels {rt}')
+            if scroll:
+                expect(hint(river, 'guides_animate')['fires'] is True, f'river, scrolling: {rt}')
+            else:
+                expect(abs(rt['guide_residual'] - rt['guide_resampling_floor']) <=
+                       0.1 * rt['guide_residual'] and
+                       hint(river, 'guides_animate')['fires'] is False,
+                       f'river, static: the floor tracks the residual: {rt}')
+            expect(rt['colour_valid_pixels'] == 0 and hint(river, 'colour_animates')['fires'] is None,
+                   f'a river narrower than the colour edge guard has no colour pixels: {rt}')
 
         # Exposure changing between frames must not read as animation.
         write_capture(tmp / 'exposure', scroll=0, jitter=0, exposure=2.0)
@@ -1923,6 +2475,10 @@ def self_test():
         expect(motion['valid_pixels_alternative'] >= 0.5 * motion['valid_pixels_pixel_convention'],
                'the alternative keeps its valid pixels')
         expect(region_of(drift, 'region')['temporal']['guide_residual'] < 5e-3, 'drift reprojects cleanly')
+        moved = region_of(drift, 'region')['temporal']
+        expect(moved['gap_ratio_guides'] is None and moved['gap_pairs'] == 0 and
+               'camera or content moves in the window' in moved['gap_status'] and
+               hint(drift, 'gap_growth')['fires'] is None, f'moving camera: no frame-gap ratio: {moved}')
 
         # An alternative scaling that keeps fewer than half the valid pixels is rejected even if its
         # residual is lower (a 50 px drift leaves 46 of 96 columns).
