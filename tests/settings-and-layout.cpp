@@ -191,6 +191,7 @@ int main() {
     rrdensity::Frame granted{};
     granted[1] = 100;
     granted[rrdensity::Extra] = 100;
+    granted[rrdensity::Extra + 1] = 30;
     granted[rrdensity::Buckets + 2] = 50;
     granted[rrdensity::Limits] = 18;
     granted[rrdensity::Limits + 3] = 15;
@@ -198,13 +199,14 @@ int main() {
     granted[rrdensity::RateSettings + 2] = 1;
     granted[rrdensity::Target] = 0x3f000000u; // apply targets are not part of the density
     dense.Add(granted);
-    assert(dense.Density(0) == 2.0 && dense.Density(1) == 0.5);
+    assert(dense.Density(0) == 2.0 && dense.Density(1) == 1.1); // 50 pixels: 25 + 30 extra rays
     granted[rrdensity::Extra] = 50;
+    granted[rrdensity::Extra + 1] = 10;
     dense.Add(granted);
-    assert(dense.Density(0) == 1.75 && dense.Density(1) == 0.5);
+    assert(dense.Density(0) == 1.75 && dense.Density(1) == 0.9); // 100 pixels: 50 + 40 extra rays
     assert(dense.Report(2000 + rrdensity::Tracker::Interval, report));
     assert(report.find("lobe1 raysPerPixel=1.750 full=100.0%") != std::string::npos);
-    assert(report.find("lobe2 raysPerPixel=0.500") != std::string::npos);
+    assert(report.find("lobe2 raysPerPixel=0.900") != std::string::npos);
     assert(report.find("threshold=18 boundary=0") != std::string::npos);
     assert(report.find("threshold=0 boundary=15") != std::string::npos);
     assert(report.find("| enabled=1 promote=0 clamp=1") != std::string::npos);
@@ -269,14 +271,23 @@ int main() {
     proof = rb::Prove(bad, 1, 1);
     assert(proof.valid && proof.entries[0] == 1 && proof.entries[1] == 1 &&
            proof.pixel_entries == 1);
+    // A lobe list of header + 1..3 bytes is not too small, but holds no entry.
+    proof = rb::Prove(lists(40, rb::ListHeader + 1, rb::ListHeader + 3), 1, 1);
+    assert(proof.valid && proof.entries[0] == 0 && proof.entries[1] == 0);
+    assert(why(lists(40, rb::ListHeader, rb::ListHeader + 1), 1, 1) == "lobe 1 list too small");
+    assert(why(lists(40, rb::ListHeader + 1, rb::ListHeader), 1, 1) == "lobe 2 list too small");
     // The lobe-1 pixel list bounds lobe 1 (only) when it holds fewer than w*h entries.
     proof = rb::Prove(lists(4 * 4000, rb::ListHeader + 4 * 10000, rb::ListHeader + 4 * 10000), 100,
                       100);
     assert(proof.valid && proof.entries[0] == 4000 && proof.entries[1] == 10000);
     assert(proof.pixel_entries == 4000);
-    proof = rb::Prove(lists(4 * 10000, rb::ListHeader + 4 * 10000, rb::ListHeader + 4 * 10000), 100,
+    proof = rb::Prove(lists(4 * 10000, rb::ListHeader + 4 * 20000, rb::ListHeader + 4 * 20000), 100,
                       100);
-    assert(proof.entries[0] == 10000 && proof.entries[1] == 10000);
+    assert(proof.valid && proof.entries[0] == 20000 && proof.entries[1] == 20000); // u3 == w*h
+    assert(proof.pixel_entries == 10000);
+    proof = rb::Prove(lists(4 * 10001, rb::ListHeader + 4 * 20000, rb::ListHeader + 4 * 20000), 100,
+                      100);
+    assert(proof.valid && proof.entries[0] == 20000 && proof.pixel_entries == 10001); // u3 > w*h
     proof =
         rb::Prove(lists(4 * 4000, rb::ListHeader + 4 * 2000, rb::ListHeader + 4 * 10000), 100, 100);
     assert(proof.entries[0] == 2000 && proof.entries[1] == 10000); // lobe 1 list is smaller anyway
@@ -286,7 +297,7 @@ int main() {
     assert(rb::Cap(4147200, 1920, 1080) == 1.0f && rb::Cap(99999999, 1920, 1080) == 1.0f);
     assert(rb::Cap(0, 1920, 1080) == 0 && rb::Cap(2073600, 0, 1080) == 0 &&
            rb::Cap(2073600, 1920, 0) == 0);
-    assert(rb::Cap(std::numeric_limits<std::uint64_t>::max(), 16384, 16384) == 1.0f);
+    assert(rb::Cap((std::numeric_limits<std::uint64_t>::max)(), 16384, 16384) == 1.0f);
     // A raised target only grows, to min(target * scale, cap).
     constexpr float nan = std::numeric_limits<float>::quiet_NaN(),
                     inf = std::numeric_limits<float>::infinity();
@@ -328,6 +339,7 @@ int main() {
     hand[2] = 50;
     hand[16] = 32;
     hand[rrdensity::Extra] = 40;
+    hand[rrdensity::Extra + 1] = 12;
     hand[rrdensity::Buckets] = 7;
     hand[rrdensity::Buckets + 4] = 80;
     const float target1 = 0.375f, target2 = 0.125f;
@@ -336,13 +348,26 @@ int main() {
     proof = rb::Prove(lists(8294400, 8294544, 4147344), 1920, 1080);
     rb::FrameSample sample = rb::Sample(hand, proof, true);
     assert(sample.expected[0] == 100 + 25 + 2 + 40 && sample.worst[0] == 100 + 50 + 32 + 40);
-    assert(sample.expected[1] == 20 && sample.worst[1] == 80);
+    assert(sample.expected[1] == 20 + 12 && sample.worst[1] == 80 + 12);
     assert(sample.target[0] == 0.375f && sample.target[1] == 0.125f && sample.raised);
     assert(sample.entries[0] == 2073600 && sample.entries[1] == 1036800);
     assert(sample.w == 1920 && sample.h == 1080);
     sample = rb::Sample(hand, rb::Prove({root, root, root, root}, 1280, 720), false);
     assert(sample.entries[0] == 0 && sample.entries[1] == 0 && !sample.raised);
     assert(sample.w == 1280 && sample.h == 720 && sample.expected[0] == 167);
+    // Capacities of an unproven result are never used, even when they are filled in.
+    rb::Lists unproven_lists;
+    unproven_lists.w = 1920;
+    unproven_lists.h = 1080;
+    unproven_lists.reason = "lobe 2 list too small";
+    unproven_lists.entries = {2073600, 1036800};
+    unproven_lists.pixel_entries = 2073600;
+    sample = rb::Sample(hand, unproven_lists, true);
+    assert(sample.entries[0] == 0 && sample.entries[1] == 0 && sample.raised);
+    assert(sample.w == 1920 && sample.h == 1080);
+    assert(rb::Describe(unproven_lists) ==
+           "RR ray lists 1920x1080: lobe1=unknown lobe2=unknown pixels=unknown counter=unknown | "
+           "rays/px lobe1=0.00 lobe2=0.00 | unproven: lobe 2 list too small");
 
     // The session stops raising when a raised frame is too full or has no proven list.
     auto frame = [](double expected1, double expected2, std::uint64_t entries, bool raised) {
@@ -379,6 +404,7 @@ int main() {
     monitor.Restart();
     unproven.entries = {0, 1000000};
     assert(monitor.Add(unproven) && monitor.Stopped());
+    assert(std::string_view(monitor.StopReason()) == "a raised frame had no proven ray list");
 
     // Restart clears the stop but keeps the window's statistics.
     rb::Monitor kept;
@@ -439,12 +465,14 @@ int main() {
     rb::Verdicts verdicts;
     const char *ready = "ready (option off)", *noproof = "no recent list proof";
     assert(verdicts.Changed(ready, 0));
-    assert(!verdicts.Changed(ready, 100) && !verdicts.Changed(ready, 60000));
-    assert(!verdicts.Changed(noproof, 1999));    // changed too soon: not logged yet
-    assert(!verdicts.Changed(ready, 2500));      // back to the logged reason
-    assert(verdicts.Changed(noproof, 2000 + 1)); // the suppressed change is logged later
-    assert(!verdicts.Changed(noproof, 9000));
-    assert(verdicts.Changed(ready, 4001) && !verdicts.Changed(noproof, 6000));
-    assert(verdicts.Changed(noproof, 6001));
-    assert(!verdicts.Changed(ready, 5) && !verdicts.Changed(noproof, 5)); // clock went backwards
+    assert(!verdicts.Changed(ready, 100));     // same reason
+    assert(!verdicts.Changed(noproof, 1999));  // changed too soon: not logged yet
+    assert(verdicts.Changed(noproof, 2000));   // the suppressed change is logged later
+    assert(!verdicts.Changed(noproof, 9000));  // same reason
+    assert(verdicts.Changed(ready, 9001));     // changed long after the last log
+    assert(!verdicts.Changed(noproof, 11000)); // 1999 ms after the last log
+    assert(verdicts.Changed(noproof, 11001));  // 2000 ms after it
+    assert(!verdicts.Changed(ready, 11500));   // too soon again
+    assert(!verdicts.Changed(noproof, 12000)); // back to the logged reason: nothing to log
+    assert(!verdicts.Changed(ready, 5));       // the clock went backwards: suppressed
 }

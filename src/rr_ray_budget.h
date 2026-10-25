@@ -86,7 +86,7 @@ inline Lists Prove(const std::array<View, ListCount> &views, unsigned w, unsigne
         r.entries[lobe] = (views[Lobe1 + lobe].bytes - ListHeader) / EntryBytes;
     r.pixel_entries = views[PixelList].bytes / PixelEntryBytes;
     if (r.pixel_entries < std::uint64_t(w) * h)
-        r.entries[0] = std::min(r.entries[0], r.pixel_entries);
+        r.entries[0] = (std::min)(r.entries[0], r.pixel_entries);
     return r;
 }
 // Cap for a lobe's raised target, in rays per pixel: min(MaxTarget, Fill * entries / (w*h)); 0 if
@@ -94,7 +94,7 @@ inline Lists Prove(const std::array<View, ListCount> &views, unsigned w, unsigne
 inline float Cap(std::uint64_t entries, unsigned w, unsigned h) {
     if (!entries || !w || !h)
         return 0;
-    return float(std::min(MaxTarget, Fill * double(entries) / (double(w) * h)));
+    return float((std::min)(MaxTarget, Fill * double(entries) / (double(w) * h)));
 }
 // Same rule the GPU applies (the shader uses a shared copy in src/rr_vrrt_target.h): only a
 // positive target below the cap is raised, to min(target * scale, cap); never lowered. Zero,
@@ -102,7 +102,7 @@ inline float Cap(std::uint64_t entries, unsigned w, unsigned h) {
 inline float Raised(float target, float scale, float cap) {
     if (!(target > 0 && target < cap && scale > 1))
         return target;
-    return std::min(target * scale, cap);
+    return (std::min)(target * scale, cap);
 }
 inline std::string ViewText(const View &v) {
     if (v.binding == Binding::Root)
@@ -200,10 +200,10 @@ class Monitor {
             Lobe &l = window.lobes[lobe];
             if (area > 0) {
                 l.rays += s.expected[lobe] / area;
-                l.worst = std::max(l.worst, s.worst[lobe] / area);
+                l.worst = (std::max)(l.worst, s.worst[lobe] / area);
             }
             if (s.entries[lobe]) {
-                l.fill = std::max(l.fill, s.expected[lobe] / double(s.entries[lobe]));
+                l.fill = (std::max)(l.fill, s.expected[lobe] / double(s.entries[lobe]));
                 if (area > 0)
                     l.capacity = double(s.entries[lobe]) / area;
             }
