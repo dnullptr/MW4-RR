@@ -34,8 +34,10 @@ inline constexpr std::uint64_t ListHeader = 144, EntryBytes = 4, PixelEntryBytes
 // The governor stores NegativeLimit for a raised lobe's threshold below it (INT_MIN included).
 // From there up, positive thresholds included, a pixel gets at most 1 + max(raw - 16, 0) rays.
 inline constexpr int NegativeLimit = -16;
-// UnverifiedLimit: raised recordings in a row that retired without reader stats (Unverified()).
-inline constexpr unsigned ProofFrames = 120, TargetFrames = 4, UnverifiedLimit = 8;
+// UnverifiedLimit: raised recordings in a row that retired without reader stats (Decide waits);
+// UnverifiedStop: raised recordings without them since the last measured raised frame (a stop).
+inline constexpr unsigned ProofFrames = 120, TargetFrames = 4, UnverifiedLimit = 8,
+                          UnverifiedStop = 32;
 // The largest extent side a proof may have (D3D12's texture limit), and the most raw rays a pixel
 // can ask for (raw - 15 for an 8-bit raw code): the reader's 32-bit sums must hold W*H of them.
 inline constexpr std::uint32_t MaxExtent = 16384;
@@ -74,7 +76,7 @@ enum class Why : unsigned {
     Memory,
     Reconfigure,
     GovernorCache,
-    // Sticky stops from here on.
+    // Sticky stops from here on (Unverified is also one, from UnverifiedStop on).
     Governor,
     PatchMismatch,
     ListsAfterArming,
@@ -181,6 +183,10 @@ struct Lists {
 inline bool Usable(const Lists &l) noexcept {
     return l.why == Why::None && l.w && l.h && l.w <= MaxExtent && l.h <= MaxExtent;
 }
+// The identity of a streak of proofs: the extent and the apply's dispatch grid.
+inline bool SameExtent(const Lists &a, const Lists &b) noexcept {
+    return a.w == b.w && a.h == b.h && a.gx == b.gx && a.gy == b.gy;
+}
 // The private ray log the controller copies into (bytes; Completed::log word = byte / 4):
 //     0..15  resolve b1 register 2 (the game's per-lobe target .x/.y)  LogResolveTarget
 //    16..31  register 2 as our patched resolve executed it             LogExecuted
@@ -188,16 +194,23 @@ inline bool Usable(const Lists &l) noexcept {
 //    48..63  apply b1 register 2                                       LogApplyTarget
 //    64..79  apply b1 register 36 (.w)                                 LogApplySettings36
 //    80..95  apply b3 register 251 (.x)                                LogApplyScene251
-//    96..99  the recording's serial (controller only; the gate never reads it)
+//    96..99  the resolve's serial (controller only; the gate never reads it)
 //   100..107 per lobe x, the resolve's t0 at lobe << 16 (the sum of r over the pixels asking for
 //            r > 0 rays): the governor's input                         LogResolveStats
-//   108..111 unused
+//   108..111 the apply's serial (controller only)
 //   112..127 apply b3 register 253 (.x: where the readers' second list segment starts)
 //                                                                      LogApplyScene253
 inline constexpr unsigned LogWords = 32;
 inline constexpr unsigned LogResolveTarget = 1, LogExecuted = 2, LogResolveScene = 4,
                           LogApplyTarget = 8, LogApplySettings36 = 16, LogApplyScene251 = 32,
                           LogResolveStats = 64, LogApplyScene253 = 128;
+// What a plan armed, for checking the frames it raised: the extent, each list's capacity (both
+// lobes), the margin of each raised lobe, and the u3 and u2 bytes Decide checked.
+struct Armed {
+    std::uint32_t w{}, h{};
+    std::array<std::uint64_t, 2> capacity{}, margin{};
+    std::uint64_t pixels{}, counter{};
+};
 // A retired recording, as the controller reports it to Gate::Complete and Summary::Completed.
 struct Completed {
     // The reader's readback of this recording; a raised recording without one is reported with
@@ -209,9 +222,24 @@ struct Completed {
     // Lobe masks: raised by this recording's patch; raised in the Budget its apply read.
     unsigned patched{}, budget{};
     std::array<std::uint32_t, 2> written{}; // Plan::bits of the patch
-    std::array<std::uint64_t, 2> margin{};  // Plan::margin of the plan that raised the frame
+    // Plan::armed of the plan whose governor wrote the raised Budget this recording's apply read
+    // (the controller keeps it per Budget identity), else of this recording's own patch plan.
+    // A raised recording with none (w 0) stops the test.
+    rrraybudget::Armed armed;
 };
 // One copy of each per-frame formula, shared by Gate::Complete and Summary::Completed.
+// The lobes a recording raised: by its patch, or through the raised Budget its apply read.
+inline unsigned RaisedLobes(const Completed &c) noexcept {
+    return (c.patched | c.budget) & 3;
+}
+// The reader counted the frame: when it runs it counts every pixel of the extent once per lobe,
+// not-requested ones included, so a reader that returned early leaves both histograms zero.
+inline bool Counted(const rrdensity::Frame &f) noexcept {
+    for (unsigned i = 0; i < 2 * rrdensity::Buckets; ++i)
+        if (f[i])
+            return true;
+    return false;
+}
 // The requested pixels of a lobe (inverse rate 1..16).
 inline std::uint64_t Requested(const rrdensity::Frame &f, unsigned lobe) noexcept {
     std::uint64_t pixels = 0;
@@ -239,8 +267,8 @@ inline const Lists &FrameLists(const Completed &c, const Lists &last) noexcept {
     return Usable(c.lists) ? c.lists : last;
 }
 // What Decide armed. The controller writes `bits` into register 2 of its b1 copy and, after the
-// game's 608 bytes, the governor's constants (mask, headroom[0], headroom[1]); after recording the
-// patch it calls Gate::Patched(plan) and keeps `bits` and `margin` for the Completed it reports.
+// game's 608 bytes, the governor's constants (mask, headroom[0], headroom[1]); it keeps `bits` for
+// the Completed of the patched recording and `armed` for every recording this plan raised.
 struct Plan {
     unsigned mask{}; // raised lobes
     std::array<float, 2> native{}, target{};
@@ -248,9 +276,9 @@ struct Plan {
     // Per raised lobe capacity - W*H - ConsumerSlack, saturated to 32 bits: the governor sets the
     // threshold to 17 when this frame's x exceeds it. 0 for a lobe not raised.
     std::array<std::uint32_t, 2> headroom{};
-    std::uint32_t w{}, h{};                  // the armed extent
-    std::array<std::uint64_t, 2> capacity{}; // each list's (both lobes)
-    std::array<std::uint64_t, 2> margin{};   // Gate::Margin per raised lobe, else 0
+    // Set whenever a lobe is raised (else all 0): the extent, the capacity of both lobes,
+    // Gate::Margin of each raised lobe, the streak's smallest u3 and u2 at this Decide.
+    rrraybudget::Armed armed;
     Why why = Why::Mode;
 };
 class Gate {
@@ -274,28 +302,27 @@ class Gate {
     std::array<std::uint32_t, 2> target_bits{};
     unsigned target_streak{};
     bool vrrt_enabled{};
-    unsigned stats_streak{};   // frames whose copied x covered the reader's raw rays (both lobes)
-    unsigned remap_frames{};   // frames at this extent that copied cb3 register 253
-    std::uint32_t remap_min{}; // its smallest nonzero .x (0: none seen)
-    unsigned unverified{};     // raised recordings in a row retired without reader stats
-    // What the last Patched plan armed (the extent is 0x0 before the first).
-    std::uint32_t armed_w{}, armed_h{};
-    std::array<std::uint64_t, 2> armed_capacity{};
-    std::uint64_t armed_pixels{}, armed_counter{};
+    unsigned stats_streak{};     // frames whose copied x covered the reader's raw rays (both lobes)
+    unsigned remap_frames{};     // frames at this extent that copied cb3 register 253
+    std::uint32_t remap_min{};   // its smallest nonzero .x (0: none seen)
+    unsigned unverified{};       // raised recordings in a row retired without reader stats
+    unsigned unverified_since{}; // ... since the last measured raised frame
     Why stop = Why::None;
 
-    // A raised frame whose own apply did not use the lists armed: an unproven or missing proof,
-    // another extent, a raised lobe's list or the counter smaller than at arming (the pixel list
-    // for lobe 1), or a second segment that starts below a raised lobe's armed capacity.
-    bool ChangedAfterArming(const Completed &c, unsigned raised) const noexcept {
+    // A raised frame whose own apply did not use the lists its plan armed (c.armed): no snapshot,
+    // an unproven or missing proof, another extent, a raised lobe's list or the counter smaller
+    // than at arming (the pixel list for lobe 1), or a second segment that starts below a raised
+    // lobe's armed capacity.
+    static bool ChangedAfterArming(const Completed &c, unsigned raised) noexcept {
         const auto &own = c.lists;
-        if (own.why != Why::None || !armed_w || own.w != armed_w || own.h != armed_h ||
-            own.v[3].bytes < armed_counter || ((raised & 1) && own.v[2].bytes < armed_pixels))
+        const auto &armed = c.armed;
+        if (!armed.w || own.why != Why::None || own.w != armed.w || own.h != armed.h ||
+            own.v[3].bytes < armed.counter || ((raised & 1) && own.v[2].bytes < armed.pixels))
             return true;
         const bool remap = (c.logged & LogApplyScene253) && c.log[28];
         for (unsigned l = 0; l < 2; ++l)
             if ((raised >> l & 1) &&
-                (own.Entries(l) < armed_capacity[l] || (remap && c.log[28] < armed_capacity[l])))
+                (own.Entries(l) < armed.capacity[l] || (remap && c.log[28] < armed.capacity[l])))
                 return true;
         return false;
     }
@@ -307,8 +334,7 @@ class Gate {
         Lists l = proof;
         if (l.why == Why::None && !Usable(l))
             l.why = Why::ListsUnproven; // an empty or impossible extent proves nothing
-        const bool same =
-            streak && l.w == last.w && l.h == last.h && l.gx == last.gx && l.gy == last.gy;
+        const bool same = streak && SameExtent(l, last);
         if (l.why != Why::None)
             streak = 0;
         else if (same) {
@@ -347,21 +373,26 @@ class Gate {
         return lobe > 1 ? 0 : (std::min)(cur.requested[lobe], prev.requested[lobe]);
     }
     // A list's usable entries: the smallest of the streak, and no more than where the readers'
-    // second segment starts when one was seen (indices from there on are remapped into it).
+    // second segment starts when one was seen (indices from there on are remapped into it). 0
+    // while the streak is broken.
     std::uint64_t Capacity(unsigned lobe) const noexcept {
-        if (lobe > 1)
+        if (lobe > 1 || last.why != Why::None)
             return 0;
         return remap_min ? (std::min)(min_entries[lobe], std::uint64_t(remap_min))
                          : min_entries[lobe];
     }
-    // Arming capacity: a ray per pixel of the extent plus the margin plus one 512-wide consumer
-    // group, a 4-byte counter (u2), and for lobe 1, whose pixel list u3 is, 4 bytes per pixel.
+    // The entries a raised lobe needs: a ray per pixel of the extent, the margin and one 512-wide
+    // consumer group.
+    std::uint64_t Need(unsigned lobe) const noexcept {
+        return last.Pixels() + Margin(lobe) + ConsumerSlack;
+    }
+    // Arming capacity: Need, a 4-byte counter (u2), and for lobe 1, whose pixel list u3 is,
+    // 4 bytes per pixel.
     bool Hard(unsigned lobe) const noexcept {
         if (lobe > 1 || last.why != Why::None)
             return false;
-        const auto pixels = last.Pixels();
-        return Capacity(lobe) >= pixels + Margin(lobe) + ConsumerSlack && min_counter >= 4 &&
-               (lobe || min_pixels >= PixelEntryBytes * pixels);
+        return Capacity(lobe) >= Need(lobe) && min_counter >= 4 &&
+               (lobe || min_pixels >= PixelEntryBytes * last.Pixels());
     }
     bool Stop(Why w) noexcept {
         if (w == Why::None || stop != Why::None)
@@ -379,19 +410,29 @@ class Gate {
         return streak;
     }
     // The controller calls this when a raised recording (patched, or its apply read a raised
-    // Budget) retires without reader stats, so no Complete covers it. From UnverifiedLimit in a row
-    // Decide waits; the next Complete ends the run.
-    void Unverified() noexcept {
+    // Budget) retires without reader stats, so no Complete covers it; Complete counts a raised
+    // frame the reader did not count the same way. From UnverifiedLimit in a row Decide waits,
+    // until the next measured frame. The UnverifiedStop-th since the last measured raised frame
+    // stops the test: returns Why::Unverified when this call newly stops it, else Why::None.
+    Why Unverified() noexcept {
         if (unverified < UnverifiedLimit)
             ++unverified;
+        if (unverified_since < UnverifiedStop)
+            ++unverified_since;
+        return unverified_since >= UnverifiedStop && Stop(Why::Unverified) ? Why::Unverified
+                                                                           : Why::None;
     }
     // Every reported slot's frame. Returns the reason when this frame newly stops the test,
     // otherwise Why::None.
     Why Complete(const Completed &c) noexcept {
         using namespace rrdensity;
-        unverified = 0;
         const auto &f = c.rates;
-        const unsigned raised = (c.patched | c.budget) & 3;
+        const unsigned raised = RaisedLobes(c);
+        // A frame the reader did not count measures nothing: it changes no evidence, streak or
+        // count, and a raised one is not verified.
+        if (!Counted(f))
+            return raised ? Unverified() : Why::None;
+        unverified = 0;
         auto fail = [&](Why w) { return Stop(w) ? w : Why::None; };
         for (unsigned l = 0; l < 2; ++l) {
             if ((c.budget >> l & 1) && !SafeThreshold(int(f[Limits + 2 * l])))
@@ -408,8 +449,9 @@ class Gate {
                 if ((raised >> l & 1) && (c.logged & LogResolveStats) && !StatsCover(c, l))
                     return fail(Why::StatsMismatch);
             for (unsigned l = 0; l < 2; ++l)
-                if ((raised >> l & 1) && Scheduled(f, l) + ConsumerSlack > armed_capacity[l])
+                if ((raised >> l & 1) && Scheduled(f, l) + ConsumerSlack > c.armed.capacity[l])
                     return fail(Why::Overflow);
+            unverified_since = 0; // a measured raised frame that passed every check
         }
         const auto &lists = FrameLists(c, last);
         if (lists.w != ew || lists.h != eh) {
@@ -470,8 +512,7 @@ class Gate {
         if (now < proven_at || now - proven_at > FreshMs)
             return refuse(Why::ListsStale);
         if (recording &&
-            (recording->why != Why::None || recording->w != last.w || recording->h != last.h ||
-             recording->gx != last.gx || recording->gy != last.gy ||
+            (recording->why != Why::None || !SameExtent(*recording, last) ||
              recording->Entries(0) < min_entries[0] || recording->Entries(1) < min_entries[1] ||
              recording->v[2].bytes < min_pixels || recording->v[3].bytes < min_counter))
             return refuse(Why::ListsChanged);
@@ -512,31 +553,23 @@ class Gate {
         }
         p.why = p.mask ? Why::None : first;
         if (p.mask) {
-            p.w = last.w;
-            p.h = last.h;
+            auto &armed = p.armed;
+            armed.w = last.w;
+            armed.h = last.h;
+            armed.pixels = min_pixels;
+            armed.counter = min_counter;
             for (unsigned l = 0; l < 2; ++l) {
-                p.capacity[l] = Capacity(l);
+                armed.capacity[l] = Capacity(l);
                 if (!(p.mask >> l & 1))
                     continue;
                 // Hard(l) holds, so the capacity covers the pixels and the slack.
                 const auto used = pixels + ConsumerSlack;
-                const auto room = p.capacity[l] > used ? p.capacity[l] - used : 0;
+                const auto room = armed.capacity[l] > used ? armed.capacity[l] - used : 0;
                 p.headroom[l] = std::uint32_t((std::min)(room, std::uint64_t(0xFFFFFFFFu)));
-                p.margin[l] = Margin(l);
+                armed.margin[l] = Margin(l);
             }
         }
         return p;
-    }
-    // Call right after recording the patch of the Decide that made `p` (no Apply in between): the
-    // completed frames of raised recordings are checked against what it armed.
-    void Patched(const Plan &p) noexcept {
-        if (!p.mask)
-            return;
-        armed_w = p.w;
-        armed_h = p.h;
-        armed_capacity = p.capacity;
-        armed_pixels = min_pixels;
-        armed_counter = min_counter;
     }
 };
 // An indirect draw or dispatch that read one of the ray lists: `lobe` is 0 or 1, `type` is
@@ -634,22 +667,31 @@ class Summary {
         std::array<std::uint32_t, 2> written{};
         unsigned written_mask{}; // the lobes the last patched frame raised
         std::uint32_t settings36{}, scene251{}, scene253{};
+        std::uint32_t seed{};    // register 251 .y & 4095: the apply's noise seed
+        unsigned seed_changes{}; // frames whose seed differs from the copy before them
+        unsigned uncounted{};    // frames the reader did not count
         bool have_native{}, have_apply{}, have_scene{}, have_settings36{}, have_scene251{},
-            have_scene253{};
+            have_seed{}, have_scene253{};
         std::array<double, 2> fill{};
         std::array<bool, 2> have_fill{};
         std::array<unsigned, 2> raw_rays_max{}, margin_exceeded{};
         std::array<Range<int>, 2> threshold;
     } w;
-    rrraybudget::Lists last; // the last apply's proof, kept across windows
+    rrraybudget::Lists last;   // the last apply's proof, kept across windows
+    std::uint32_t last_seed{}; // the seed of the last frame that copied register 251, ever
+    bool have_last_seed{};
     std::uint64_t since{};
     bool started{};
     unsigned warned{};
 
-    // One line of at most N-1 characters; what does not fit is cut.
+    // One line of at most N-1 characters, made of whole pieces (one per Add): the first piece that
+    // does not fit, with room left for the marker, ends the line with " ...".
     template <std::size_t N> class Line {
+        static constexpr std::size_t Marker = 4; // " ..."
+        static_assert(N > Marker + 1);
         char text[N]{};
         std::size_t length{};
+        bool cut{};
 
       public:
         // clang-format off
@@ -658,14 +700,19 @@ class Summary {
 #endif
         void Add(const char *format, ...) noexcept {
             // clang-format on
-            if (length + 1 >= N)
+            if (cut)
                 return;
             va_list args;
             va_start(args, format);
             const int n = std::vsnprintf(text + length, N - length, format, args);
             va_end(args);
-            if (n > 0)
-                length = (std::min)(length + std::size_t(n), N - 1);
+            if (n >= 0 && length + std::size_t(n) + Marker < N) {
+                length += std::size_t(n);
+                return;
+            }
+            cut = true; // length + Marker < N still holds: the marker always fits
+            std::snprintf(text + length, N - length, " ...");
+            length += Marker;
         }
         void Put(const char *literal) noexcept {
             Add("%s", literal);
@@ -757,11 +804,15 @@ class Summary {
             c.Add(" scene251.x=0x%x", unsigned(w.scene251));
         else
             c.Put(" scene251.x=n/a");
+        if (w.have_seed)
+            c.Add(" scene251.y=%u changes=%u", unsigned(w.seed), w.seed_changes);
+        else
+            c.Add(" scene251.y=n/a changes=%u", w.seed_changes);
         if (w.have_scene253)
             c.Add(" scene253.x=%u", unsigned(w.scene253));
         else
             c.Put(" scene253.x=n/a");
-        c.Add(" stats=%u/%u", w.stats.yes, w.stats.all);
+        c.Add(" stats=%u/%u uncounted=%u", w.stats.yes, w.stats.all, w.uncounted);
         c.Add(" | consumers lobe1=%u lobe2=%u dispatch=%u rays=%u other=%u", w.lobe[0], w.lobe[1],
               w.dispatch, w.rays, w.other);
         if (w.have_consumer)
@@ -793,11 +844,11 @@ class Summary {
               unsigned(last.gx), unsigned(last.gy), U(area));
         for (unsigned l = 0; l < 2; ++l) {
             const auto &list = last.v[l];
-            const auto entries = last.Entries(l);
-            c.Add(" | lobe%u u%u=%s %lluB entries=%llu (%.3fx area)", l + 1, 5 + l,
-                  BindingName(list.binding), U(list.bytes), U(entries),
-                  area ? double(entries) / double(area) : 0.0);
-            c.Add(" need=%llu tier=%s worstFill=", U(area + gate.Margin(l) + ConsumerSlack),
+            const auto capacity = gate.Capacity(l); // what the gate arms with, against its need
+            c.Add(" | lobe%u u%u=%s %lluB capacity=%llu (%.3fx area)", l + 1, 5 + l,
+                  BindingName(list.binding), U(list.bytes), U(capacity),
+                  area ? double(capacity) / double(area) : 0.0);
+            c.Add(" need=%llu tier=%s worstFill=", U(gate.Need(l)),
                   gate.Hard(l) ? "hard" : "small");
             if (w.have_fill[l])
                 c.Add("%.1f%%", w.fill[l]);
@@ -871,7 +922,7 @@ class Summary {
     void Completed(const rrraybudget::Completed &c) noexcept {
         using namespace rrdensity;
         const auto &f = c.rates;
-        const unsigned raised = (c.patched | c.budget) & 3;
+        const unsigned raised = RaisedLobes(c);
         if (c.patched) {
             bool verified = true;
             for (unsigned l = 0; l < 2; ++l)
@@ -892,7 +943,7 @@ class Summary {
         if (c.logged & LogResolveScene) {
             w.scene = {std::bit_cast<float>(c.log[8]), std::bit_cast<float>(c.log[9])};
             w.have_scene = true;
-            w.scene_match.Add(lists.w && lists.h && w.scene[0] == float(lists.w) &&
+            w.scene_match.Add(Usable(lists) && w.scene[0] == float(lists.w) &&
                               w.scene[1] == float(lists.h));
         }
         if (c.logged & LogApplyTarget) {
@@ -906,19 +957,27 @@ class Summary {
         if (c.logged & LogApplyScene251) {
             w.scene251 = c.log[20];
             w.have_scene251 = true;
+            const std::uint32_t seed = c.log[21] & 4095;
+            w.seed_changes += have_last_seed && seed != last_seed;
+            w.seed = last_seed = seed;
+            w.have_seed = have_last_seed = true;
         }
-        if (c.logged & LogResolveStats)
-            w.stats.Add(StatsCover(c, 0) && StatsCover(c, 1));
         if (c.logged & LogApplyScene253) {
             w.scene253 = c.log[28];
             w.have_scene253 = true;
         }
+        // The rest is measured by the reader.
+        if (!Counted(f)) {
+            ++w.uncounted;
+            return;
+        }
+        if (c.logged & LogResolveStats)
+            w.stats.Add(StatsCover(c, 0) && StatsCover(c, 1));
         for (unsigned l = 0; l < 2; ++l) {
             w.raw_rays_max[l] = (std::max)(w.raw_rays_max[l], f[RawRays + l]);
-            w.margin_exceeded[l] += (raised >> l & 1) && f[RawRays + l] > c.margin[l];
-            if (const int t = int(f[Limits + 2 * l]); t != INT_MIN)
-                w.threshold[l].Add(t);
-            if (lists.why != Why::None || !lists.w || !lists.h || !lists.Entries(l))
+            w.margin_exceeded[l] += (raised >> l & 1) && f[RawRays + l] > c.armed.margin[l];
+            w.threshold[l].Add(int(f[Limits + 2 * l])); // INT_MIN too (the reader cannot model it)
+            if (!Usable(lists) || !lists.Entries(l))
                 continue;
             w.fill[l] =
                 (std::max)(w.fill[l], 100.0 * double(Scheduled(f, l)) / double(lists.Entries(l)));

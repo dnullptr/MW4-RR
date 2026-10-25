@@ -24,6 +24,7 @@ class Tracker {
     std::array<std::uint32_t, Extra - Limits> last{};
     std::array<std::uint64_t, 4> extra{}; // extra rays (lobe 1, 2), raw requested rays (1, 2)
     std::array<std::uint32_t, 2> raw_max{};
+    std::uint64_t unsupported{}; // requested pixels the reader could not model (both lobes)
     unsigned frames{};
     std::uint64_t since{};
     bool started{};
@@ -40,6 +41,7 @@ class Tracker {
             extra[i] += f[Extra + i];
         for (unsigned i = 0; i < raw_max.size(); ++i)
             raw_max[i] = (std::max)(raw_max[i], f[RawMax + i]);
+        unsupported += f[Unsupported];
     }
     // Expected rays per requested pixel per frame for one lobe, 0..1.
     double Density(unsigned lobe) const {
@@ -98,8 +100,10 @@ class Tracker {
                     static_cast<unsigned long long>(extra[lobe]),
                     static_cast<unsigned long long>(extra[2 + lobe]), unsigned(raw_max[lobe]));
             if (at > 0 && at < int(sizeof(text)))
-                std::snprintf(text + at, sizeof(text) - at, " | enabled=%d promote=%d clamp=%d",
-                              int(last[4]), int(last[5]), int(last[6]));
+                std::snprintf(text + at, sizeof(text) - at,
+                              " | enabled=%d promote=%d clamp=%d | unsupported=%llu", int(last[4]),
+                              int(last[5]), int(last[6]),
+                              static_cast<unsigned long long>(unsupported));
             out = text;
         }
         *this = {};
