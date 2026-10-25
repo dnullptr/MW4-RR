@@ -8,11 +8,12 @@ namespace rrdensity {
 // Layout written by shaders/rr_vrrt_probability.hlsl after the gate's 16 bytes:
 // per lobe 17 pixel counts by inverse rate (0 = not requested, 16 = 16 or more),
 // then lobe 1 and lobe 2 budget threshold/boundary, then enabled/promote/clamp, then per lobe the
-// extra rays (code above 16 after the budget), the raw multi-ray potential (raw code above 16
-// before it) and the largest raw code.
+// extra rays (code above 16 after the budget), the raw requested rays (over requested pixels with a
+// raw code of 16 or more, the sum of raw - 15: the rays they ask for before the budget) and the
+// largest raw code, then the requested pixels of both lobes the reader could not model.
 inline constexpr unsigned Buckets = 17, Offset = 64, Limits = 2 * Buckets, Settings1 = Limits + 4,
-                          Extra = Settings1 + 3, RawExtra = Extra + 2, RawMax = RawExtra + 2,
-                          Count = RawMax + 2;
+                          Extra = Settings1 + 3, RawRays = Extra + 2, RawMax = RawRays + 2,
+                          Unsupported = RawMax + 2, Count = Unsupported + 1;
 static_assert(Offset + Limits * 4 == 200 && Offset + Extra * 4 == 228 && Offset + Count * 4 <= 256,
               "mirror shaders/rr_vrrt_probability.hlsl RateLimits/RateExtra");
 using Frame = std::array<std::uint32_t, Count>;
@@ -21,7 +22,7 @@ using Frame = std::array<std::uint32_t, Count>;
 class Tracker {
     std::array<std::uint64_t, 2 * Buckets> pixels{};
     std::array<std::uint32_t, Extra - Limits> last{};
-    std::array<std::uint64_t, 4> extra{}; // extra rays (lobe 1, 2), raw multi-ray potential (1, 2)
+    std::array<std::uint64_t, 4> extra{}; // extra rays (lobe 1, 2), raw requested rays (1, 2)
     std::array<std::uint32_t, 2> raw_max{};
     unsigned frames{};
     std::uint64_t since{};
@@ -90,7 +91,7 @@ class Tracker {
                     text + at, sizeof(text) - at,
                     " | lobe%u raysPerPixel=%.3f full=%.1f%% 1/2-1/4=%.1f%% 1/5-1/8=%.1f%% "
                     "1/9-1/15=%.1f%% 1/16+=%.1f%% none=%.1f%% threshold=%d boundary=%d "
-                    "raysPerScreenPixel=%.3f extraRays=%llu rawExtra=%llu rawMax=%u",
+                    "raysPerScreenPixel=%.3f extraRays=%llu rawRays=%llu rawMax=%u",
                     lobe + 1, Density(lobe), Share(lobe, 1, 2), Share(lobe, 2, 5),
                     Share(lobe, 5, 9), Share(lobe, 9, 16), Share(lobe, 16, 17), Share(lobe, 0, 1),
                     int(last[lobe * 2]), int(last[lobe * 2 + 1]), ScreenRays(lobe),

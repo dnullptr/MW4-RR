@@ -48,19 +48,21 @@ static_assert(!rrsettings::HotkeyToggles(true, true, false, true));
 static_assert(!rrsettings::HotkeyToggles(true, false, true, true));
 static_assert(!rrsettings::HotkeyToggles(true, false, false, false));
 static_assert(!rrsettings::HotkeyToggles(false, false, false, true));
-// More rays: the readback frame appends the extra rays (bytes 228, 232), the raw multi-ray
-// potential (236, 240) and the largest raw codes (244, 248); the stats buffer ends at byte 256.
+// More rays: the readback frame appends the extra rays (bytes 228, 232), the raw requested rays
+// (236, 240), the largest raw codes (244, 248) and the requested pixels the reader could not model
+// (252); the stats buffer ends at byte 256.
 static_assert(rrdensity::Limits == 34 && rrdensity::Settings1 == 38 && rrdensity::Extra == 41 &&
-              rrdensity::RawExtra == 43 && rrdensity::RawMax == 45 && rrdensity::Count == 47);
+              rrdensity::RawRays == 43 && rrdensity::RawMax == 45 && rrdensity::Unsupported == 47 &&
+              rrdensity::Count == 48);
 static_assert(rrdensity::Offset + 4 * rrdensity::Limits == 200 &&
               rrdensity::Offset + 4 * rrdensity::Extra == 228 &&
-              rrdensity::Offset + 4 * rrdensity::RawExtra == 236 &&
+              rrdensity::Offset + 4 * rrdensity::RawRays == 236 &&
               rrdensity::Offset + 4 * rrdensity::RawMax == 244 &&
-              rrdensity::Offset + 4 * rrdensity::Count == 252 &&
-              rrdensity::Offset + 4 * rrdensity::Count <= 256);
+              rrdensity::Offset + 4 * rrdensity::Unsupported == 252 &&
+              rrdensity::Offset + 4 * rrdensity::Count == 256);
 
 // The ray budget test: the option steps are fixed, unknown values read as Off, and the numbers the
-// gate relies on are pinned (list layout of the native apply, the governor's threshold range).
+// gate relies on are pinned (list layout of the native apply, the governor's threshold bound).
 static_assert(rrraybudget::Off == 0 && rrraybudget::Times15 == 1 && rrraybudget::Times2 == 2 &&
               rrraybudget::OnePerPixel == 3 && rrraybudget::Count == 4);
 static_assert(rrraybudget::Valid(rrraybudget::OnePerPixel) == rrraybudget::OnePerPixel &&
@@ -80,66 +82,169 @@ static_assert(rrraybudget::Resolve == 0x293995352d1f8220ull &&
 static_assert(rrraybudget::ListHeader == 144 && rrraybudget::EntryBytes == 4 &&
               rrraybudget::PixelEntryBytes == 4 && rrraybudget::ConsumerSlack == 512 &&
               rrraybudget::FreshMs == 500 && rrraybudget::RetryMs == 1000);
-static_assert(rrraybudget::PositiveLimit == 17 && rrraybudget::NegativeLimit == -16 &&
-              rrraybudget::ProofFrames == 120 && rrraybudget::TargetFrames == 4 &&
-              rrraybudget::Gate::BlockFrames == 300);
-static_assert(rrraybudget::SafeThreshold(17) && !rrraybudget::SafeThreshold(18) &&
-              rrraybudget::SafeThreshold(-16) && !rrraybudget::SafeThreshold(-17) &&
-              rrraybudget::SafeThreshold(0) &&
-              rrraybudget::SafeThreshold((std::numeric_limits<int>::min)()));
-// Every reason has a text and the table ends where the enum does.
-static_assert(std::string_view(rrraybudget::Text(rrraybudget::Why::None)) == "none" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::Mode)) == "test off" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::ListsStable)) ==
-                  "waiting for 120 identical ray-list proofs" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::Reconfigure)) ==
-                  "RR is reconfiguring" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::Governor)) ==
-                  "controller threshold beyond the one-ray bound after the governor" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::Exception)) ==
-                  "internal error" &&
-              std::string_view(rrraybudget::Text(rrraybudget::Why::Count)) == "unknown");
+static_assert(rrraybudget::NegativeLimit == -16 && rrraybudget::ProofFrames == 120 &&
+              rrraybudget::TargetFrames == 4 && rrraybudget::UnverifiedLimit == 8 &&
+              rrraybudget::MaxExtent == 16384 && rrraybudget::Gate::BlockFrames == 300);
+// A threshold of -16 or more never adds a ray, positive ones included; INT_MIN (|t| wraps) would.
+static_assert(rrraybudget::SafeThreshold(-16) && !rrraybudget::SafeThreshold(-17) &&
+              rrraybudget::SafeThreshold(0) && rrraybudget::SafeThreshold(17) &&
+              rrraybudget::SafeThreshold(18) && rrraybudget::SafeThreshold(300) &&
+              rrraybudget::SafeThreshold((std::numeric_limits<int>::max)()) &&
+              !rrraybudget::SafeThreshold((std::numeric_limits<int>::min)()) &&
+              !rrraybudget::SafeThreshold((std::numeric_limits<int>::min)() + 1));
+// The private ray log: 32 words, one bit per copy the controller recorded into it.
+static_assert(rrraybudget::LogWords == 32 &&
+              sizeof(rrraybudget::Completed::log) == 4 * rrraybudget::LogWords);
+static_assert(rrraybudget::LogResolveTarget == 1 && rrraybudget::LogExecuted == 2 &&
+              rrraybudget::LogResolveScene == 4 && rrraybudget::LogApplyTarget == 8 &&
+              rrraybudget::LogApplySettings36 == 16 && rrraybudget::LogApplyScene251 == 32 &&
+              rrraybudget::LogResolveStats == 64 && rrraybudget::LogApplyScene253 == 128);
 
 namespace rb = rrraybudget;
+constexpr int IntMin = (std::numeric_limits<int>::min)(),
+              IntMax = (std::numeric_limits<int>::max)();
 
-// The governor's premise: with a raised lobe's threshold clamped to [NegativeLimit, PositiveLimit]
-// the budget transform never adds a ray, so a pixel gets 1 + max(raw - 16, 0) rays at most.
-// Enumerated over every threshold, request, flag combination and tile ring position.
-static void GovernorBounds() {
-    long checked = 0, supported = 0;
-    unsigned worst = 0;
-    for (int threshold = rb::NegativeLimit; threshold <= rb::PositiveLimit; ++threshold)
-        for (unsigned high : {0u, 0xFF00u})
-            for (unsigned raw = 0; raw < 256; ++raw)
-                for (int flags = 0; flags < 16; ++flags) {
-                    const unsigned request = high | raw;
-                    if (request == 0xFFFFu) // not requested
-                        continue;
-                    const int enabled = flags & 1, promote = flags >> 1 & 1, clamp = flags >> 2 & 1,
-                              inner = flags >> 3 & 1;
-                    const auto r = rrvrrt::InverseRate(request, enabled, promote, clamp, threshold,
-                                                       inner ? -1 : 1, 0);
-                    ++checked;
-                    assert(r.raw == raw);
-                    if (!r.supported)
-                        continue;
-                    ++supported;
-                    assert(r.extra <= (raw > 16 ? raw - 16 : 0u));
-                    worst = (std::max)(worst, r.extra);
-                }
-    assert(checked == 34 * 2 * 256 * 16 - 34 * 16 && supported == checked);
-    assert(worst == 255 - 16); // only a raw code above 16 asks for more than one ray
-    // Outside the range the transform itself creates extra rays.
-    assert(rrvrrt::InverseRate(0xFF00u | 5, 1, 1, 1, -17, -1, 0).extra ==
-           1); // promote, inner pixel
-    assert(rrvrrt::InverseRate(0xFF00u | 30, 1, 0, 1, 18, -1, 0).extra == 1); // clamp, inner pixel
-    assert(rrvrrt::InverseRate(0xFF00u | 30, 1, 0, 1, 17, -1, 0).extra == 0);
-    assert(rrvrrt::InverseRate(0xFF00u | 5, 1, 1, 1, -16, -1, 0).extra == 0 &&
-           rrvrrt::InverseRate(0xFF00u | 5, 1, 1, 1, -16, -1, 0).denominator == 1);
-    assert(!rb::SafeThreshold(-17) && !rb::SafeThreshold(18));
+// Every reason's text (logged and shown verbatim) and key (the 10 s line's `refused` list), one
+// assertion per reason, so that swapping two entries does not compile.
+static constexpr bool Pinned(rb::Why why, std::string_view text, std::string_view key) {
+    return rb::Text(why) == text && rb::keys[unsigned(why)] == key;
+}
+static_assert(Pinned(rb::Why::None, "none", "none"));
+static_assert(Pinned(rb::Why::Mode, "test off", "mode"));
+static_assert(Pinned(rb::Why::Stopped, "stopped", "stopped"));
+static_assert(Pinned(rb::Why::Unverified, "raised frames were not verified", "unverified"));
+static_assert(Pinned(rb::Why::Context, "binding tracker, copy context or state hooks unavailable",
+                     "context"));
+static_assert(Pinned(rb::Why::Shape, "controller dispatch is not 2x1x1", "shape"));
+static_assert(Pinned(rb::Why::Constants, "controller b1/b3 are not proven root constant buffers",
+                     "constants"));
+static_assert(Pinned(rb::Why::Heap, "controller constants are not in an upload heap", "heap"));
+static_assert(Pinned(rb::Why::BudgetBinding, "controller Budget u0 is not a proven table raw view",
+                     "budgetBinding"));
+static_assert(Pinned(rb::Why::BudgetIdentity,
+                     "controller writes a different Budget than the apply reads",
+                     "budgetIdentity"));
+static_assert(Pinned(rb::Why::Outside, "controller ran outside the RR guide recording", "outside"));
+static_assert(Pinned(rb::Why::AfterSR, "controller ran after RR recorded this frame", "afterSR"));
+static_assert(Pinned(rb::Why::Repeated, "controller ran twice in one recording", "repeated"));
+static_assert(Pinned(rb::Why::Ambiguous, "more than one RR recording on this command list",
+                     "ambiguous"));
+static_assert(Pinned(rb::Why::ListsUnproven, "ray lists not proven at the VRRT apply",
+                     "listsUnproven"));
+static_assert(Pinned(rb::Why::ListsRoot, "a ray list is a root UAV (no bounds checks)",
+                     "listsRoot"));
+static_assert(Pinned(rb::Why::ListsView, "a ray list is not a raw table buffer view", "listsView"));
+static_assert(Pinned(rb::Why::ListsOverlap, "ray list views overlap", "listsOverlap"));
+static_assert(Pinned(rb::Why::ListsSmall, "ray lists hold less than one ray per pixel plus margin",
+                     "listsSmall"));
+static_assert(Pinned(rb::Why::ListsStable, "waiting for 120 proven ray-list applies",
+                     "listsStable"));
+static_assert(Pinned(rb::Why::ListsStale, "no recent ray-list proof", "listsStale"));
+static_assert(Pinned(rb::Why::ListsChanged, "ray lists changed in this recording", "listsChanged"));
+static_assert(Pinned(rb::Why::Evidence, "waiting for 120 measured frames", "evidence"));
+static_assert(Pinned(rb::Why::VrrtOff, "the game's VRRT rate control is off", "vrrtOff"));
+static_assert(Pinned(rb::Why::Resolution, "render resolution too large for the ray counters",
+                     "resolution"));
+static_assert(Pinned(rb::Why::TargetUnknown, "the game's target is not known yet",
+                     "targetUnknown"));
+static_assert(Pinned(rb::Why::StatsUnverified,
+                     "the controller's ray statistics are not verified yet", "statsUnverified"));
+static_assert(Pinned(rb::Why::RemapUnknown, "the readers' second list segment is not known",
+                     "remapUnknown"));
+static_assert(Pinned(rb::Why::TargetRange, "the game's target is not in (0,1]", "targetRange"));
+static_assert(Pinned(rb::Why::AtCap, "already at the cap (1 ray per requested pixel)", "atCap"));
+static_assert(Pinned(rb::Why::Memory, "waiting for GPU memory", "memory"));
+static_assert(Pinned(rb::Why::Reconfigure, "RR is reconfiguring", "reconfigure"));
+static_assert(Pinned(rb::Why::GovernorCache, "governor cache full; waiting for reconfigure",
+                     "governorCache"));
+static_assert(Pinned(rb::Why::Governor,
+                     "controller threshold beyond the one-ray bound after the governor",
+                     "governor"));
+static_assert(Pinned(rb::Why::PatchMismatch, "private constants did not reach the controller",
+                     "patchMismatch"));
+static_assert(Pinned(rb::Why::ListsAfterArming, "ray lists changed after arming",
+                     "listsAfterArming"));
+static_assert(Pinned(rb::Why::Unsupported, "requested pixels the reader cannot model",
+                     "unsupported"));
+static_assert(Pinned(rb::Why::StatsMismatch, "the controller's ray statistics lag this frame",
+                     "statsMismatch"));
+static_assert(Pinned(rb::Why::Overflow,
+                     "scheduled rays came within 512 entries of a ray list's capacity",
+                     "overflow"));
+static_assert(Pinned(rb::Why::Pipeline, "governor pipeline could not be created", "pipeline"));
+static_assert(Pinned(rb::Why::Readback, "ray budget readback failed", "readback"));
+static_assert(Pinned(rb::Why::Exception, "internal error", "exception"));
+static_assert(unsigned(rb::Why::Exception) + 1 == unsigned(rb::Why::Count) &&
+              unsigned(rb::Why::Count) == 42 &&
+              std::string_view(rb::Text(rb::Why::Count)) == "unknown");
+
+// The governor's premise. A pixel gets no ray when not requested, 1 + extra rays at a code of 16 or
+// more (denominator 1) and at most one below (a 1/denominator chance).
+static unsigned Rays(const rrvrrt::Rate &r) {
+    return r.denominator == 0 ? 0u : r.denominator == 1 ? 1u + r.extra : 1u;
 }
 
-// A proven apply: dispatch groups cover the extent, every list holds `entries` entries.
+// The governor's rule for a raised lobe: a threshold below -16 (INT_MIN included) becomes -16.
+static int Governed(int threshold) {
+    return threshold < rb::NegativeLimit ? rb::NegativeLimit : threshold;
+}
+
+// At one threshold, every request (both high bytes, every raw byte; the game emits codes 0..31),
+// flag combination (enabled, promote, clamp) and tile ring position: a pixel never gets more than
+// 1 + max(raw - 16, 0) rays. Returns the number of cases; `worst` is the largest extra seen.
+static unsigned BoundedRays(int threshold, unsigned &worst) {
+    unsigned cases = 0;
+    for (unsigned high : {0u, 0xFF00u})
+        for (unsigned raw = 0; raw < 256; ++raw)
+            for (int flags = 0; flags < 16; ++flags) {
+                const unsigned request = high | raw;
+                if (request == 0xFFFFu) // not requested
+                    continue;
+                const int enabled = flags & 1, promote = flags >> 1 & 1, clamp = flags >> 2 & 1,
+                          inner = flags >> 3 & 1;
+                const auto r = rrvrrt::InverseRate(request, enabled, promote, clamp, threshold,
+                                                   inner ? -1 : 1, 0);
+                ++cases;
+                assert(r.supported && r.raw == raw);
+                assert(Rays(r) <= 1 + (raw > 16 ? raw - 16 : 0u));
+                worst = (std::max)(worst, r.extra);
+            }
+    return cases;
+}
+
+static void GovernorBounds() {
+    // Every threshold of -16 and above keeps the bound, positive ones included.
+    unsigned long cases = 0;
+    unsigned worst = 0;
+    for (int threshold = rb::NegativeLimit; threshold <= 300; ++threshold)
+        cases += BoundedRays(threshold, worst);
+    cases += BoundedRays(IntMax, worst);
+    assert(cases == 318ul * (2 * 256 * 16 - 16));
+    assert(worst == 255 - 16); // only a raw code above 16 asks for more than one ray
+    // The governor's rule brings every threshold into that range. Below it the transform adds rays
+    // (-17 promotes an inner pixel to 2) and INT_MIN cannot even be modelled (|t| wraps).
+    for (int t : {IntMin, IntMin + 1, -65536, -1000, -17, -16, 0, 17, 18, 300, IntMax}) {
+        assert(Governed(t) == (t < -16 ? -16 : t) && rb::SafeThreshold(Governed(t)));
+        BoundedRays(Governed(t), worst);
+    }
+    assert(Governed(IntMin) == -16 && Governed(-17) == -16 && Governed(-16) == -16);
+    assert(rrvrrt::InverseRate(0xFF00u | 5, 1, 1, 1, -17, -1, 0).extra == 1); // promote, inner
+    assert(!rrvrrt::InverseRate(0xFF00u | 5, 1, 1, 1, IntMin, -1, 0).supported);
+    assert(!rb::SafeThreshold(-17) && !rb::SafeThreshold(IntMin));
+    // The governor's fallback, 17: with clamping on at most one ray per pixel for every raw code,
+    // with clamping off the game's own rays (a positive threshold then changes nothing).
+    for (unsigned raw = 0; raw < 256; ++raw)
+        for (int flags = 0; flags < 4; ++flags) {
+            const int promote = flags & 1, boundary = flags & 2 ? -1 : 1;
+            const auto on = rrvrrt::InverseRate(raw, 1, promote, 1, 17, boundary, 0);
+            const auto off = rrvrrt::InverseRate(raw, 1, promote, 0, 17, boundary, 0);
+            assert(on.supported && Rays(on) <= 1);
+            assert(Rays(off) == Rays(rrvrrt::InverseRate(raw, 0, 0, 0, 0, 0, 0)));
+        }
+}
+
+// A proven apply: dispatch groups cover the extent, both ray lists hold `entries` entries and the
+// pixel list 4 bytes per pixel of the extent.
 static rb::Lists Proven(std::uint64_t entries, std::uint32_t w = 1920, std::uint32_t h = 1080) {
     rb::Lists l;
     l.w = w;
@@ -149,14 +254,16 @@ static rb::Lists Proven(std::uint64_t entries, std::uint32_t w = 1920, std::uint
     l.why = rb::Why::None;
     for (unsigned i = 0; i < 2; ++i)
         l.v[i] = {rb::Binding::Table, 0x1000 + i, 0, rb::ListHeader + entries * rb::EntryBytes};
-    l.v[2] = {rb::Binding::Table, 0x2000, 0, rb::PixelEntryBytes * l.Area()};
+    l.v[2] = {rb::Binding::Table, 0x2000, 0, rb::PixelEntryBytes * l.Pixels()};
     l.v[3] = {rb::Binding::Table, 0x3000, 0, 16};
     l.budget_resource = 0x4000;
     return l;
 }
 
 // A completed reader frame: lobe 1 requests half the pixels at full rate, lobe 2 all of them; the
-// game's target is `target`, its rate control is on and both thresholds are inside the range.
+// game's target is `target`, its rate control is on and both thresholds are 9. The controller
+// copied the resolve's ray statistics (x = 0, covering the reader's 0 raw rays) and the readers'
+// second segment (0: none).
 static rb::Completed Measured(const rb::Lists &l, float target = 0.4f) {
     rb::Completed c;
     c.lists = l;
@@ -167,7 +274,7 @@ static rb::Completed Measured(const rb::Lists &l, float target = 0.4f) {
     c.rates[rrdensity::Settings1] = 1;
     c.rates[rrdensity::Limits] = c.rates[rrdensity::Limits + 2] = 9;
     c.log[0] = c.log[1] = std::bit_cast<std::uint32_t>(target);
-    c.logged = rb::LogResolveTarget;
+    c.logged = rb::LogResolveTarget | rb::LogResolveStats | rb::LogApplyScene253;
     return c;
 }
 
@@ -180,6 +287,28 @@ static rb::Gate Primed(const rb::Lists &l, unsigned applies = rb::ProofFrames,
     for (unsigned i = 0; i < frames; ++i)
         assert(g.Complete(Measured(l, target)) == rb::Why::None);
     return g;
+}
+
+// Primed(l), armed for Times2 with both lobes raised: `plan` is what it patched.
+static rb::Gate Armed(const rb::Lists &l, rb::Plan &plan) {
+    auto g = Primed(l);
+    plan = g.Decide(rb::Times2, rb::ProofFrames - 1, nullptr);
+    assert(plan.mask == 3);
+    g.Patched(plan);
+    return g;
+}
+
+// The completed frame of a recording whose resolve was patched with `plan` and whose apply read the
+// raised Budget, with the executed constants copied back.
+static rb::Completed Raised(const rb::Lists &l, const rb::Plan &plan) {
+    auto c = Measured(l);
+    c.patched = c.budget = plan.mask;
+    c.written = plan.bits;
+    c.margin = plan.margin;
+    c.logged |= rb::LogExecuted;
+    c.log[4] = plan.bits[0];
+    c.log[5] = plan.bits[1];
+    return c;
 }
 
 static bool Near(float a, float b) {
@@ -195,8 +324,29 @@ static void GateRefusals() {
     assert(fresh.Decide(99u, 0, nullptr).why == rb::Why::Mode); // unknown steps read as Off
     assert(fresh.Decide(rb::Times2, 0, nullptr).why == rb::Why::ListsUnproven);
     assert(fresh.Decide(rb::Times2, 0, nullptr).mask == 0);
+    // Raised recordings that retired without reader stats: from 8 in a row on, Decide waits (right
+    // after a stop, before the proofs); any completed frame ends the run.
+    rb::Gate unverified;
+    for (unsigned i = 0; i < rb::UnverifiedLimit; ++i)
+        unverified.Unverified();
+    assert(unverified.Decide(rb::Times2, 0, nullptr).why == rb::Why::Unverified);
+    assert(unverified.Decide(rb::Off, 0, nullptr).why == rb::Why::Mode);
+    assert(unverified.Stop(rb::Why::Readback));
+    assert(unverified.Decide(rb::Times2, 0, nullptr).why == rb::Why::Stopped);
+    auto g = Primed(l);
+    for (unsigned i = 1; i < rb::UnverifiedLimit; ++i)
+        g.Unverified();
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    g.Unverified();
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Unverified);
+    for (unsigned i = 0; i < 1000; ++i) // a long run stays refused
+        g.Unverified();
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Unverified &&
+           g.Decide(rb::Times2, now, nullptr).mask == 0);
+    assert(g.Complete(Measured(l)) == rb::Why::None); // not sticky
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
     // Fewer than 120 consecutive proven applies at one extent: waiting.
-    auto g = Primed(l, rb::ProofFrames - 1);
+    g = Primed(l, rb::ProofFrames - 1);
     assert(g.Streak() == rb::ProofFrames - 1 &&
            g.Decide(rb::Times2, now - 1, nullptr).why == rb::Why::ListsStable);
     g.Apply(l, now);
@@ -209,6 +359,26 @@ static void GateRefusals() {
     assert(g.Streak() == 0 && g.Decide(rb::Times2, now + 1, nullptr).why == rb::Why::ListsView);
     g.Apply(l, now + 2);
     assert(g.Streak() == 1 && g.Decide(rb::Times2, now + 2, nullptr).why == rb::Why::ListsStable);
+    // A proof of an empty or impossible extent is no proof, so a raised frame always has an extent
+    // to check (16384 is the largest D3D12 texture side).
+    for (auto [w, h] : {std::pair{0u, 1080u},
+                        {1920u, 0u},
+                        {0u, 0u},
+                        {16385u, 1080u},
+                        {1920u, 16385u},
+                        {0xFFFFFFFFu, 0xFFFFFFFFu}}) {
+        rb::Gate d;
+        const auto degenerate = Proven(1920ull * 1088 + 100000, w, h);
+        for (unsigned i = 0; i < 2 * rb::ProofFrames; ++i)
+            d.Apply(degenerate, i);
+        assert(d.Streak() == 0 && d.Proof().why == rb::Why::ListsUnproven);
+        assert(d.Decide(rb::Times2, 2 * rb::ProofFrames - 1, nullptr).why ==
+               rb::Why::ListsUnproven);
+        assert(!d.KnownBudget(degenerate.budget_resource, 0));
+    }
+    rb::Gate largest_extent;
+    largest_extent.Apply(Proven(1ull << 30, 16384, 16384), 0);
+    assert(largest_extent.Streak() == 1 && largest_extent.Proof().why == rb::Why::None);
     // 120 proofs without measured frames: evidence missing.
     auto e = Primed(l, rb::ProofFrames, 0);
     assert(e.Decide(rb::Times2, now, nullptr).why == rb::Why::Evidence);
@@ -229,6 +399,12 @@ static void GateRefusals() {
     other.v[1].bytes -= rb::EntryBytes;
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
     other = l;
+    other.v[2].bytes -= 1; // the pixel list
+    assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
+    other = l;
+    other.v[3].bytes -= 1; // the counter
+    assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
+    other = l;
     other.why = rb::Why::ListsUnproven;
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
     other = Proven(1920ull * 1088 + 100000, 1280, 720);
@@ -237,14 +413,16 @@ static void GateRefusals() {
     other.h = 1079;
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
     other = l;
-    other.gx += 1; // the dispatch covers more threads than the streak was proven for
+    other.gx += 1; // another dispatch grid: not the apply the streak was proven for
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
     other = l;
     other.gy -= 1;
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::ListsChanged);
     other = l;
     other.v[0].bytes += 4096;
-    other.v[0].resource = 0x9000; // a larger list in another buffer is fine
+    other.v[0].resource = 0x9000; // larger lists in other buffers are fine
+    other.v[2].bytes += 4;
+    other.v[3].bytes += 4;
     assert(g.Decide(rb::Times2, now, &other).why == rb::Why::None);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None); // no apply in this recording
     // Measured frames at another extent than the proofs do not count.
@@ -260,11 +438,18 @@ static void GateRefusals() {
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::VrrtOff);
     assert(g.Complete(Measured(l)) == rb::Why::None);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
-    // The pixel counters hold W*H*239 in 32 bits.
-    assert(std::uint64_t(4239) * 4239 * 239 < (1ull << 32) &&
-           std::uint64_t(4240) * 4240 * 239 >= (1ull << 32));
-    const auto largest = Proven(4240ull * 4240 + 100000, 4239, 4239);
-    const auto too_large = Proven(4240ull * 4240 + 100000, 4240, 4240);
+    // The ray counters hold W*H*240 in 32 bits (a pixel's raw rays are at most 255 - 15).
+    assert(std::uint64_t(4230) * 4230 * 240 < (1ull << 32) &&
+           std::uint64_t(4231) * 4231 * 240 >= (1ull << 32));
+    const auto largest = Proven(4231ull * 4231 + 100000, 4230, 4230);
+    const auto too_large = Proven(4231ull * 4231 + 100000, 4231, 4231);
+    // At the widest extent the height decides.
+    assert(std::uint64_t(16384) * 1092 * 240 < (1ull << 32) &&
+           std::uint64_t(16384) * 1093 * 240 >= (1ull << 32));
+    const auto wide = Proven(16384ull * 1093 + 100000, 16384, 1092);
+    const auto too_wide = Proven(16384ull * 1093 + 100000, 16384, 1093);
+    assert(Primed(wide).Decide(rb::Times2, now, nullptr).mask == 3);
+    assert(Primed(too_wide).Decide(rb::Times2, now, nullptr).why == rb::Why::Resolution);
     assert(Primed(largest).Decide(rb::Times2, now, nullptr).mask == 3);
     assert(Primed(too_large).Decide(rb::Times2, now, nullptr).why == rb::Why::Resolution);
     // The native target must read the same four times in a row.
@@ -286,6 +471,63 @@ static void GateRefusals() {
     for (unsigned i = 0; i < rb::ProofFrames; ++i)
         g.Complete(unlogged);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::TargetUnknown);
+    // Then the controller's copies of the resolve's ray statistics (x per lobe) must have covered
+    // the reader's raw rays in 120 frames, and the readers' second segment must have been copied in
+    // 120 frames at this extent.
+    auto bare = Measured(l);
+    bare.logged = rb::LogResolveTarget;
+    g = Primed(l, rb::ProofFrames, 0);
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(bare);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    bare.logged |= rb::LogResolveStats;
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(bare);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::RemapUnknown);
+    bare.logged |= rb::LogApplyScene253;
+    for (unsigned i = 1; i < rb::ProofFrames; ++i)
+        g.Complete(bare);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::RemapUnknown);
+    g.Complete(bare);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    // The statistics count: a frame whose x is lower than the raw rays (either lobe) starts it
+    // over, a frame without the copy leaves it, an x equal to the raw rays is enough.
+    auto lag = Measured(l);
+    lag.rates[rrdensity::RawRays + 1] = 7;
+    lag.log[26] = 6;
+    g.Complete(lag);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    auto equal = Measured(l);
+    equal.rates[rrdensity::RawRays] = equal.log[25] = 5;
+    equal.rates[rrdensity::RawRays + 1] = 7;
+    equal.log[26] = 9;
+    auto no_stats = Measured(l);
+    no_stats.logged &= ~rb::LogResolveStats;
+    no_stats.rates[rrdensity::RawRays] = 100; // not compared: no copy
+    for (unsigned i = 1; i < rb::ProofFrames; ++i)
+        g.Complete(equal);
+    for (unsigned i = 0; i < 50; ++i)
+        g.Complete(no_stats);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    g.Complete(equal);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
+    lag = Measured(l);
+    lag.rates[rrdensity::RawRays] = 7;
+    lag.log[25] = 6;
+    g.Complete(lag);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    // The second segment's count starts over at another extent.
+    auto no_remap = Measured(l);
+    no_remap.logged &= ~rb::LogApplyScene253;
+    g = Primed(l, rb::ProofFrames, 0);
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(Measured(Proven(1920ull * 1088 + 100000, 1280, 720)));
+    for (unsigned i = 1; i < rb::ProofFrames; ++i)
+        g.Complete(Measured(l));
+    g.Complete(no_remap);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::RemapUnknown);
+    g.Complete(Measured(l));
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::None);
     // A root list is never armed, however long it is observed.
     rb::Gate r;
     auto root = l;
@@ -304,6 +546,7 @@ static void GateRefusals() {
 static void GatePlans() {
     const auto l = Proven(1920ull * 1088 + 100000);
     const std::uint64_t now = rb::ProofFrames - 1;
+    const std::uint64_t pixels = 1920ull * 1080;
     auto g = Primed(l);
     // Lobe 1 requests half the pixels, so its target stops at 0.5 (the requested share).
     auto p = g.Decide(rb::Times2, now, nullptr);
@@ -312,6 +555,13 @@ static void GatePlans() {
     assert(Near(p.target[0], 0.5f) && Near(p.target[1], 0.8f));
     assert(p.bits[0] == std::bit_cast<std::uint32_t>(p.target[0]) &&
            p.bits[1] == std::bit_cast<std::uint32_t>(p.target[1]));
+    // It carries what the governor and the completed-frame checks need: the extent, each list's
+    // capacity and, per raised lobe, the headroom (capacity - W*H - slack) and the margin.
+    assert(p.w == 1920 && p.h == 1080);
+    assert(p.capacity[0] == l.Entries(0) && p.capacity[1] == l.Entries(1));
+    assert(l.Entries(0) == 2188960 && p.headroom[0] == 2188960 - pixels - rb::ConsumerSlack &&
+           p.headroom[1] == p.headroom[0] && p.headroom[0] == 114848);
+    assert(p.margin[0] == 0 && p.margin[1] == 0);
     p = g.Decide(rb::Times15, now, nullptr);
     assert(p.mask == 3 && Near(p.target[0], 0.5f) && Near(p.target[1], 0.6f));
     p = g.Decide(rb::OnePerPixel, now, nullptr); // factor 0: up to one ray per requested pixel
@@ -356,7 +606,8 @@ static void GatePlans() {
     }
     g = Primed(l, rb::ProofFrames, rb::ProofFrames, 1.0f); // exactly 1 is in range, but at the cap
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::AtCap);
-    // Lobes are decided one by one: the first reason is kept only when no lobe arms.
+    // Lobes are decided one by one: the first reason is kept only when no lobe arms. A lobe left
+    // alone gets no headroom (the governor leaves it alone), but its capacity is still known.
     g = Primed(l);
     auto mixed = Measured(l);
     mixed.log[0] = std::bit_cast<std::uint32_t>(0.5f); // lobe 1 already at its requested share
@@ -365,68 +616,146 @@ static void GatePlans() {
     p = g.Decide(rb::Times2, now, nullptr);
     assert(p.why == rb::Why::None && p.mask == 2 && p.target[0] == 0 &&
            Near(p.target[1], 0.4f * 2));
+    assert(p.headroom[0] == 0 && p.headroom[1] == 114848 && p.capacity[0] == l.Entries(0));
     mixed.log[1] = std::bit_cast<std::uint32_t>(0.0f);
     for (unsigned i = 0; i < rb::TargetFrames; ++i)
         g.Complete(mixed);
     p = g.Decide(rb::Times2, now, nullptr); // lobe 1 at the cap, lobe 2 out of range
     assert(p.why == rb::Why::AtCap && p.mask == 0);
-    // Lists that hold less than one ray per pixel plus margin never arm.
-    auto small = Proven(1920ull * 1080);
-    g = Primed(small);
+    // Lists that hold less than one ray per pixel of the extent plus margin and slack never arm.
+    // The extent counts, not the dispatch grid (threads past the extent append nothing).
+    auto undersized = Proven(pixels);
+    g = Primed(undersized);
     assert(g.Decide(rb::OnePerPixel, now, nullptr).why == rb::Why::ListsSmall);
-    auto exact = Proven(1920ull * 1088 + rb::ConsumerSlack); // area + slack: just enough
-    assert(Primed(exact).Decide(rb::Times2, now, nullptr).mask == 3);
-    exact = Proven(1920ull * 1088 + rb::ConsumerSlack - 1);
+    auto exact = Proven(pixels + rb::ConsumerSlack); // W*H + slack: just enough
+    assert(exact.Pixels() == pixels && std::uint64_t(exact.gx) * 16 * exact.gy * 16 > pixels);
+    p = Primed(exact).Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.headroom[0] == 0 && p.headroom[1] == 0);
+    exact = Proven(pixels + rb::ConsumerSlack - 1);
     assert(Primed(exact).Decide(rb::Times2, now, nullptr).why == rb::Why::ListsSmall);
+    // The headroom saturates at the governor's 32 bits.
+    p = Primed(Proven(pixels + rb::ConsumerSlack + 0xFFFFFFFEull)).Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.headroom[0] == 0xFFFFFFFEu);
+    p = Primed(Proven(pixels + rb::ConsumerSlack + 0x100000000ull))
+            .Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.headroom[0] == 0xFFFFFFFFu && p.headroom[1] == 0xFFFFFFFFu);
+    assert(p.capacity[0] == pixels + rb::ConsumerSlack + 0x100000000ull);
     // The smallest list of the streak counts, not the last one.
     g = Primed(l, rb::ProofFrames - 1);
-    g.Apply(Proven(1920ull * 1088), now);
+    g.Apply(Proven(pixels + rb::ConsumerSlack - 1), now);
     assert(g.Streak() == rb::ProofFrames);
     for (unsigned i = 0; i < rb::ProofFrames; ++i)
         g.Complete(Measured(l));
+    assert(g.Capacity(0) == pixels + rb::ConsumerSlack - 1);
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::ListsSmall);
-    // Lobe 1 needs a pixel list of 4 bytes per dispatched pixel, both lobes a 4-byte counter.
-    auto pixels = l;
-    pixels.v[2].bytes -= 1;
-    p = Primed(pixels).Decide(rb::Times2, now, nullptr);
+    // u3 is lobe 1's pixel list: lobe 1 needs 4 bytes per pixel of the extent there; both lobes
+    // need a 4-byte counter.
+    auto pixel_list = l;
+    pixel_list.v[2].bytes -= 1;
+    p = Primed(pixel_list).Decide(rb::Times2, now, nullptr);
     assert(p.why == rb::Why::None && p.mask == 2);
     auto counter = l;
     counter.v[3].bytes = 3;
     assert(Primed(counter).Decide(rb::Times2, now, nullptr).why == rb::Why::ListsSmall);
-    // Raw multi-ray requests widen the margin the lists must hold; it covers two blocks of frames.
+    counter.v[3].bytes = 4;
+    assert(Primed(counter).Decide(rb::Times2, now, nullptr).mask == 3);
+    // Raw requested rays widen the margin the lists must hold: twice their largest per-frame sum.
     g = Primed(l, rb::ProofFrames, 0);
     for (unsigned i = 0; i < rb::ProofFrames; ++i) {
         auto f = Measured(l);
-        f.rates[rrdensity::RawExtra] = 10 + i % 3;
-        f.rates[rrdensity::RawExtra + 1] = 3;
+        f.rates[rrdensity::RawRays] = f.log[25] = 10 + i % 3;
+        f.rates[rrdensity::RawRays + 1] = f.log[26] = 3;
         g.Complete(f);
     }
     assert(g.Margin(0) == 24 && g.Margin(1) == 6);
     assert(g.Hard(0) && g.Hard(1) && !g.Hard(2));
-    auto tight = Proven(1920ull * 1088 + rb::ConsumerSlack + 23); // one entry short of the margin
+    p = g.Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.margin[0] == 24 && p.margin[1] == 6 && p.headroom[0] == 114848);
+    auto tight = Proven(pixels + rb::ConsumerSlack + 23); // one entry short of the margin
     g = Primed(tight, rb::ProofFrames, 0);
     for (unsigned i = 0; i < rb::ProofFrames; ++i) {
         auto f = Measured(tight);
-        f.rates[rrdensity::RawExtra] = 12;
+        f.rates[rrdensity::RawRays] = f.log[25] = 12;
         g.Complete(f);
     }
     assert(g.Margin(0) == 24 && !g.Hard(0) && g.Hard(1));
     p = g.Decide(rb::Times2, now, nullptr);
-    assert(p.why == rb::Why::None && p.mask == 2);
-    // Margin and requested share are rolling minima/maxima over two blocks of BlockFrames.
+    assert(p.why == rb::Why::None && p.mask == 2 && p.margin[0] == 0 && p.headroom[0] == 0);
+    // The maximum decays: each block of BlockFrames frames halves it before new frames count.
     g = Primed(l, rb::ProofFrames, 0);
     auto burst = Measured(l);
-    burst.rates[rrdensity::RawExtra] = 10;
-    burst.rates[1] = 1000; // lobe 1 requests few pixels in this block
-    burst.rates[0] = l.w * l.h - 1000;
+    burst.rates[rrdensity::RawRays] = burst.log[25] = 1000;
+    burst.rates[rrdensity::RawRays + 1] = burst.log[26] = 41;
+    g.Complete(burst);
+    for (unsigned i = 1; i < rb::Gate::BlockFrames; ++i)
+        g.Complete(Measured(l));
+    assert(g.Margin(0) == 2000 && g.Margin(1) == 82); // the first block
+    g.Complete(Measured(l));
+    assert(g.Margin(0) == 1000 && g.Margin(1) == 40); // the second block: halved (rounded down)
+    for (unsigned i = 1; i < rb::Gate::BlockFrames; ++i)
+        g.Complete(Measured(l));
+    assert(g.Margin(0) == 1000);
+    g.Complete(Measured(l));
+    assert(g.Margin(0) == 500 && g.Margin(1) == 20);
+    auto rise = Measured(l); // a frame above the halved maximum raises it at once
+    rise.rates[rrdensity::RawRays] = rise.log[25] = 300;
+    g.Complete(rise);
+    assert(g.Margin(0) == 600 && g.Margin(1) == 20);
+    for (unsigned i = 0; i < 12 * rb::Gate::BlockFrames; ++i)
+        g.Complete(Measured(l));
+    assert(g.Margin(0) == 0 && g.Margin(1) == 0);
+    // It starts over with the extent.
+    g.Complete(burst);
+    assert(g.Margin(0) == 2000);
+    g.Complete(Measured(Proven(1920ull * 1088 + 100000, 1280, 720)));
+    assert(g.Margin(0) == 0 && g.Margin(1) == 0);
+    // The requested share is the smallest over two blocks of BlockFrames frames.
+    g = Primed(l, rb::ProofFrames, 0);
+    auto sparse = Measured(l);
+    sparse.rates[1] = 1000; // lobe 1 requests few pixels in this block
+    sparse.rates[0] = l.w * l.h - 1000;
     for (unsigned i = 0; i < rb::Gate::BlockFrames; ++i)
-        g.Complete(burst);
-    assert(g.Margin(0) == 20 && g.Requested(0) < 0.001);
+        g.Complete(sparse);
+    assert(g.Requested(0) < 0.001);
     for (unsigned i = 0; i < rb::Gate::BlockFrames; ++i)
-        g.Complete(Measured(l)); // the burst moves to the previous block
-    assert(g.Margin(0) == 20 && g.Requested(0) < 0.001);
+        g.Complete(Measured(l)); // the sparse block moves to the previous block
+    assert(g.Requested(0) < 0.001);
     g.Complete(Measured(l)); // and is forgotten one block later
-    assert(g.Margin(0) == 0 && Near(float(g.Requested(0)), 0.5f) && g.Requested(1) == 1.0);
+    assert(Near(float(g.Requested(0)), 0.5f) && g.Requested(1) == 1.0);
+    // The readers' second segment (cb3 register 253 .x) bounds both lists: the capacity is the
+    // smallest nonzero value of the frames at this extent when it is below the entries (0: none).
+    g = Primed(l, rb::ProofFrames, 0);
+    auto remap = Measured(l);
+    remap.log[28] = 2100000;
+    g.Complete(remap);
+    remap.log[28] = 0;
+    for (unsigned i = 1; i < rb::ProofFrames; ++i)
+        g.Complete(remap);
+    assert(g.Capacity(0) == 2100000 && g.Capacity(1) == 2100000 && g.Capacity(2) == 0);
+    p = g.Decide(rb::Times2, now, nullptr);
+    assert(p.mask == 3 && p.capacity[0] == 2100000 && p.capacity[1] == 2100000 &&
+           p.headroom[0] == 2100000 - pixels - rb::ConsumerSlack);
+    remap.log[28] = 2100001; // the smallest one is kept
+    g.Complete(remap);
+    assert(g.Capacity(0) == 2100000);
+    remap.log[28] = std::uint32_t(pixels + rb::ConsumerSlack - 1);
+    g.Complete(remap);
+    assert(g.Capacity(1) == pixels + rb::ConsumerSlack - 1 && !g.Hard(0) && !g.Hard(1));
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::ListsSmall);
+    remap.lists = Proven(1920ull * 1088 + 100000, 1280, 720); // another extent forgets it
+    g.Complete(remap);
+    g.Complete(Measured(l));
+    assert(g.Capacity(0) == l.Entries(0));
+    g = Primed(l, rb::ProofFrames, 0);
+    remap = Measured(l);
+    remap.log[28] = 0xFFFFFFFFu; // above the entries: the entries stay the capacity
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        g.Complete(remap);
+    assert(g.Capacity(0) == l.Entries(0) && g.Decide(rb::Times2, now, nullptr).mask == 3);
+    remap.logged &= ~rb::LogApplyScene253; // a value that was not copied is no value
+    remap.log[28] = 1;
+    g.Complete(remap);
+    assert(g.Capacity(0) == l.Entries(0));
 }
 
 // Completed frames can stop the test for the session; none of the stops is lifted again.
@@ -443,39 +772,35 @@ static void GateStops() {
     assert(g.Stop(rb::Why::Exception));
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Stopped);
     assert(g.Decide(rb::Off, now, nullptr).why == rb::Why::Mode); // Off still reads as Off
-    // The governor did not keep a raised lobe's threshold inside [-16, 17].
-    g = Primed(l);
-    g.Patched(g.Decide(rb::Times2, now, nullptr));
-    auto c = Measured(l);
-    c.budget = 3;
-    c.rates[rrdensity::Limits] = 17;
-    c.rates[rrdensity::Limits + 2] = std::uint32_t(-16);
-    assert(g.Complete(c) == rb::Why::None); // both bounds are fine
-    c.rates[rrdensity::Limits + 2] =
-        std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
-    assert(g.Complete(c) == rb::Why::None); // INT_MIN is the unsupported value, not a threshold
-    c.rates[rrdensity::Limits + 2] = std::uint32_t(-17);
-    c.budget = 1; // lobe 2 was not raised: its threshold is the game's business
+    // A raised frame that passes every check, also with any threshold of -16 or more on a raised
+    // lobe (the game runs at 15..18 natively).
+    rb::Plan plan;
+    g = Armed(l, plan);
+    auto c = Raised(l, plan);
+    for (int t : {-16, 0, 17, 18, 300, IntMax}) {
+        c.rates[rrdensity::Limits] = c.rates[rrdensity::Limits + 2] = std::uint32_t(t);
+        assert(g.Complete(c) == rb::Why::None);
+    }
+    assert(g.Stopped() == rb::Why::None && g.Decide(rb::Times2, now, nullptr).mask == 3);
+    // The governor left a raised lobe's threshold below -16, or at INT_MIN.
+    c.rates[rrdensity::Limits + 2] = std::bit_cast<std::uint32_t>(IntMin);
+    c.budget = 1; // lobe 2's apply read the game's own Budget: its threshold is the game's business
     assert(g.Complete(c) == rb::Why::None && g.Stopped() == rb::Why::None);
     c.budget = 3;
     assert(g.Complete(c) == rb::Why::Governor && g.Stopped() == rb::Why::Governor);
     assert(g.Complete(c) == rb::Why::None); // only the frame that newly stops reports
     assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::Stopped);
-    g = Primed(l);
+    g = Armed(l, plan);
     c.rates[rrdensity::Limits + 2] = 9;
-    c.rates[rrdensity::Limits] = 18;
+    c.rates[rrdensity::Limits] = std::uint32_t(-17);
     assert(g.Complete(c) == rb::Why::Governor);
     // The constants the controller executed differ from the ones written.
     g = Primed(l);
     const auto q = g.Decide(rb::Times15, now, nullptr);
     assert(q.mask == 3);
     g.Patched(q);
-    auto d = Measured(l);
-    d.patched = 3;
-    d.written = q.bits;
-    d.logged |= rb::LogExecuted;
-    d.log[4] = q.bits[0];
-    d.log[5] = q.bits[1];
+    auto d = Raised(l, q);
+    d.budget = 0;
     assert(g.Complete(d) == rb::Why::None);
     auto d1 = d;
     d1.patched = 1; // only lobe 1 patched: lobe 2's words are not compared
@@ -488,87 +813,158 @@ static void GateStops() {
     g.Patched(q);
     d.log[5] ^= 1;
     assert(g.Complete(d) == rb::Why::PatchMismatch);
-    // Multi-ray requests grew beyond the margin the lists were armed with.
-    rb::Gate m;
-    for (unsigned i = 0; i < rb::ProofFrames; ++i) {
-        m.Apply(l, i);
-        auto f = Measured(l);
-        f.rates[rrdensity::RawExtra] = 10;
-        m.Complete(f);
-    }
-    const auto armed = m.Decide(rb::Times2, now, nullptr);
-    assert(armed.mask == 3);
-    m.Patched(armed);
-    auto grown = Measured(l);
-    grown.budget = 1;
-    grown.rates[rrdensity::RawExtra] = 20;
-    assert(m.Complete(grown) == rb::Why::None); // 2 x 10 is the margin: equal is fine
-    grown.budget = 2;
-    grown.rates[rrdensity::RawExtra + 1] = 1; // lobe 2 was armed with a margin of 0
-    assert(m.Complete(grown) == rb::Why::MultiRay);
-    m = Primed(l, rb::ProofFrames, 0);
+    // Raw requested rays beyond the margin the lists were armed with do not stop the test: the
+    // governor bounds each frame by its own statistics (the summary counts these frames).
+    rb::Gate m = Primed(l, rb::ProofFrames, 0);
     for (unsigned i = 0; i < rb::ProofFrames; ++i) {
         auto f = Measured(l);
-        f.rates[rrdensity::RawExtra] = 10;
+        f.rates[rrdensity::RawRays] = f.log[25] = 10;
         m.Complete(f);
     }
-    m.Patched(m.Decide(rb::Times2, now, nullptr));
-    grown.budget = 1;
-    grown.rates[rrdensity::RawExtra] = 21;
-    assert(m.Complete(grown) == rb::Why::MultiRay);
-    // The scheduled rays came within 512 entries of a list's capacity: requested pixels, extra rays
-    // and the threads past the extent (the dispatch covers more than w*h) plus one consumer group.
-    const auto tight = Proven(1920ull * 1088 + 600);
-    const std::uint64_t pixels = tight.w * tight.h, past = tight.Area() - pixels;
-    const std::uint64_t room1 = tight.Entries(0) - pixels / 2 - past - rb::ConsumerSlack,
-                        room2 = tight.Entries(1) - pixels - past - rb::ConsumerSlack;
+    const auto margin_plan = m.Decide(rb::Times2, now, nullptr);
+    assert(margin_plan.mask == 3 && margin_plan.margin[0] == 20 && margin_plan.margin[1] == 0);
+    m.Patched(margin_plan);
+    auto grown = Raised(l, margin_plan);
+    grown.rates[rrdensity::RawRays] = grown.log[25] = 50000;
+    grown.rates[rrdensity::RawRays + 1] = grown.log[26] = 1;
+    assert(m.Complete(grown) == rb::Why::None && m.Stopped() == rb::Why::None);
+    // A raised frame is judged by its own apply's lists, which must be the ones armed: proven (a
+    // failed or missing proof stops), the armed extent, no raised lobe's list or counter smaller
+    // than at arming (the pixel list counts for lobe 1), no second segment below the capacity.
+    auto changed = [&](auto edit) {
+        rb::Plan armed;
+        auto gate = Armed(l, armed);
+        auto frame = Raised(l, armed);
+        edit(frame);
+        const auto why = gate.Complete(frame);
+        assert(gate.Stopped() == why);
+        return why;
+    };
+    const auto after = rb::Why::ListsAfterArming;
+    assert(changed([](rb::Completed &) {}) == rb::Why::None);
+    assert(changed([](rb::Completed &f) { f.lists.why = rb::Why::ListsRoot; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists = rb::Lists{}; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.w = 1919; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.h = 1081; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.w = f.lists.h = 0; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.v[0].bytes -= rb::EntryBytes; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.v[1].bytes -= rb::EntryBytes; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.v[1].binding = rb::Binding::Root; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.v[2].bytes -= 1; }) == after);
+    assert(changed([](rb::Completed &f) { f.lists.v[3].bytes -= 1; }) == after);
+    assert(changed([](rb::Completed &f) { f.log[28] = 2188959; }) == after);
+    assert(changed([](rb::Completed &f) { f.log[28] = 2188960; }) == rb::Why::None);
+    assert(changed([](rb::Completed &f) {
+               f.log[28] = 1; // not copied: no value
+               f.logged &= ~rb::LogApplyScene253;
+           }) == rb::Why::None);
+    assert(changed([](rb::Completed &f) {
+               f.lists.v[0].bytes += 4096; // larger lists, other buffers, another dispatch grid
+               f.lists.v[0].resource = 0x9000;
+               f.lists.v[2].bytes += 4;
+               f.lists.gx = f.lists.gy = 1;
+           }) == rb::Why::None);
+    assert(changed([](rb::Completed &f) {
+               f.patched = f.budget = 2; // lobe 1 was not raised: its lists are the game's
+               f.lists.v[0].bytes -= rb::EntryBytes;
+               f.lists.v[2].bytes -= 1;
+           }) == rb::Why::None);
+    assert(changed([](rb::Completed &f) {
+               f.patched = f.budget = 2;
+               f.lists.v[3].bytes -= 1;
+           }) == after);
+    assert(changed([](rb::Completed &f) {
+               f.patched = 0; // the apply read a raised Budget of an earlier resolve
+               f.budget = 1;
+               f.lists.v[0].bytes -= rb::EntryBytes;
+           }) == after);
+    // A raised frame of a gate that never armed has no armed lists to match.
+    auto unarmed = Primed(l);
+    assert(unarmed.Complete(Raised(l, plan)) == after);
+    // The reader could not model some requested pixels of a raised frame (only then).
+    assert(changed([](rb::Completed &f) { f.rates[rrdensity::Unsupported] = 1; }) ==
+           rb::Why::Unsupported);
+    g = Armed(l, plan);
+    auto unraised = Measured(l);
+    unraised.rates[rrdensity::Unsupported] = 1000;
+    assert(g.Complete(unraised) == rb::Why::None);
+    // The controller's statistics for a raised lobe lag the reader's raw rays: the governor judged
+    // this frame by another frame's numbers. A lobe that was not raised only resets the count.
+    assert(changed([](rb::Completed &f) {
+               f.rates[rrdensity::RawRays + 1] = 10;
+               f.log[26] = 9;
+           }) == rb::Why::StatsMismatch);
+    assert(changed([](rb::Completed &f) {
+               f.rates[rrdensity::RawRays] = 10;
+               f.log[25] = 10;
+           }) == rb::Why::None);
+    assert(changed([](rb::Completed &f) {
+               f.rates[rrdensity::RawRays] = 10; // not copied in this frame
+               f.logged &= ~rb::LogResolveStats;
+           }) == rb::Why::None);
+    g = Armed(l, plan);
+    c = Raised(l, plan);
+    c.patched = c.budget = 1;
+    c.rates[rrdensity::RawRays + 1] = 10;
+    c.log[26] = 9;
+    assert(g.Complete(c) == rb::Why::None);
+    assert(g.Decide(rb::Times2, now, nullptr).why == rb::Why::StatsUnverified);
+    // The scheduled rays (requested pixels plus their extra rays) came within 512 entries of the
+    // armed capacity.
+    const auto tight = Proven(1920ull * 1080 + 600);
+    const std::uint64_t pixels = tight.Pixels();
+    const std::uint64_t room1 = tight.Entries(0) - pixels / 2 - rb::ConsumerSlack,
+                        room2 = tight.Entries(1) - pixels - rb::ConsumerSlack;
     assert(room1 == 1036888 && room2 == 88);
-    rb::Gate o = Primed(tight);
-    const auto plan = o.Decide(rb::Times2, now, nullptr);
-    assert(plan.mask == 3);
-    o.Patched(plan);
-    auto full = Measured(tight);
-    full.budget = 2;
+    rb::Plan tight_plan;
+    auto o = Armed(tight, tight_plan);
+    auto full = Raised(tight, tight_plan);
+    full.patched = full.budget = 2;
     full.rates[rrdensity::Extra + 1] = std::uint32_t(room2); // exactly full: still fine
     assert(o.Complete(full) == rb::Why::None);
     full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 + 1);
     assert(o.Complete(full) == rb::Why::Overflow && o.Stopped() == rb::Why::Overflow);
     // Lobe 1 counts the requested pixels of its own histogram.
-    o = Primed(tight);
-    o.Patched(plan);
-    full = Measured(tight);
-    full.budget = 1;
+    o = Armed(tight, tight_plan);
+    full = Raised(tight, tight_plan);
+    full.patched = full.budget = 1;
     full.rates[rrdensity::Extra] = std::uint32_t(room1);
     assert(o.Complete(full) == rb::Why::None);
     full.rates[rrdensity::Extra] = std::uint32_t(room1 + 1);
     assert(o.Complete(full) == rb::Why::Overflow);
-    // Lobes that were not raised are not checked.
-    o = Primed(tight);
+    // Lobes that were not raised are not checked; a lobe whose apply read a raised Budget is.
+    o = Armed(tight, tight_plan);
     full = Measured(tight);
     full.rates[rrdensity::Extra] = std::uint32_t(room1 + 1);
     full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 + 1);
-    full.budget = 0;
     assert(o.Complete(full) == rb::Why::None);
     full.budget = 2; // lobe 2 only
     assert(o.Complete(full) == rb::Why::Overflow);
-    // A frame whose own apply was not proven is judged against the gate's last proof; a patched
-    // lobe counts as raised even when the budget mask is empty.
-    o = Primed(tight);
-    full = Measured(tight);
+    o = Armed(tight, tight_plan);
+    full = Raised(tight, tight_plan);
+    full.patched = full.budget = 1; // lobe 2 runs the game's own budget in this frame
     full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 + 1);
-    full.patched = 2;
-    full.logged |= rb::LogExecuted;
-    full.written = {0, 0};
-    full.log[4] = full.log[5] = 0;
-    full.lists = rb::Lists{};
+    assert(o.Complete(full) == rb::Why::None);
+    // The capacity is the armed one, even when the frame's own list is larger.
+    o = Armed(tight, tight_plan);
+    full = Raised(tight, tight_plan);
+    full.lists.v[1].bytes += 1000 * rb::EntryBytes;
+    full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 + 1);
     assert(o.Complete(full) == rb::Why::Overflow);
-    // A dispatch that covers fewer threads than the extent has none past it (and cannot wrap).
-    o = Primed(tight);
-    auto narrow = tight;
-    narrow.gx = narrow.gy = 1;
-    full = Measured(narrow);
-    full.budget = 3;
-    assert(o.Complete(full) == rb::Why::None && o.Stopped() == rb::Why::None);
+    // The armed capacity includes the readers' second segment.
+    o = Primed(tight, rb::ProofFrames, 0);
+    auto segment = Measured(tight);
+    segment.log[28] = std::uint32_t(tight.Entries(0) - 10);
+    for (unsigned i = 0; i < rb::ProofFrames; ++i)
+        o.Complete(segment);
+    tight_plan = o.Decide(rb::Times2, now, nullptr);
+    assert(tight_plan.mask == 3 && tight_plan.capacity[1] == tight.Entries(1) - 10);
+    o.Patched(tight_plan);
+    full = Raised(tight, tight_plan);
+    full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 - 10);
+    assert(o.Complete(full) == rb::Why::None);
+    full.rates[rrdensity::Extra + 1] = std::uint32_t(room2 - 9);
+    assert(o.Complete(full) == rb::Why::Overflow);
 }
 
 static void GateTests() {
@@ -593,7 +989,7 @@ static void StatusText() {
     s.mode = rb::Times2;
     assert(describe(s) == "waiting: test off");
     s.why = rb::Why::ListsStable;
-    assert(describe(s) == "waiting: waiting for 120 identical ray-list proofs");
+    assert(describe(s) == "waiting: waiting for 120 proven ray-list applies");
     s.why = rb::Why::AtCap;
     assert(describe(s) == "waiting: already at the cap (1 ray per requested pixel)");
     // Active lines show the game's target and ours, three decimals; a lobe left alone says so.
@@ -661,15 +1057,11 @@ static void ExpectNot(const std::string &text, const std::string &part) {
     }
 }
 
-// A frame whose patch was executed and verified, with every optional log word present.
+// A raised frame whose patch was executed and verified, with every optional log word present.
 static rb::Completed Verified(const rb::Lists &l, const rb::Plan &plan) {
-    auto c = Measured(l);
-    c.patched = plan.mask;
-    c.written = plan.bits;
-    c.logged |= rb::LogExecuted | rb::LogResolveScene | rb::LogApplyTarget |
-                rb::LogApplySettings36 | rb::LogApplyScene251;
-    c.log[4] = plan.bits[0];
-    c.log[5] = plan.bits[1];
+    auto c = Raised(l, plan);
+    c.logged |=
+        rb::LogResolveScene | rb::LogApplyTarget | rb::LogApplySettings36 | rb::LogApplyScene251;
     c.log[8] = std::bit_cast<std::uint32_t>(float(l.w));
     c.log[9] = std::bit_cast<std::uint32_t>(float(l.h));
     c.log[12] = std::bit_cast<std::uint32_t>(plan.target[0]);
@@ -684,13 +1076,13 @@ static constexpr std::uint64_t Interval = rb::Summary::Interval;
 static void SummaryWindow() {
     const auto l = Proven(1920ull * 1088 + 100000);
     auto gate = Primed(l);
-    for (unsigned i = 0; i < 20; ++i) { // a raw multi-ray margin of 24 for lobe 1
+    for (unsigned i = 0; i < 20; ++i) { // a raw-ray margin of 24 for lobe 1
         auto f = Measured(l);
-        f.rates[rrdensity::RawExtra] = 12;
+        f.rates[rrdensity::RawRays] = f.log[25] = 12;
         gate.Complete(f);
     }
     const auto plan = gate.Decide(rb::Times2, 119, nullptr);
-    assert(plan.mask == 3);
+    assert(plan.mask == 3 && plan.margin[0] == 24 && plan.margin[1] == 0);
     rb::Status status;
     status.mode = rb::Times2;
     status.why = rb::Why::None;
@@ -737,16 +1129,19 @@ static void SummaryWindow() {
     sm.Lists(broken);
     sm.Lists(l);
     // Five patched frames: three verified, one with a different word, one that never executed.
+    // One (f3) asks for more raw rays than both lobes' margins, and its statistics were not copied
+    // to cover them; f2 and f5 copied the readers' second segment.
     auto f1 = Verified(l, plan), f2 = Verified(l, plan), f3 = Verified(l, plan);
     f2.log[0] = std::bit_cast<std::uint32_t>(0.25f);
     f2.log[1] = std::bit_cast<std::uint32_t>(0.6f);
     f3.log[0] = std::bit_cast<std::uint32_t>(0.5f);
     f3.rates[rrdensity::Extra] = 1000;
     f3.rates[rrdensity::Extra + 1] = 20000;
-    f3.rates[rrdensity::RawExtra] = 30;
-    f3.rates[rrdensity::RawExtra + 1] = 40;
+    f3.rates[rrdensity::RawRays] = 30;
+    f3.rates[rrdensity::RawRays + 1] = 40;
     f3.rates[rrdensity::Limits] = 17;
     f3.rates[rrdensity::Limits + 2] = std::uint32_t(-16);
+    f2.log[28] = 5;
     auto f4 = Verified(l, plan), f5 = Verified(l, plan);
     f4.log[5] ^= 1;
     f4.log[9] = std::bit_cast<std::uint32_t>(1081.0f);
@@ -754,6 +1149,7 @@ static void SummaryWindow() {
     f5.log[0] = std::bit_cast<std::uint32_t>(0.4f);
     f5.log[1] = std::bit_cast<std::uint32_t>(0.45f);
     f5.rates[rrdensity::Limits] = std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
+    f5.log[28] = 2100000;
     for (const auto &f : {f1, f2, f3, f4, f5})
         sm.Completed(f);
     assert(!sm.Report(1000 + Interval - 1, gate, status, controller, lists));
@@ -764,15 +1160,18 @@ static void SummaryWindow() {
                        "outside=2 beforePrepass=1 afterSR=1 repeated=1 clears=4/5 "
                        "sameB1AsApply=11/14 sameBudget=7/8 | target native=0.400/0.450 "
                        "(0.250..0.500/0.400..0.600) apply=0.500/0.800 written=0.500/0.800 "
-                       "scene=1920x1080 match=4/5 settings36.w=0x10000 scene251.x=0x400 | "
-                       "consumers lobe1=0 lobe2=0 dispatch=0 rays=0 other=0 last=n/a | refused "
-                       "listsStable=12 heap=3 outside=2 afterSR=1 repeated=1 ambiguous=1");
+                       "scene=1920x1080 match=4/5 settings36.w=0x10000 scene251.x=0x400 "
+                       "scene253.x=2100000 stats=4/5 | consumers lobe1=0 lobe2=0 dispatch=0 "
+                       "rays=0 other=0 last=n/a | refused listsStable=12 heap=3 outside=2 "
+                       "afterSR=1 repeated=1 ambiguous=1");
+    // Area is the extent's W*H (2073600); worst fill = requested pixels plus extra rays over the
+    // entries: lobe 1 (1036800 + 1000) / 2188960, lobe 2 (2073600 + 20000) / 2188960.
     Expect(lists, "RR ray lists (10s): applies=8 proven=7 streak=120 1920x1080 groups=120x68 "
-                  "area=2088960 | lobe1 u5=table 8755984B entries=2188960 (1.048x area) "
-                  "need=2089496 tier=hard worstFill=48.1% rawExtraMax=30 "
-                  "threshold=9..17 | lobe2 u6=table 8755984B entries=2188960 (1.048x area) "
-                  "need=2089472 tier=hard worstFill=96.3% rawExtraMax=40 "
-                  "threshold=-16..9 | pixels u3=table 8355840B (4.000 B/px) counter u2=table 16B "
+                  "area=2073600 | lobe1 u5=table 8755984B entries=2188960 (1.056x area) "
+                  "need=2074136 tier=hard worstFill=47.4% rawRaysMax=30 marginExceeded=1 "
+                  "threshold=9..17 | lobe2 u6=table 8755984B entries=2188960 (1.056x area) "
+                  "need=2074112 tier=hard worstFill=95.6% rawRaysMax=40 marginExceeded=1 "
+                  "threshold=-16..9 | pixels u3=table 8294400B (4.000 B/px) counter u2=table 16B "
                   "| why=none");
     // The window starts over; a quiet one prints only while the test is on.
     assert(!sm.Report(1000 + 2 * Interval, gate, rb::Status{}, controller, lists));
@@ -780,8 +1179,8 @@ static void SummaryWindow() {
     assert(sm.Report(1000 + 3 * Interval, gate, status, controller, lists));
     Expect(controller, "patched=0/0 verified=0 | resolve seen=0 inRecording=0");
     Expect(controller,
-           "| target native=n/a apply=n/a written=- scene=n/a match=0/0 settings36.w=n/a "
-           "scene251.x=n/a | consumers lobe1=0");
+           "| target native=n/a apply=n/a written=-/- scene=n/a match=0/0 settings36.w=n/a "
+           "scene251.x=n/a scene253.x=n/a stats=0/0 | consumers lobe1=0");
     ExpectNot(controller, "refused");
     assert(lists.empty()); // no apply in this window
 }
@@ -797,12 +1196,12 @@ static void SummaryFormat() {
     assert(!sm.Report(0, gate, status, controller, lists));
     assert(sm.Report(Interval, gate, status, controller, lists) && lists.empty());
     assert(controller ==
-           "RR ray budget (10s): test=2x the game's rays state=waiting: waiting for 120 identical "
-           "ray-list proofs patched=0/0 verified=0 | resolve seen=0 inRecording=0 afterApply=0 "
+           "RR ray budget (10s): test=2x the game's rays state=waiting: waiting for 120 proven "
+           "ray-list applies patched=0/0 verified=0 | resolve seen=0 inRecording=0 afterApply=0 "
            "beforeApply=0 outside=0 beforePrepass=0 afterSR=0 repeated=0 clears=0/0 "
-           "sameB1AsApply=0/0 sameBudget=0/0 | target native=n/a apply=n/a written=- scene=n/a "
-           "match=0/0 settings36.w=n/a scene251.x=n/a | consumers lobe1=0 lobe2=0 dispatch=0 "
-           "rays=0 other=0 last=n/a");
+           "sameB1AsApply=0/0 sameBudget=0/0 | target native=n/a apply=n/a written=-/- "
+           "scene=n/a match=0/0 settings36.w=n/a scene251.x=n/a scene253.x=n/a stats=0/0 | "
+           "consumers lobe1=0 lobe2=0 dispatch=0 rays=0 other=0 last=n/a");
     status.mode = rb::Off;
     assert(!sm.Report(2 * Interval, gate, status, controller, lists)); // nothing seen, test off
     // The state word: off, waiting, active, stopped.
@@ -812,8 +1211,8 @@ static void SummaryFormat() {
     status.mode = rb::OnePerPixel;
     sm.Resolve(false, false);
     assert(sm.Report(4 * Interval, gate, status, controller, lists));
-    Expect(controller, "test=Up to 1 ray per pixel state=waiting: waiting for 120 identical "
-                       "ray-list proofs patched=0/1");
+    Expect(controller, "test=Up to 1 ray per pixel state=waiting: waiting for 120 proven "
+                       "ray-list applies patched=0/1");
     status.active = true;
     sm.Resolve(false, false);
     assert(sm.Report(5 * Interval, gate, status, controller, lists));
@@ -840,8 +1239,41 @@ static void SummaryFormat() {
     sm.Completed(c);
     assert(sm.Report(31 * Interval, gate, status, controller, lists));
     Expect(controller, "verified=0 | resolve seen=0");
-    Expect(controller, "target native=0.400/0.400 (0.400..0.400/0.400..0.400) apply=n/a written=- "
-                       "scene=n/a match=0/0");
+    Expect(controller, "target native=0.400/0.400 (0.400..0.400/0.400..0.400) apply=n/a "
+                       "written=-/- scene=n/a match=0/0");
+    // A lobe the last patch did not raise has no written value.
+    rb::Plan lobe2;
+    lobe2.mask = 2;
+    lobe2.bits = {0, std::bit_cast<std::uint32_t>(0.8f)};
+    sm.Completed(Verified(l, lobe2));
+    assert(sm.Report(32 * Interval, gate, status, controller, lists));
+    Expect(controller, "verified=1 | resolve");
+    Expect(controller, " written=-/0.800 scene=");
+    rb::Plan lobe1;
+    lobe1.mask = 1;
+    lobe1.bits = {std::bit_cast<std::uint32_t>(0.5f), 0};
+    sm.Completed(Verified(l, lobe2));
+    sm.Completed(Verified(l, lobe1)); // the last patched frame counts
+    sm.Completed(Measured(l));        // a frame that was not patched leaves it
+    assert(sm.Report(33 * Interval, gate, status, controller, lists));
+    Expect(controller, " written=0.500/- scene=");
+    assert(sm.Report(34 * Interval, gate, status, controller, lists));
+    Expect(controller, " written=-/- scene="); // a new window forgets it
+    // The statistics count frames with the copy, and how many covered the reader's raw rays on
+    // both lobes; the second segment shows the last value copied.
+    auto stats = Measured(l);
+    stats.rates[rrdensity::RawRays] = stats.log[25] = 7;
+    stats.log[28] = 1234;
+    sm.Completed(stats);
+    stats.log[26] = 3;
+    stats.rates[rrdensity::RawRays + 1] = 4; // lobe 2 lags
+    stats.log[28] = 0;
+    sm.Completed(stats);
+    stats.logged &= ~(rb::LogResolveStats | rb::LogApplyScene253); // neither copied
+    stats.log[28] = 99;
+    sm.Completed(stats);
+    assert(sm.Report(35 * Interval, gate, status, controller, lists));
+    Expect(controller, " scene251.x=n/a scene253.x=0 stats=1/2 | consumers");
 }
 
 static void SummaryRefusals() {
@@ -873,11 +1305,12 @@ static void SummaryRefusals() {
     Expect(controller, "resolve seen=4 inRecording=0 afterApply=0 beforeApply=0 outside=1 "
                        "beforePrepass=0 afterSR=1 repeated=1");
     // Each reason has its own key (the enum's name in lower camel case) and its own text; equal
-    // counts keep the enum's order.
+    // counts keep the enum's order. All 41 fit.
     std::string expected;
     for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
         expected += std::string(w > 1 ? " " : "") + rb::keys[w] + "=1";
-    Expect(controller, " | refused " + expected.substr(0, 400));
+    Expect(controller, " | refused " + expected);
+    assert(controller.size() < 1023 && controller.ends_with(" | refused " + expected));
     for (unsigned a = 0; a < unsigned(rb::Why::Count); ++a) {
         assert(rb::keys[a][0] >= 'a' && rb::keys[a][0] <= 'z' && rb::Text(rb::Why(a))[0] != 0);
         for (unsigned b = a + 1; b < unsigned(rb::Why::Count); ++b) {
@@ -885,16 +1318,19 @@ static void SummaryRefusals() {
             assert(std::string(rb::Text(rb::Why(a))) != rb::Text(rb::Why(b)));
         }
     }
-    assert(std::string(rb::keys[unsigned(rb::Why::AfterSR)]) == "afterSR" &&
-           std::string(rb::keys[unsigned(rb::Why::ListsStable)]) == "listsStable" &&
-           std::string(rb::keys[unsigned(rb::Why::Exception)]) == "exception");
-    // The line is one 1024-char buffer: a refusal list that does not fit is cut, never overrun.
+    // The line is one 1024-char buffer: what does not fit is cut at 1023 characters, never overrun.
+    // With 100000 of each reason the refusal list no longer fits.
     for (unsigned k = 0; k < 100000; ++k)
         for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
             sm.Refused(rb::Why(w));
     assert(sm.Report(3 * Interval, gate, status, controller, lists));
-    assert(controller.size() < 1024 && controller.size() > 900);
-    Expect(controller, " | refused mode=100000 stopped=100000 context=100000 shape=100000 ");
+    expected.clear();
+    for (unsigned w = 1; w < unsigned(rb::Why::Count); ++w)
+        expected += std::string(w > 1 ? " " : "") + rb::keys[w] + "=100000";
+    const auto at = controller.find(" | refused mode=100000 stopped=100000 unverified=100000 ");
+    assert(at != std::string::npos && controller.starts_with("RR ray budget (10s): test=2x"));
+    const std::string uncut = controller.substr(0, at) + " | refused " + expected;
+    assert(uncut.size() > 1100 && controller.size() == 1023 && controller == uncut.substr(0, 1023));
 }
 
 static void SummaryConsumers() {
@@ -954,19 +1390,19 @@ static void SummaryLists() {
     gate.Apply(odd, 200); // the gate's streak starts over
     assert(sm.Report(Interval, gate, status, controller, lists));
     Expect(lists, "applies=2 proven=1 streak=0 1920x1080");
-    Expect(lists, "| lobe1 u5=root 8755984B entries=0 (0.000x area) need=2089472 tier=");
-    Expect(lists, "| lobe2 u6=view 8755984B entries=0 (0.000x area) need=2089472 tier=");
-    Expect(lists, "worstFill=n/a rawExtraMax=0 threshold=n/a");
+    Expect(lists, "| lobe1 u5=root 8755984B entries=0 (0.000x area) need=2074112 tier=");
+    Expect(lists, "| lobe2 u6=view 8755984B entries=0 (0.000x area) need=2074112 tier=");
+    Expect(lists, "worstFill=n/a rawRaysMax=0 marginExceeded=0 threshold=n/a");
     Expect(lists,
-           "| pixels u3=unknown 8355840B (4.000 B/px) counter u2=table 0B | why=a ray list is a "
+           "| pixels u3=unknown 8294400B (4.000 B/px) counter u2=table 0B | why=a ray list is a "
            "root UAV (no bounds checks)");
-    // Small lists, a margin that grew and a list that is not there at all.
-    auto small = Proven(1920ull * 1080);
-    gate = Primed(small);
-    sm.Lists(small);
+    // Small lists and a list that is not there at all.
+    auto undersized = Proven(1920ull * 1080);
+    gate = Primed(undersized);
+    sm.Lists(undersized);
     assert(sm.Report(2 * Interval, gate, status, controller, lists));
-    Expect(lists, "area=2088960 | lobe1 u5=table 8294544B entries=2073600 (0.993x area) "
-                  "need=2089472 tier=small");
+    Expect(lists, "area=2073600 | lobe1 u5=table 8294544B entries=2073600 (1.000x area) "
+                  "need=2074112 tier=small");
     rb::Lists none;
     sm.Lists(none);
     assert(sm.Report(3 * Interval, gate, status, controller, lists));
@@ -974,7 +1410,7 @@ static void SummaryLists() {
                   "entries=0 (0.000x area) need=512 tier=small worstFill=n/a");
     Expect(lists, "| pixels u3=unknown 0B (0.000 B/px) counter u2=unknown 0B | why=ray lists not "
                   "proven at the VRRT apply");
-    // Fill uses the last proof when the frame's own apply was not proven.
+    // Fill uses the last proof when the frame's own apply was not proven, or proved no extent.
     gate = Primed(l);
     sm.Lists(l);
     auto frame = Measured(l);
@@ -982,22 +1418,53 @@ static void SummaryLists() {
     frame.rates[rrdensity::Extra + 1] = 20000;
     sm.Completed(frame);
     assert(sm.Report(4 * Interval, gate, status, controller, lists));
-    Expect(lists, "worstFill=96.3%");
-    // Without any proof there is nothing to measure against.
-    sm.Lists(none);
-    sm.Completed(frame);
+    Expect(lists, "worstFill=95.6%"); // (2073600 + 20000) / 2188960
+    sm.Lists(l);
+    auto zero = frame;
+    zero.lists = Proven(100, 0, 0);
+    sm.Completed(zero);
     assert(sm.Report(5 * Interval, gate, status, controller, lists));
+    Expect(lists, "worstFill=95.6%");
+    // Without any proof there is nothing to measure against, and a scene matches no zero extent.
+    sm.Lists(none);
+    frame.logged |= rb::LogResolveScene; // the resolve's scene: 0x0
+    sm.Completed(frame);
+    assert(sm.Report(6 * Interval, gate, status, controller, lists));
     Expect(lists, "worstFill=n/a");
+    Expect(controller, " scene=0x0 match=0/1 ");
+    sm.Lists(none);
+    zero.logged |= rb::LogResolveScene;
+    sm.Completed(zero);
+    assert(sm.Report(7 * Interval, gate, status, controller, lists));
+    Expect(controller, " scene=0x0 match=0/1 ");
     // A lobe whose list holds nothing has no fill; the other still does.
     auto empty = l;
     empty.v[0].bytes = rb::ListHeader;
     sm.Lists(empty);
     sm.Completed(Measured(empty));
-    assert(sm.Report(6 * Interval, gate, status, controller, lists));
+    assert(sm.Report(8 * Interval, gate, status, controller, lists));
     Expect(lists,
-           "lobe1 u5=table 144B entries=0 (0.000x area) need=2089472 tier=hard worstFill=n/a");
-    Expect(lists, "lobe2 u6=table 8755984B entries=2188960 (1.048x area) need=2089472 tier=hard "
-                  "worstFill=95.4%");
+           "lobe1 u5=table 144B entries=0 (0.000x area) need=2074112 tier=hard worstFill=n/a");
+    Expect(lists, "lobe2 u6=table 8755984B entries=2188960 (1.056x area) need=2074112 tier=hard "
+                  "worstFill=94.7%");
+    // Raised lobes whose raw rays exceeded the margin they were armed with, per lobe; equal is not
+    // more, and a lobe that was not raised is not counted.
+    sm.Lists(l);
+    rb::Plan plan;
+    plan.mask = 2;
+    plan.margin = {0, 50};
+    auto margin = Raised(l, plan);
+    margin.rates[rrdensity::RawRays] = 1000; // lobe 1 not raised
+    margin.rates[rrdensity::RawRays + 1] = 50;
+    sm.Completed(margin);
+    margin.rates[rrdensity::RawRays + 1] = 51;
+    sm.Completed(margin);
+    sm.Completed(margin);
+    margin.budget = 1; // the apply read a raised Budget for lobe 1 too, armed with margin 0
+    sm.Completed(margin);
+    assert(sm.Report(9 * Interval, gate, status, controller, lists));
+    Expect(lists, "rawRaysMax=1000 marginExceeded=1 threshold=9..9 | lobe2");
+    Expect(lists, "rawRaysMax=51 marginExceeded=3 threshold=9..9 | pixels");
 }
 
 static void SummaryTiming() {
@@ -1038,6 +1505,9 @@ static void SummaryTiming() {
     assert(!sm.Report(4000 + 5 * Interval, gate, status, controller, lists));
     status.mode = rb::Times15;
     assert(sm.Report(4000 + 6 * Interval, gate, status, controller, lists));
+    // The quiet window still started over: its counters are gone.
+    Expect(controller, " clears=0/0 sameB1AsApply=0/0 sameBudget=0/0 | ");
+    Expect(controller, "| consumers lobe1=0 lobe2=0 dispatch=0 rays=0 other=0 last=n/a");
 }
 
 static void SummaryIdle() {
@@ -1223,35 +1693,36 @@ int main() {
     report.clear();
     assert(!density.Report(1000 + 2 * rrdensity::Tracker::Interval, report) && report.empty());
 
-    // Extra rays at pixels granted several rays are summed per window next to the raw multi-ray
-    // potential and the largest raw code. They feed ScreenRays, never the per requested pixel
-    // density, whose value stays what the base report gave.
+    // Extra rays at pixels granted several rays are summed per window next to the raw requested
+    // rays (raw code - 15 of the pixels asking for one or more) and the largest raw code. They feed
+    // ScreenRays, never the per requested pixel density, whose value stays what the base report
+    // gave.
     rrdensity::Tracker screen;
     assert(!screen.Report(5000, report));
     rrdensity::Frame granted{};
     granted[1] = 100;                  // lobe 1: 100 pixels at full rate
     granted[rrdensity::Buckets] = 100; // lobe 2: 100 pixels not requested
     granted[rrdensity::Extra] = 50;
-    granted[rrdensity::RawExtra] = 80;
+    granted[rrdensity::RawRays] = 80;
     granted[rrdensity::RawMax] = 20;
     granted[rrdensity::Limits] = std::bit_cast<std::uint32_t>((std::numeric_limits<int>::min)());
     screen.Add(granted);
     assert(screen.Density(0) == 1.0 && screen.Density(1) == 0);
     assert(screen.ScreenRays(0) == 1.5 && screen.ScreenRays(1) == 0);
     granted[rrdensity::Extra] = 10;
-    granted[rrdensity::RawExtra] = 5;
+    granted[rrdensity::RawRays] = 5;
     granted[rrdensity::RawMax] = 30;
     granted[rrdensity::Extra + 1] = 7;
-    granted[rrdensity::RawExtra + 1] = 9;
+    granted[rrdensity::RawRays + 1] = 9;
     granted[rrdensity::RawMax + 1] = 4;
     granted[rrdensity::Limits] = 0;
     screen.Add(granted); // sums 60 / 85 / 7 / 9; maxima 30 / 4
     assert(screen.Density(0) == 1.0 && screen.ScreenRays(0) == 1.3); // (200 + 60) / 200
     assert(screen.ScreenRays(1) == 7.0 / 200);                       // 7 extra rays, 200 pixels
     assert(screen.Report(5000 + rrdensity::Tracker::Interval, report));
-    assert(report.find("threshold=0 boundary=0 raysPerScreenPixel=1.300 extraRays=60 rawExtra=85 "
+    assert(report.find("threshold=0 boundary=0 raysPerScreenPixel=1.300 extraRays=60 rawRays=85 "
                        "rawMax=30 | lobe2 raysPerPixel=0.000") != std::string::npos);
-    assert(report.find("raysPerScreenPixel=0.035 extraRays=7 rawExtra=9 rawMax=4 | enabled=0") !=
+    assert(report.find("raysPerScreenPixel=0.035 extraRays=7 rawRays=9 rawMax=4 | enabled=0") !=
            std::string::npos);
     assert(screen.ScreenRays(0) == 0 && screen.ScreenRays(1) == 0); // the window starts over
     // Lobe 2 has its own pixel counts: 60 pixels at full rate, 40 at 1/2, 100 not requested.
