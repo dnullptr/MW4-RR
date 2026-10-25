@@ -613,6 +613,7 @@ static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
 }
 #include "rr_sparse_render.h"
+#include "rr_vrrt_budget_render.h"
 #include "rr_vrrt_render.h"
 static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32_t y, uint32_t z) {
     const auto binding = ShaderDispatches().Get(list->get_native());
@@ -829,6 +830,8 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         const bool live_prepass = PreservePrepass(list, x, y, z);
         if (live_prepass)
             return true;
+        if (PreserveRayBudget(list, x, y, z))
+            return true;
         const auto b = ShaderDispatches().Get(list->get_native());
         auto *device = list->get_device();
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
@@ -864,7 +867,9 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
     return false;
 }
 static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_command t,
-                       reshade::api::resource, uint64_t, uint32_t, uint32_t) {
+                       reshade::api::resource buffer, uint64_t offset, uint32_t draw_count,
+                       uint32_t stride) {
+    ObserveRayListConsumer(l, t, buffer, offset, draw_count, stride);
     RestoreLightingPipeline(l);
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)

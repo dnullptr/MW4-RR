@@ -4,6 +4,7 @@
 #include "rr_responsivity.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
+#include "rr_ray_budget.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -138,6 +139,20 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
+    // Session only: the combo never sets `changed`, so the test is never saved or loaded.
+    int ray_budget = static_cast<int>(rrraybudget::Valid(rrraybudget::mode));
+    if (ImGui::Combo("Ray budget test (experimental)", &ray_budget, rrraybudget::labels,
+                     rrraybudget::Count))
+        rrraybudget::mode = rrraybudget::Valid(static_cast<unsigned>(ray_budget));
+    char ray_status[192];
+    rrraybudget::Describe(LiveRR().RayBudgetStatus(), ray_status, sizeof(ray_status));
+    ImGui::Text("Ray budget test: %s", ray_status);
+    ImGui::TextWrapped("%s", "Session only, never saved. Raises the target of the game's own ray "
+                             "budget so it traces more rays: about one ray per requested pixel; "
+                             "pixels the game asks to multi-sample keep their extra rays. Starts "
+                             "only after the ray lists are proven large enough over 120 frames, "
+                             "costs GPU time, and stops itself for the session with a ReShade.log "
+                             "line if any check fails.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
