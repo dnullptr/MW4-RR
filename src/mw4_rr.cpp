@@ -712,6 +712,62 @@ static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32
     }
     return false;
 }
+// Copies the native specular hit distance read by cs_ray_hit_distance_blur.
+// Only the used tables are proven, as for the sparse copies: a full restore
+// snapshot would wrongly require unused roots after ExecuteIndirect.
+static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t x, uint32_t y,
+                                     uint32_t z) {
+    if (list->get_device()->get_api() != reshade::api::device_api::d3d12)
+        return;
+    const auto binding = ShaderDispatches().Get(list->get_native());
+    if (binding.shader != rrspecular::DistanceBlur || !LiveRR().Enabled() ||
+        !LiveRR().SpecularHitEnabled())
+        return;
+    auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
+        reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
+    auto *state = rrbindings::State(list->get_device());
+    if (!native || !state || !state->tracker.Healthy() ||
+        !AlbedoInspector().SafeCopies(native.Get()) ||
+        !AlbedoInspector().StateCoverage(native.Get()))
+        return;
+    const auto root = state->tracker.CurrentLayout(list->get_native());
+    if (!root)
+        return;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> resources;
+    std::array<rrbindings::Value, 2> values;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto loc = state->tracker.Find(list->get_native(), {false, i ? 13u : 10u});
+        if (!loc.known ||
+            !ComputeState().TableBound(native.Get(),
+                                       reinterpret_cast<ID3D12PipelineState *>(binding.pipeline),
+                                       reinterpret_cast<ID3D12RootSignature *>(root),
+                                       loc.parameter, loc.table))
+            return;
+        auto slot = rrbindings::Resolve(list->get_device(), {loc.table}, loc.offset);
+        if (!slot.heap)
+            return;
+        auto &v = values[i] = state->tracker.Get(slot);
+        if (!v.known || v.buffer || !v.resource ||
+            v.view_type != unsigned(reshade::api::resource_view_type::texture_2d) ||
+            v.first_level || v.levels != 1 || v.first_layer || v.layers > 1)
+            return;
+        resources[i] =
+            fg::NativeObject<ID3D12Resource>(reinterpret_cast<ID3D12Resource *>(v.resource));
+        if (!resources[i])
+            return;
+    }
+    const auto &distance = values[0], &surface = values[1];
+    if (distance.format != unsigned(DXGI_FORMAT_R16_FLOAT) ||
+        distance.view_format != unsigned(DXGI_FORMAT_R16_FLOAT) ||
+        surface.view_format != unsigned(DXGI_FORMAT_R32G32B32A32_UINT) ||
+        distance.width != surface.width || distance.height != surface.height ||
+        !rrspecular::DispatchShape(distance.width, distance.height, x, y, z))
+        return;
+    D3D12_RESOURCE_STATES source_state{};
+    if (!SparseLayouts().Get(native.Get(), resources[0].Get(), source_state))
+        return;
+    LiveRR().SpecularDistance(native.Get(), resources[1].Get(), resources[0].Get(), source_state);
+}
 static void RestoreLightingPipeline(reshade::api::command_list *list) {
     const auto b = ShaderDispatches().Get(list->get_native());
     if (!rrbypass::Target(b.shader) || !b.pipeline)
@@ -726,6 +782,13 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         return false;
     try {
         RestoreLightingPipeline(list);
+        try {
+            PreserveSpecularDistance(list, x, y, z);
+        } catch (...) {
+            static std::atomic<bool> warned{};
+            if (!warned.exchange(true))
+                WriteLog("Specular hit distance validation failed; RR continues without it");
+        }
         const bool live_prepass = PreservePrepass(list, x, y, z);
         if (live_prepass)
             return true;

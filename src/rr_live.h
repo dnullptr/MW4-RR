@@ -26,7 +26,7 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
-        bool sss_used{}, awaiting_prepass{};
+        bool sss_used{}, awaiting_prepass{}, hit_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
         GpuFrame gpu;
@@ -83,6 +83,8 @@ class Controller {
     ComPtr<ID3D12Resource> transparency_source;
     bool sss_enabled{}, sss_failed{};
     UINT64 sss_retry_after{};
+    bool hit_enabled{};
+    unsigned hit_reports{};
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
@@ -268,7 +270,8 @@ class Controller {
                 s.reported = true;
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  s.sss_used && s.sss.admission.accepted,
-                                 s.transparency_used && s.transparency_accepted, s.replaced_sr);
+                                 s.transparency_used && s.transparency_accepted, s.replaced_sr,
+                                 s.hit_used);
                 if (v[0] || !v[1]) {
                     policy.Reject();
                 }
@@ -302,6 +305,56 @@ class Controller {
     void ToggleSss() {
         std::lock_guard lock(mutex);
         SetSssEnabled(!sss_enabled);
+    }
+    bool SpecularHitEnabled() {
+        std::lock_guard lock(mutex);
+        return hit_enabled;
+    }
+    void SetSpecularHitEnabled(bool value) {
+        std::lock_guard lock(mutex);
+        if (hit_enabled != value) {
+            hit_enabled = value;
+            policy.Reject();
+        }
+    }
+    // The native distance blur runs after the prepass on the same recording and
+    // reads that prepass's PackedSurface. Only a copy is recorded; the caller has
+    // proven the dispatch, tables, views and the source's tracked state.
+    bool SpecularDistance(ID3D12GraphicsCommandList *cl, ID3D12Resource *surface,
+                          ID3D12Resource *source, D3D12_RESOURCE_STATES source_state) {
+        std::lock_guard lock(mutex);
+        if (!enabled || !hit_enabled || failed || retired || !cl || !surface || !source)
+            return false;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.gpu.sources[3].Get() == surface) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match)
+            return false;
+        try {
+            rrinternal::Scope copy_guard;
+            rrcompute::Tracker::Internal state_guard;
+            const bool copied =
+                match->gpu.CopySpecularDistance(cl, pipelines, source, source_state);
+            if (hit_reports < 2) {
+                ++hit_reports;
+                const auto d = source->GetDesc();
+                char line[192];
+                snprintf(line, sizeof(line),
+                         "Specular hit distance %s: source=%llux%u format=%u state=0x%x "
+                         "guides=%ux%u",
+                         copied ? "copied" : "rejected", d.Width, d.Height, unsigned(d.Format),
+                         unsigned(source_state), match->gpu.w, match->gpu.h);
+                Log(line);
+            }
+            return copied;
+        } catch (const std::exception &e) {
+            Failure(e.what());
+            return false;
+        }
     }
 
     bool OwnedSssDraw(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *variant,
@@ -574,7 +627,7 @@ class Controller {
     rrstatus::Snapshot Status() {
         std::lock_guard lock(mutex);
         return status.Read({enabled, sss_enabled, transparency_enabled, failed, retired, sss_failed,
-                            transparency_failed},
+                            transparency_failed, hit_enabled},
                            GetTickCount64());
     }
     bool Enabled() {
@@ -1029,6 +1082,9 @@ class Controller {
 
             // An optional per-evaluation hint may be NULL without invalidating native
             // radiance/history. Explicit toggles and real frame rejection still Reject.
+            s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
+                          !o.color_x && !o.color_y;
+
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
             s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y);
@@ -1062,7 +1118,8 @@ class Controller {
                                         s->gpu.guides[2].Get(),
                                         s->sss_used ? s->gpu.sss.guide.Get() : nullptr,
                                         s->transparency_used ? s->gpu.transparency.guide.Get()
-                                                             : nullptr};
+                                                             : nullptr,
+                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
             rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
                                        s->projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
@@ -1078,6 +1135,9 @@ class Controller {
             }
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
+            if (s->hit_used)
+                Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1086,6 +1146,9 @@ class Controller {
                 Log("RR evaluation threw; restoring resources for native SR");
             }
             s->inference_ok = NVSDK_NGX_SUCCEED(evaluated_result);
+            if (s->hit_used)
+                Change(cl.Get(), s->gpu.specular_hit.Get(),
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)

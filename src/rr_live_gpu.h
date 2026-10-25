@@ -12,6 +12,7 @@
 #include "rr_transparency_guide.h"
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
+#include "rr_specular_distance.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -189,6 +190,10 @@ struct GpuFrame {
                 return 0;
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R32_UINT)))
             return 0;
+        auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        distance.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (!add(distance))
+            return 0;
         auto buffer = rrprivate::Buffer(256);
         if (!add(buffer))
             return 0;
@@ -220,12 +225,15 @@ struct GpuFrame {
     rrvrrt::Inputs probability_inputs;
     std::array<ComPtr<ID3D12Resource>, 4> sr;
     ComPtr<ID3D12Resource> rr_output, depth, depth_buffer, header, stats, readback;
+    // Owned copy of the native specular hit distance; hit_source is retained
+    // until the recording that copied it retires.
+    ComPtr<ID3D12Resource> specular_hit, hit_source;
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
-    bool use_depth{};
+    bool use_depth{}, hit_ready{};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
@@ -277,6 +285,8 @@ struct GpuFrame {
     void Prepare(Pipelines &p, Budget &b, const std::array<ComPtr<ID3D12Resource>, 4> &in,
                  const std::array<ComPtr<ID3D12Resource>, 2> &cb,
                  const std::array<UINT64, 2> &off) {
+        hit_ready = false;
+        hit_source.Reset();
         if (heap) {
             Require(w == in[3]->GetDesc().Width && h == in[3]->GetDesc().Height,
                     "live guide generation was not retired before size change");
@@ -304,6 +314,9 @@ struct GpuFrame {
             UAV(p, guides[i].Get(), 4 + i);
         }
         SRV(p, guides[3].Get(), 8);
+        auto distance = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        distance.Flags = D3D12_RESOURCE_FLAG_NONE;
+        specular_hit = Allocate(p, b, distance);
         header = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RANGE empty{};
         void *m{};
@@ -316,6 +329,26 @@ struct GpuFrame {
         readback = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
     }
 
+    // Copy-only: records no shader state. Caller proves the native dispatch,
+    // its bindings and the recording; this checks extent, format and state.
+    bool CopySpecularDistance(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *source,
+                              D3D12_RESOURCE_STATES source_state) {
+        if (!cl || !source || !specular_hit || hit_ready ||
+            !rrspecular::ValidSource(source->GetDesc(), w, h, source_state))
+            return false;
+        ComPtr<ID3D12Device> device;
+        if (FAILED(source->GetDevice(IID_PPV_ARGS(&device))) ||
+            !fg::SameNativeObject(device.Get(), p.device.Get()))
+            return false;
+        hit_source = source;
+        hit_ready = true;
+        Change(cl, source, source_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(specular_hit.Get(), source);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        Change(cl, source, D3D12_RESOURCE_STATE_COPY_SOURCE, source_state);
+        return true;
+    }
     void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p) {
         Order(cl);
         for (unsigned i = 2; i < 4; ++i)
@@ -537,6 +570,8 @@ struct GpuFrame {
         constants = {};
         sr = {};
         probability_inputs = {};
+        hit_source.Reset();
+        hit_ready = false;
     }
     void Release(Budget &b) {
         if (header_map)

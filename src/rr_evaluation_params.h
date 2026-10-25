@@ -65,6 +65,7 @@ struct Resources {
     ID3D12Resource *specular{};
     ID3D12Resource *sss{};
     ID3D12Resource *before_transparency{};
+    ID3D12Resource *specular_hit{};
 };
 inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const Resources &r,
                                float *world_to_view, float *view_to_clip) {
@@ -77,7 +78,7 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_GBuffer_Normals, r.normal);
     p.Set(NVSDK_NGX_Parameter_GBuffer_Roughness, static_cast<ID3D12Resource *>(nullptr));
     // Set every frame, including null: never reuse a prior frame's optional guide.
-    p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, static_cast<ID3D12Resource *>(nullptr));
+    p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, r.specular_hit);
     p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance_Subrect_Base_Y, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ScreenSpaceSubsurfaceScatteringGuide, r.sss);
