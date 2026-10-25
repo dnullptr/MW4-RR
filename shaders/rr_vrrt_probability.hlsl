@@ -25,15 +25,22 @@ uint PixelInverse(uint2 p,uint2 size,out bool supported){
  }
  return packed;
 }
-[numthreads(16,16,1)]
-void main(uint3 id:SV_DispatchThreadID){
- uint w,h,bytes;Requests.GetDimensions(w,h);Probability.GetDimensions(bytes);
- uint x=id.x*2,y=id.y;if(x>=w||y>=h)return;
+// Diagnostic only: per lobe, how many pixels got each inverse rate (bucket 0 =
+// not requested, 16 = 16 or more), plus the budget limits and rate settings.
+// The caller zeroes RateStats before this dispatch; nothing native reads it.
+RWByteAddressBuffer RateStats:register(u2);
+static const uint RateBuckets=17,RateBase=64,RateLimits=RateBase+2*RateBuckets*4;
+groupshared uint rateCounts[2*RateBuckets];
+void CountRates(uint packed){
+ for(uint lobe=0;lobe<2;++lobe)InterlockedAdd(rateCounts[lobe*RateBuckets+min((packed>>(lobe*8))&255,16u)],1);
+}
+bool Convert(uint2 id,uint w,uint h,uint bytes){
+ uint x=id.x*2,y=id.y;if(x>=w||y>=h)return false;
  uint rows=w>0?min(32u,(131072u-16u)/(w*2u)):0;
  bool dimensions=w>0&&w<=RR_TEXTURE2D_LIMIT&&(w&1)==0&&h>0&&h<=RR_TEXTURE2D_LIMIT&&rows>0;
  if(dimensions)dimensions=bytes>=((h+rows-1)/rows)*131072;
  dimensions=dimensions&&all(asfloat(Scene[86].xy)==float2(w,h));
- if(!dimensions){GuideStatus[uint2(x,y)]=0;if(x+1<w)GuideStatus[uint2(x+1,y)]=0;return;}
+ if(!dimensions){GuideStatus[uint2(x,y)]=0;if(x+1<w)GuideStatus[uint2(x+1,y)]=0;return false;}
  uint chunk=y/rows,base=chunk*131072;
  if(x==0&&(y%rows)==0)Probability.Store4(base,uint4(w,h,y,min(rows,h-y)));
  bool valid0,valid1;
@@ -43,4 +50,21 @@ void main(uint3 id:SV_DispatchThreadID){
  if(!valid1)GuideStatus[uint2(x+1,y)]=0;
  uint offset=base+16+((y%rows)*w+x)*2;
  Probability.Store(offset,a|(b<<16));
+ CountRates(a);
+ if(x+1<w)CountRates(b);
+ return true;
+}
+[numthreads(16,16,1)]
+void main(uint3 id:SV_DispatchThreadID,uint index:SV_GroupIndex){
+ uint w,h,bytes;Requests.GetDimensions(w,h);Probability.GetDimensions(bytes);
+ if(index<2*RateBuckets)rateCounts[index]=0;
+ GroupMemoryBarrierWithGroupSync();
+ bool first=Convert(id.xy,w,h,bytes)&&all(id.xy==0);
+ GroupMemoryBarrierWithGroupSync();
+ if(index<2*RateBuckets&&rateCounts[index]!=0){uint old;RateStats.InterlockedAdd(RateBase+index*4,rateCounts[index],old);}
+ if(first){
+  int4 limits=int4(asint(Budget.Load2(0)),asint(Budget.Load2(16)));
+  RateStats.Store4(RateLimits,asuint(limits));
+  RateStats.Store3(RateLimits+16,Settings[1].xyz);
+ }
 }

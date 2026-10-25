@@ -13,6 +13,7 @@
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
 #include "rr_specular_distance.h"
+#include "rr_ray_density.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -148,7 +149,7 @@ struct Pipelines {
         if (probability)
             return;
         D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
-                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
+                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 0}};
         D3D12_ROOT_PARAMETER p[4]{};
         for (unsigned i = 0; i < 2; ++i) {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -383,7 +384,7 @@ struct GpuFrame {
             probability = Allocate(p, b, desc);
         }
         if (!probability_heap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
             Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&probability_heap)),
                   "native VRRT immutable descriptor heap");
@@ -416,10 +417,23 @@ struct GpuFrame {
         u.Format = DXGI_FORMAT_R32_UINT;
         u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         p.device->CreateUnorderedAccessView(guides[3].Get(), nullptr, &u, {cpu.ptr + 3 * p.stride});
+        Require(stats && header, "native VRRT rate statistics unavailable");
+        u = {};
+        u.Format = DXGI_FORMAT_R32_TYPELESS;
+        u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        u.Buffer.NumElements = UINT(stats->GetDesc().Width / 4);
+        u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        p.device->CreateUnorderedAccessView(stats.Get(), nullptr, &u, {cpu.ptr + 4 * p.stride});
         // All allocations/descriptors/references exist before recording any change.
         Change(cl, probability.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Change(cl, guides[3].Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Zero the rate statistics from the header's never-written tail.
+        constexpr UINT64 rates = rrdensity::Offset, rate_bytes = 256 - rrdensity::Offset;
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(stats.Get(), rates, header.Get(), rates, rate_bytes);
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {probability_heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
@@ -433,6 +447,8 @@ struct GpuFrame {
         Change(cl, probability.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COMMON);
         Change(cl, guides[3].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COMMON);
+        Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COMMON);
     }
     void PrepareSR(Pipelines &p, Budget &b, const rreval::Options &o,
@@ -543,7 +559,7 @@ struct GpuFrame {
         Change(cl, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 16);
+        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 256);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
     // tolerate: count isolated unusable guide pixels instead of rejecting the frame.
@@ -566,6 +582,17 @@ struct GpuFrame {
         D3D12_RANGE r{0, 16};
         Check(readback->Map(0, &r, &m), "live stats map failed");
         memcpy(v.data(), m, 16);
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
+    // Valid only for a frame whose native VRRT reader ran (see Probability).
+    rrdensity::Frame ReadRates() {
+        rrdensity::Frame v{};
+        void *m{};
+        D3D12_RANGE r{rrdensity::Offset, rrdensity::Offset + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live rate statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + rrdensity::Offset, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;

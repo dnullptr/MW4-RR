@@ -2,6 +2,7 @@
 #include "rr_live_gpu.h"
 #include "rr_live_policy.h"
 #include "rr_guide_health.h"
+#include "rr_ray_density.h"
 #include "rr_responsivity.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
@@ -81,6 +82,7 @@ class Controller {
     rreval::Options observed_options;
     HistoryPolicy policy;
     rrhealth::Tracker health;
+    rrdensity::Tracker density;
     bool tolerate_isolated = true;
     bool responsivity_enabled{}, responsivity_active{};
     float responsivity_strength = rrresponsivity::DefaultStrength;
@@ -275,6 +277,8 @@ class Controller {
                 auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
                 s.reported = true;
                 health.Frame(v);
+                if (s.gate_recorded && s.native_sampling)
+                    density.Add(s.gpu.ReadRates());
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  s.sss_used && s.sss.admission.accepted,
                                  s.transparency_used && s.transparency_accepted, s.replaced_sr,
@@ -294,6 +298,8 @@ class Controller {
         }
         std::string report;
         if (health.Report(GetTickCount64(), report))
+            Log(report.c_str());
+        if (density.Report(GetTickCount64(), report))
             Log(report.c_str());
     }
 #include "rr_live_pool.inl"

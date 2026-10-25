@@ -4,6 +4,7 @@
 #include "../src/rr_vrs_config.h"
 #include "../src/rr_live_policy.h"
 #include "../src/rr_guide_health.h"
+#include "../src/rr_ray_density.h"
 #include "../src/rr_lighting_source.h"
 #include "../src/rr_responsivity.h"
 #include "../src/rr_specular_distance.h"
@@ -133,4 +134,25 @@ int main() {
     assert(report.find("sanitizedSssFrames=1 maxSanitizedSamples=30") != std::string::npos);
     report.clear();
     assert(!health.Report(1000 + 2 * rrhealth::Tracker::Interval, report) && report.empty());
+
+    // Ray density: lobe 1 fully sampled, lobe 2 at 1/4 with some unrequested pixels.
+    rrdensity::Tracker density;
+    assert(!density.Report(1000, report));
+    rrdensity::Frame rates{};
+    rates[1] = 100;
+    rates[rrdensity::Buckets + 4] = 100;
+    rates[rrdensity::Buckets] = 100;
+    rates[2 * rrdensity::Buckets] = 7;
+    rates[2 * rrdensity::Buckets + 6] = 1;
+    density.Add(rates);
+    assert(density.Density(0) == 1.0 && density.Density(1) == 0.25);
+    assert(density.Report(1000 + rrdensity::Tracker::Interval, report));
+    assert(report.find("lobe1 raysPerPixel=1.000 full=100.0%") != std::string::npos);
+    assert(report.find("lobe2 raysPerPixel=0.250 full=0.0% 1/2-1/4=50.0%") != std::string::npos);
+    assert(report.find("none=50.0% threshold=0") != std::string::npos);
+    assert(report.find("lobe1 raysPerPixel=1.000 full=100.0% 1/2-1/4=0.0% 1/5-1/8=0.0% "
+                       "1/9-1/15=0.0% 1/16+=0.0% none=0.0% threshold=7") != std::string::npos);
+    assert(report.find("clamp=1") != std::string::npos);
+    report.clear();
+    assert(!density.Report(1000 + 2 * rrdensity::Tracker::Interval, report) && report.empty());
 }
