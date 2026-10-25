@@ -184,6 +184,11 @@ static_assert(Pinned(rb::Why::AfterApply, "controller ran after the VRRT apply i
                      "afterApply"));
 static_assert(Pinned(rb::Why::Placement,
                      "the VRRT apply did not read the Budget its own resolve wrote", "placement"));
+static_assert(Pinned(rb::Why::RrOff, "RR is off", "rrOff"));
+static_assert(Pinned(rb::Why::ResolveIdle, "the game's resolve has not run recently",
+                     "resolveIdle"));
+static_assert(Pinned(rb::Why::LoggingOff, "ray budget logging copies are disabled for this session",
+                     "loggingOff"));
 static_assert(Pinned(rb::Why::ListsUnproven, "ray lists not proven at the VRRT apply",
                      "listsUnproven"));
 static_assert(Pinned(rb::Why::ListsRoot, "a ray list is a root UAV (no bounds checks)",
@@ -230,7 +235,7 @@ static_assert(Pinned(rb::Why::Pipeline, "governor pipeline could not be created"
 static_assert(Pinned(rb::Why::Readback, "ray budget readback failed", "readback"));
 static_assert(Pinned(rb::Why::Exception, "internal error", "exception"));
 static_assert(unsigned(rb::Why::Exception) + 1 == unsigned(rb::Why::Count) &&
-              unsigned(rb::Why::Count) == 44 &&
+              unsigned(rb::Why::Count) == 47 &&
               std::string_view(rb::Text(rb::Why::Count)) == "unknown");
 
 // The governor's premise. A pixel gets no ray when not requested, 1 + extra rays at a code of 16 or

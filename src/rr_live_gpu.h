@@ -244,39 +244,41 @@ struct Pipelines {
     // pso, else why not: hr E_INVALIDARG (no root or device, or a root of another device; nothing
     // cached), E_OUTOFMEMORY (nothing cached, worth a retry), another failure of the creation
     // (cached: every later call answers the same), or `full` (every entry holds another root).
+    // created: CreateComputePipelineState ran for this root (now or, for a cached failure,
+    // earlier); false for a root this device cannot use (E_INVALIDARG) and a full cache.
     struct GovernorPipeline {
         ID3D12PipelineState *pso{};
         HRESULT hr = S_OK;
-        bool full{};
+        bool full{}, created{};
     };
     GovernorPipeline Governor(ID3D12RootSignature *root) noexcept {
         ComPtr<ID3D12Device> owner;
         if (!root || !device || FAILED(root->GetDevice(IID_PPV_ARGS(&owner))) ||
             !fg::SameNativeObject(owner.Get(), device.Get()))
-            return {nullptr, E_INVALIDARG, false};
+            return {nullptr, E_INVALIDARG, false, false};
         GovernorEntry *empty{};
         for (auto &e : governors) {
             if (e.root.Get() == root)
-                return {e.pso.Get(), e.pso ? S_OK : e.failed, false};
+                return {e.pso.Get(), e.pso ? S_OK : e.failed, false, true};
             if (!e.root && !empty)
                 empty = &e;
         }
         if (!empty)
-            return {nullptr, S_OK, true};
+            return {nullptr, S_OK, true, false};
         D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
         d.pRootSignature = root;
         d.CS = {RRVrrtGovernor, sizeof(RRVrrtGovernor)};
         empty->root = root;
         const HRESULT hr = device->CreateComputePipelineState(&d, IID_PPV_ARGS(&empty->pso));
         if (SUCCEEDED(hr) && empty->pso)
-            return {empty->pso.Get(), S_OK, false};
+            return {empty->pso.Get(), S_OK, false, true};
         if (hr == E_OUTOFMEMORY) {
             *empty = {};
-            return {nullptr, E_OUTOFMEMORY, false};
+            return {nullptr, E_OUTOFMEMORY, false, true};
         }
         empty->pso.Reset();
         empty->failed = FAILED(hr) ? hr : E_FAIL;
-        return {nullptr, empty->failed, false};
+        return {nullptr, empty->failed, false, true};
     }
     // Hit distance conditioning: SRV table t0-t4, target UAV table, 4 root
     // constants, statistics root UAV u1. Created on first use.

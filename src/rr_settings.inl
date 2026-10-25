@@ -236,11 +236,13 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     rrraybudget::Describe(LiveRR().RayBudgetStatus(), ray_status, sizeof(ray_status));
     ImGui::Text("Ray budget test: %s", ray_status);
     ImGui::TextWrapped("%s", "Session only, never saved. Raises the target of the game's own ray "
-                             "budget so it traces more rays: about one ray per requested pixel; "
-                             "pixels the game asks to multi-sample keep their extra rays. Starts "
-                             "only after the ray lists are proven large enough over 120 frames, "
-                             "costs GPU time, and stops itself for the session with a ReShade.log "
-                             "line if any check fails.");
+                             "budget (1.5x, 2x, or up to about one ray per requested pixel) so it "
+                             "traces more rays. Pixels the game asks to multi-sample normally keep "
+                             "their extra rays; in a frame that would overfill the ray lists, a "
+                             "raised lobe is held to one ray per pixel. Starts only after the ray "
+                             "lists are proven large enough over 120 frames, costs GPU time, and "
+                             "stops itself for the session with a ReShade.log line if any check "
+                             "fails.");
     bool weapon_depth = rrweapondepth::enabled;
     if (ImGui::Checkbox("Weapon depth test: give the weapon its own depth", &weapon_depth)) {
         rrweapondepth::enabled = weapon_depth;

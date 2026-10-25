@@ -34,6 +34,8 @@ inline constexpr std::uint64_t ListHeader = 144, EntryBytes = 4, PixelEntryBytes
 // The governor stores NegativeLimit for a raised lobe's threshold below it (INT_MIN included).
 // From there up, positive thresholds included, a pixel gets at most 1 + max(raw - 16, 0) rays.
 inline constexpr int NegativeLimit = -16;
+// The threshold the governor writes for a lobe whose rays would exceed its headroom.
+inline constexpr int FallbackThreshold = 17;
 // UnverifiedLimit: raised recordings in a row that retired without reader stats (Decide waits);
 // UnverifiedStop: raised recordings without them since the last measured raised frame (a stop).
 inline constexpr unsigned ProofFrames = 120, TargetFrames = 4, UnverifiedLimit = 8,
@@ -60,6 +62,10 @@ enum class Why : unsigned {
     // Same-frame placement (A2): the governed Budget must be read by its own recording's apply.
     AfterApply,
     Placement,
+    // Status reasons while nothing in a recording decides (StatusLocked), and a session-long wait.
+    RrOff,
+    ResolveIdle,
+    LoggingOff,
     ListsUnproven,
     ListsRoot,
     ListsView,
@@ -108,6 +114,9 @@ inline constexpr const char *texts[] = {
     "more than one RR recording on this command list",
     "controller ran after the VRRT apply in this recording",
     "the VRRT apply did not read the Budget its own resolve wrote",
+    "RR is off",
+    "the game's resolve has not run recently",
+    "ray budget logging copies are disabled for this session",
     "ray lists not proven at the VRRT apply",
     "a ray list is a root UAV (no bounds checks)",
     "a ray list is not a raw table buffer view",
@@ -144,13 +153,14 @@ inline constexpr const char *keys[] = {
     "context",          "shape",            "constants",        "heap",
     "budgetBinding",    "budgetIdentity",   "outside",          "afterSR",
     "repeated",         "ambiguous",        "afterApply",       "placement",
-    "listsUnproven",    "listsRoot",        "listsView",        "listsOverlap",
-    "listsSmall",       "listsStable",      "listsStale",       "listsChanged",
-    "evidence",         "vrrtOff",          "resolution",       "targetUnknown",
-    "statsUnverified",  "remapUnknown",     "targetRange",      "atCap",
-    "memory",           "reconfigure",      "governorCache",    "governor",
-    "patchMismatch",    "listsAfterArming", "unsupported",      "statsMismatch",
-    "overflow",         "pipeline",         "readback",         "exception"};
+    "rrOff",            "resolveIdle",      "loggingOff",       "listsUnproven",
+    "listsRoot",        "listsView",        "listsOverlap",     "listsSmall",
+    "listsStable",      "listsStale",       "listsChanged",     "evidence",
+    "vrrtOff",          "resolution",       "targetUnknown",    "statsUnverified",
+    "remapUnknown",     "targetRange",      "atCap",            "memory",
+    "reconfigure",      "governorCache",    "governor",         "patchMismatch",
+    "listsAfterArming", "unsupported",      "statsMismatch",    "overflow",
+    "pipeline",         "readback",         "exception"};
 // clang-format on
 static_assert(sizeof(keys) / sizeof(keys[0]) == unsigned(Why::Count), "one key per Why");
 inline constexpr const char *Text(Why w) {

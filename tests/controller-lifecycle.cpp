@@ -523,6 +523,119 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.Reconfigure() && c.budget.limit == pre - 100);
     }
+    // M5: the status reports the outcome of the last resolve in a recording while it is under
+    // RayActiveMs old and in the selected mode; resolves placed elsewhere never change it. While RR
+    // is off or failed it says so, never active; with no recent resolve it says the game's resolve
+    // has not run; once the logging copies failed, resolves wait for a reason that names it.
+    static void RayStatus() {
+        using rrraybudget::Why;
+        rrraybudget::Plan plan;
+        plan.mask = 1;
+        plan.native = {0.4f, 0.4f};
+        plan.target = {0.8f, 0.4f};
+        plan.armed = RayArmed();
+        rrvrrt::RayResolve in;
+        in.budget_resource = 0x5000;
+        in.budget_offset = 64;
+        auto describe = [](const rrraybudget::Status &s) {
+            char text[256];
+            rrraybudget::Describe(s, text, sizeof(text));
+            return std::string(text);
+        };
+        {
+            Controller c;
+            assert(describe(c.StatusLocked(1000)) == "off");
+            rrraybudget::mode = rrraybudget::Times2;
+            assert(c.StatusLocked(1000).why == Why::RrOff); // RR not enabled
+            auto &s = RayLive(c);
+            assert(c.StatusLocked(1000).why == Why::ResolveIdle);
+            c.ray_logged_mode = rrraybudget::Times2;
+            c.RayPatched(s, plan, in, 1000, rrraybudget::Times2);
+            auto st = c.StatusLocked(1000 + Controller::RayActiveMs);
+            assert(st.active &&
+                   describe(st) == "active: lobe1 0.400 -> 0.800, lobe2 0.400 (not raised)");
+            // Resolves on other lists, and a second one in this recording, do not change it.
+            c.RayMisplaced(Why::Outside, rrraybudget::Times2, 1100);
+            c.RayMisplaced(Why::Repeated, rrraybudget::Times2, 1100);
+            c.RayMisplaced(Why::Ambiguous, rrraybudget::Times2, 1100);
+            assert(c.StatusLocked(1100).active);
+            // RR off or failed: never active, and the reason says so.
+            c.enabled = false;
+            st = c.StatusLocked(1100);
+            assert(!st.active && describe(st) == "waiting: RR is off");
+            c.enabled = true;
+            c.failed = true;
+            assert(!c.StatusLocked(1100).active && c.StatusLocked(1100).why == Why::RrOff);
+            c.failed = false;
+            c.retired = true;
+            assert(!c.StatusLocked(1100).active && c.StatusLocked(1100).why == Why::RrOff);
+            c.retired = false;
+            // Another mode selected since: not this outcome.
+            rrraybudget::mode = rrraybudget::OnePerPixel;
+            assert(!c.StatusLocked(1100).active && c.StatusLocked(1100).why == Why::ResolveIdle);
+            rrraybudget::mode = rrraybudget::Times2;
+            // Too old: the recent misplaced resolve's reason, then that the resolve is idle.
+            st = c.StatusLocked(1001 + Controller::RayActiveMs);
+            assert(!st.active && st.why == Why::Ambiguous);
+            st = c.StatusLocked(1101 + Controller::RayActiveMs);
+            assert(!st.active &&
+                   describe(st) == "waiting: the game's resolve has not run recently");
+            // A refusal in a recording is the reason; before the patch it was older.
+            c.RayRefuse(Why::Evidence, rrraybudget::Times2, 3000);
+            assert(!c.StatusLocked(3000).active && c.StatusLocked(3000).why == Why::Evidence);
+            c.RayMisplaced(Why::Outside, rrraybudget::Times2, 3001);
+            assert(c.StatusLocked(3001).why == Why::Evidence);
+        }
+        // The logging copies failed for the session: a resolve that would reach Decide says so.
+        {
+            Controller c;
+            const auto l = RayLists();
+            rrraybudget::mode = rrraybudget::Times2;
+            RayPrime(c, l);
+            c.ray_log_failed = true;
+            RayLine(c);
+            RayNext(c);
+            RayResolve(c);
+            assert(RayRefused(c) == "loggingOff=1");
+            assert(c.StatusLocked(GetTickCount64()).why == Why::LoggingOff);
+        }
+        rrraybudget::mode = rrraybudget::Off;
+        // The governor's outcomes: a PSO; a full cache or memory waits; a root the device cannot
+        // use (nothing created) is Context, never sticky; only a creation failure is Pipeline.
+        using G = Pipelines::GovernorPipeline;
+        auto *pso = reinterpret_cast<ID3D12PipelineState *>(0x40);
+        assert(Controller::RayGovernor(G{pso, S_OK, false, true}) == Why::None);
+        assert(Controller::RayGovernor(G{nullptr, S_OK, true, false}) == Why::GovernorCache);
+        assert(Controller::RayGovernor(G{nullptr, E_OUTOFMEMORY, false, true}) == Why::Memory);
+        assert(Controller::RayGovernor(G{nullptr, E_INVALIDARG, false, false}) == Why::Context);
+        assert(Controller::RayGovernor(G{nullptr, E_INVALIDARG, false, true}) == Why::Pipeline);
+        assert(Controller::RayGovernor(G{nullptr, E_FAIL, false, true}) == Why::Pipeline);
+        Pipelines none; // no device: nothing created, so Context
+        const auto g = none.Governor(nullptr);
+        assert(!g.pso && g.hr == E_INVALIDARG && !g.created && !g.full);
+        assert(Controller::RayGovernor(g) == Why::Context);
+        // A ListsAfterArming stop names register 253 when it was copied.
+        rrraybudget::Completed f;
+        f.lists = RayLists();
+        f.armed = RayArmed();
+        f.log[28] = 5;
+        char details[320];
+        Controller::RayStopDetails(Why::ListsAfterArming, f, details, sizeof(details));
+        assert(std::string(details).find("scene253") == std::string::npos);
+        f.logged = rrraybudget::LogApplyScene253;
+        Controller::RayStopDetails(Why::ListsAfterArming, f, details, sizeof(details));
+        const std::string text = details;
+        assert(text.size() > 13 && text.compare(text.size() - 11, 11, " scene253=5") == 0);
+        // The active line names both governor thresholds and the clamp.
+        Controller a;
+        logged.clear();
+        a.logger = Logged;
+        a.RayActiveLog(rrraybudget::Times2, plan);
+        assert(logged.find("keeps raised thresholds at -16 or above and, in a frame whose rays "
+                           "would exceed a lobe's headroom, sets that lobe's threshold to 17 (at "
+                           "most one ray per pixel with clamp on; the game's own behaviour with "
+                           "clamp off)") != std::string::npos);
+    }
     static void RayBudget() {
         using rrraybudget::Why;
         using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
@@ -549,7 +662,7 @@ struct ControllerCpuTest {
             in.why = Why::None;
             bool dispatched = false;
             assert(!idle.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched) && !dispatched);
-            assert(idle.ray_why == Why::Outside && !idle.failed);
+            assert(!idle.failed);
             assert(idle.ray_summary.Report(20001, idle.ray_gate, idle.StatusLocked(20001), a, b));
             assert(a.find(" outside=1 ") != std::string::npos);
             assert(a.find(" | refused outside=1") != std::string::npos);
@@ -564,9 +677,9 @@ struct ControllerCpuTest {
             shape.why = Why::Shape;
             bool dispatched = false;
             assert(!live.RayBudgetResolve(nullptr, shape, 3, 1, 1, dispatched) && !dispatched);
-            assert(s.ray_resolved && !s.ray_logged && live.ray_why == Why::Shape);
+            assert(s.ray_resolved && !s.ray_logged);
             assert(!live.RayBudgetResolve(nullptr, shape, 3, 1, 1, dispatched) && !dispatched);
-            assert(live.ray_why == Why::Repeated && !live.failed);
+            assert(RayRefused(live) == "shape=1 repeated=1" && !live.failed);
             // Every recognised apply reaches the gate, proven or not.
             live.RayBudgetApply(nullptr, RayLists(), {});
             assert(s.ray_applied && s.ray_lists == RayLists() && !s.ray_budget);
@@ -586,7 +699,7 @@ struct ControllerCpuTest {
             rrvrrt::RayResolve in;
             bool dispatched = false;
             assert(!two.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched) && !dispatched);
-            assert(two.ray_why == Why::Ambiguous && !two.slots[0].ray_resolved);
+            assert(RayRefused(two) == "ambiguous=1" && !two.slots[0].ray_resolved);
             two.RayBudgetApply(nullptr, RayLists(), {});
             assert(two.ray_gate.Streak() == 0 && !two.slots[0].ray_applied);
         }
@@ -1723,6 +1836,7 @@ struct ControllerCpuTest {
         RayRestart();
         RayOldMark();
         RayReserve();
+        RayStatus();
     }
 };
 } // namespace rrlive

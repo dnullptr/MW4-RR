@@ -21,15 +21,19 @@ struct RayMark {
     rrraybudget::Armed armed;
 };
 static constexpr UINT RayMarkLife = 8;
-static constexpr UINT64 RayActiveMs = 1000; // Status shows a patch as active this long
+static constexpr UINT64 RayActiveMs = 1000; // Status reports the last resolve's outcome this long
 rrraybudget::Gate ray_gate;
 rrraybudget::Summary ray_summary;
 unsigned ray_logged_mode = rrraybudget::Off; // the mode the waiting/active lines are for
-UINT64 ray_retry_after{}, ray_active_at{};
+UINT64 ray_retry_after{};
 ID3D12GraphicsCommandList *ray_early{}; // compared only, never dereferenced
 std::array<bool, unsigned(RayWhy::Count)> ray_waited{};
-rrraybudget::Plan ray_plan;    // the last patched plan
-RayWhy ray_why = RayWhy::Mode; // the last resolve's refusal; None after a patch
+rrraybudget::Plan ray_plan; // the last patched plan
+// The outcome of the last resolve in a recording (a match, not Repeated), at ray_why_at: its
+// refusal, None after a patch. A resolve placed elsewhere (Outside, AfterSR, Ambiguous, Repeated)
+// sets only ray_misplaced at ray_misplaced_at, so it never changes what the status says.
+RayWhy ray_why = RayWhy::Mode, ray_misplaced = RayWhy::None;
+UINT64 ray_why_at{}, ray_misplaced_at{};
 bool ray_announced{};
 std::array<RayMark, 4> ray_marks{};
 unsigned ray_next_mark{};
@@ -70,11 +74,10 @@ void RayStop(RayWhy why, const char *details) noexcept {
     if (ray_gate.Stop(why))
         RayStopLog(why, details);
 }
-// A resolve refused (counted, and the status's reason), logged once per reason per mode
-// selection while a test mode is selected. Returns false: the native resolve runs.
-bool RayRefuse(RayWhy why, unsigned m) noexcept {
+// A refused resolve, counted and logged once per reason per mode selection while a test mode is
+// selected. Returns false: the native resolve runs.
+bool RayCounted(RayWhy why, unsigned m) noexcept {
     ray_summary.Refused(why);
-    ray_why = why;
     const unsigned i = unsigned(why);
     if (m != rrraybudget::Off && why != RayWhy::Stopped && i < ray_waited.size() &&
         !ray_waited[i]) {
@@ -84,6 +87,18 @@ bool RayRefuse(RayWhy why, unsigned m) noexcept {
         RayWrite(line);
     }
     return false;
+}
+// A resolve in a recording refused: the status's reason (RayCounted).
+bool RayRefuse(RayWhy why, unsigned m, UINT64 now) noexcept {
+    ray_why = why;
+    ray_why_at = now;
+    return RayCounted(why, m);
+}
+// A resolve outside any single recording, or a second one in it (RayCounted).
+bool RayMisplaced(RayWhy why, unsigned m, UINT64 now) noexcept {
+    ray_misplaced = why;
+    ray_misplaced_at = now;
+    return RayCounted(why, m);
 }
 // A sticky stop raised at a resolve, which then runs natively.
 bool RayStopResolve(RayWhy why, const char *details) noexcept {
@@ -197,25 +212,33 @@ RayMark RayConsumed(UINT64 resource, UINT64 offset) const noexcept {
     }
     return found;
 }
-// Active while the last patch is under RayActiveMs old and was made in the selected mode.
+static bool RayRecent(UINT64 at, UINT64 now) noexcept {
+    return at && now >= at && now - at <= RayActiveMs;
+}
+// While RR runs, the outcome of the last resolve in a recording when it is under RayActiveMs old
+// and was in the selected mode: active after a patch, else its refusal. Otherwise a recent
+// misplaced resolve's reason, else ResolveIdle. RrOff while RR is off, failed or retired.
 rrraybudget::Status StatusLocked(UINT64 now) const noexcept {
     rrraybudget::Status s;
     s.mode = rrraybudget::Valid(rrraybudget::mode.load(std::memory_order_relaxed));
     s.stopped = ray_gate.Stopped();
-    s.active = s.mode == ray_logged_mode && ray_plan.mask && ray_active_at &&
-               now >= ray_active_at && now - ray_active_at <= RayActiveMs;
+    const bool rr = enabled && !failed && !retired;
+    const bool placed = rr && s.mode == ray_logged_mode && RayRecent(ray_why_at, now);
+    s.active = placed && ray_why == RayWhy::None && ray_plan.mask;
     s.native = ray_plan.native;
     s.target = ray_plan.target;
     for (unsigned l = 0; l < 2; ++l)
         s.raised[l] = (ray_plan.mask >> l & 1) != 0;
     if (s.mode == rrraybudget::Off)
         s.why = RayWhy::Mode;
-    else if (ray_why != RayWhy::None && ray_why != RayWhy::Mode)
+    else if (!rr)
+        s.why = RayWhy::RrOff;
+    else if (placed)
         s.why = ray_why;
-    else { // no resolve refused in this mode yet, or the last patch is old: the gate's reason
-        const auto why = ray_gate.Decide(s.mode, now, nullptr).why;
-        s.why = why == RayWhy::None ? RayWhy::ListsStale : why;
-    }
+    else if (s.mode == ray_logged_mode && RayRecent(ray_misplaced_at, now))
+        s.why = ray_misplaced;
+    else
+        s.why = RayWhy::ResolveIdle;
     return s;
 }
 // The details of a stop Gate::Complete or Gate::Unverified returned for `c`.
@@ -246,21 +269,25 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
                 return;
             }
         break;
-    case RayWhy::ListsAfterArming:
-        std::snprintf(out, size,
-                      "proof=%s extent=%ux%u armed=%ux%u entries=%llu/%llu armed=%llu/%llu "
-                      "u3=%lluB armed=%lluB u2=%lluB armed=%lluB",
-                      rrraybudget::Text(c.lists.why), unsigned(c.lists.w), unsigned(c.lists.h),
-                      unsigned(c.armed.w), unsigned(c.armed.h),
-                      static_cast<unsigned long long>(c.lists.Entries(0)),
-                      static_cast<unsigned long long>(c.lists.Entries(1)),
-                      static_cast<unsigned long long>(c.armed.capacity[0]),
-                      static_cast<unsigned long long>(c.armed.capacity[1]),
-                      static_cast<unsigned long long>(c.lists.v[2].bytes),
-                      static_cast<unsigned long long>(c.armed.pixels),
-                      static_cast<unsigned long long>(c.lists.v[3].bytes),
-                      static_cast<unsigned long long>(c.armed.counter));
+    case RayWhy::ListsAfterArming: {
+        const int at =
+            std::snprintf(out, size,
+                          "proof=%s extent=%ux%u armed=%ux%u entries=%llu/%llu armed=%llu/%llu "
+                          "u3=%lluB armed=%lluB u2=%lluB armed=%lluB",
+                          rrraybudget::Text(c.lists.why), unsigned(c.lists.w), unsigned(c.lists.h),
+                          unsigned(c.armed.w), unsigned(c.armed.h),
+                          static_cast<unsigned long long>(c.lists.Entries(0)),
+                          static_cast<unsigned long long>(c.lists.Entries(1)),
+                          static_cast<unsigned long long>(c.armed.capacity[0]),
+                          static_cast<unsigned long long>(c.armed.capacity[1]),
+                          static_cast<unsigned long long>(c.lists.v[2].bytes),
+                          static_cast<unsigned long long>(c.armed.pixels),
+                          static_cast<unsigned long long>(c.lists.v[3].bytes),
+                          static_cast<unsigned long long>(c.armed.counter));
+        if ((c.logged & rrraybudget::LogApplyScene253) && at > 0 && std::size_t(at) < size)
+            std::snprintf(out + at, size - at, " scene253=%u", unsigned(c.log[28]));
         return;
+    }
     case RayWhy::Unsupported:
         std::snprintf(out, size, "pixels=%u", unsigned(f[rrdensity::Unsupported]));
         return;
@@ -425,11 +452,12 @@ void RayActiveLog(unsigned m, const rrraybudget::Plan &plan) noexcept {
     if (at > 0 && at < int(sizeof(line)))
         std::snprintf(line + at, sizeof(line) - at,
                       "; lists hold %.2fx/%.2fx the extent; the governor keeps raised "
-                      "thresholds at %d or above and holds a lobe to one ray per pixel in a "
-                      "frame whose rays exceed its headroom",
+                      "thresholds at %d or above and, in a frame whose rays would exceed a "
+                      "lobe's headroom, sets that lobe's threshold to %d (at most one ray per "
+                      "pixel with clamp on; the game's own behaviour with clamp off)",
                       extent ? double(plan.armed.capacity[0]) / extent : 0.0,
                       extent ? double(plan.armed.capacity[1]) / extent : 0.0,
-                      rrraybudget::NegativeLimit);
+                      rrraybudget::NegativeLimit, rrraybudget::FallbackThreshold);
     RayWrite(line);
 }
 // The logging copies at a ray site, in every mode (A6): PrepareRayLog, then the recording's
@@ -470,7 +498,7 @@ void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve
                    ray_resolves.load(std::memory_order_relaxed));
         ray_summary.Patched(plan);
         ray_plan = plan;
-        ray_active_at = now;
+        ray_why_at = now;
         ray_why = RayWhy::None;
         if (!ray_announced) {
             ray_announced = true;
@@ -479,6 +507,18 @@ void RayPatched(Slot &s, const rrraybudget::Plan &plan, const rrvrrt::RayResolve
     } catch (...) {
         RayStop(RayWhy::Exception, "after the controller dispatch");
     }
+}
+// What a Pipelines::Governor result means at a resolve: None with a PSO; waits for a full cache
+// (GovernorCache) or memory (Memory, retried); Context when nothing was created (a root of
+// another device: never sticky); a sticky Pipeline stop only for a real creation failure.
+static RayWhy RayGovernor(const Pipelines::GovernorPipeline &g) noexcept {
+    if (g.pso)
+        return RayWhy::None;
+    if (g.full)
+        return RayWhy::GovernorCache;
+    if (g.hr == E_OUTOFMEMORY)
+        return RayWhy::Memory;
+    return g.created ? RayWhy::Pipeline : RayWhy::Context;
 }
 // At every generation change (Reconfigure, SetEnabled on either edge): the gate's apply streak
 // and the placement streak restart, so the first resolves of the new generation are refused
@@ -507,15 +547,15 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
                 after_sr = true;
         }
         if (ambiguous)
-            return RayRefuse(RayWhy::Ambiguous, m);
+            return RayMisplaced(RayWhy::Ambiguous, m, now);
         if (!match) {
             if (!after_sr)
                 ray_early = cl; // a later prepass on this list counts it as beforePrepass
-            return RayRefuse(after_sr ? RayWhy::AfterSR : RayWhy::Outside, m);
+            return RayMisplaced(after_sr ? RayWhy::AfterSR : RayWhy::Outside, m, now);
         }
         auto &s = *match;
         if (s.ray_resolved)
-            return RayRefuse(RayWhy::Repeated, m);
+            return RayMisplaced(RayWhy::Repeated, m, now);
         s.ray_resolved = true;
         s.ray_resolve_cb = in.settings.address;
         RaySerial(s);
@@ -532,49 +572,51 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
             logged = RayLogCopies(
                 s, now, [&] { return s.gpu.LogResolve(cl, in.settings, in.scene, in.stats); });
         if (in.why != RayWhy::None)
-            return RayRefuse(in.why, m);
+            return RayRefuse(in.why, m, now);
         const bool same_budget = ray_gate.KnownBudget(in.budget_resource, in.budget_offset);
         ray_summary.Budget(same_budget);
         if (m == rrraybudget::Off)
-            return RayRefuse(RayWhy::Mode, m);
+            return RayRefuse(RayWhy::Mode, m, now);
         if (!same_budget)
-            return RayRefuse(RayWhy::BudgetIdentity, m);
+            return RayRefuse(RayWhy::BudgetIdentity, m, now);
         // A2: the Budget this resolve governs must be read by this recording's apply, after it.
         // A resolve after the apply would govern the next recording's frame instead, and the
         // placement streak shows that the applies read the Budget their own resolve wrote.
         if (s.ray_applied)
-            return RayRefuse(RayWhy::AfterApply, m);
+            return RayRefuse(RayWhy::AfterApply, m, now);
         if (ray_placement < rrraybudget::ProofFrames)
-            return RayRefuse(RayWhy::Placement, m);
+            return RayRefuse(RayWhy::Placement, m, now);
         if (NeedsReconfigure())
-            return RayRefuse(RayWhy::Reconfigure, m);
+            return RayRefuse(RayWhy::Reconfigure, m, now);
         if (now < ray_retry_after)
-            return RayRefuse(RayWhy::Memory, m);
+            return RayRefuse(RayWhy::Memory, m, now);
+        // No resolve records its stats copy any more: say so, not StatsUnverified forever.
+        if (ray_log_failed)
+            return RayRefuse(RayWhy::LoggingOff, m, now);
         const auto plan = ray_gate.Decide(m, now, nullptr); // no apply in this recording yet
         if (plan.why != RayWhy::None)
-            return RayRefuse(plan.why, m);
+            return RayRefuse(plan.why, m, now);
         // Patch only when this recording's LogResolve copied the governor's input (t0) for
         // this very frame: the gate checks it against the reader only for frames with
         // LogResolveStats. It also guarantees that LogResolve, which alone copies the resolve
         // serial (log word 24), was recorded before PatchResolve, which does not check it.
         if (!(logged & rrraybudget::LogResolveStats))
-            return RayRefuse(RayWhy::StatsUnverified, m);
+            return RayRefuse(RayWhy::StatsUnverified, m, now);
         const auto governor = pipelines.Governor(in.root);
-        if (governor.full)
-            return RayRefuse(RayWhy::GovernorCache, m);
-        if (!governor.pso && governor.hr == E_OUTOFMEMORY) {
+        const auto governor_why = RayGovernor(governor);
+        if (governor_why == RayWhy::Memory)
             ray_retry_after = now + rrraybudget::RetryMs;
-            return RayRefuse(RayWhy::Memory, m);
-        }
-        if (!governor.pso) {
+        if (governor_why == RayWhy::Pipeline) {
             char details[32];
             std::snprintf(details, sizeof(details), "hr=0x%08lx",
                           static_cast<unsigned long>(governor.hr));
             return RayStopResolve(RayWhy::Pipeline, details);
         }
+        if (governor_why != RayWhy::None)
+            return RayRefuse(governor_why, m, now);
         if (!RayPrepare([&] { return s.gpu.PrepareRayPatch(pipelines, budget); })) {
             ray_retry_after = now + rrraybudget::RetryMs;
-            return RayRefuse(RayWhy::Memory, m);
+            return RayRefuse(RayWhy::Memory, m, now);
         }
         ray_memory_waiting = false;
         // Everything that can throw is above this line. Below: noexcept calls and D3D12
@@ -583,7 +625,7 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         rrcompute::Tracker::Internal state;
         const UINT64 va = s.gpu.PatchResolve(cl, in.settings, plan);
         if (!va)
-            return RayRefuse(RayWhy::Constants, m); // nothing was recorded
+            return RayRefuse(RayWhy::Constants, m, now); // nothing was recorded
         cl->SetComputeRootConstantBufferView(in.parameter, va);
         cl->Dispatch(x, y, z);
         dispatched = true;
@@ -605,6 +647,7 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         }
         ray_summary.Refused(RayWhy::Memory);
         ray_why = RayWhy::Memory;
+        ray_why_at = now;
         return dispatched;
     } catch (...) {
         RayStopResolve(RayWhy::Exception, "at the controller resolve");
