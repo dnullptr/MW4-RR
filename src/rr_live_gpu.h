@@ -456,8 +456,9 @@ struct GpuFrame {
         header_map = (UINT *)m;
         memset(m, 0, 256);
         // stats bytes (rr_live_gate.hlsl): 0 bad, 4 copied, 8 isolated, 12 sanitized SSS
-        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20 non-finite
-        // color, 24 non-finite output (ReadFinite); 64+ ray density (ReadRates).
+        // (ReadStats); 16 water pixels (rr_water_masks.hlsl, ReadWaterPixels); 20..63 hit
+        // distance statistics (rr_hit_condition.hlsl, ReadHitStats); 64..227 ray density
+        // (ReadRates); 228 non-finite color, 232 non-finite output (ReadFinite).
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
@@ -994,13 +995,18 @@ struct GpuFrame {
         readback->Unmap(0, &r);
         return v;
     }
-    // Pixels with a non-finite channel: in the color RR receives, in RR's output.
+    // Pixels with a non-finite channel: in the color RR receives, in RR's output. Their
+    // stats bytes follow the hit distance statistics and the ray density.
+    static constexpr UINT FiniteOffset = 228;
+    static_assert(rrhitcond::StatsOffset + 4 * rrhitcond::StatCount <= rrdensity::Offset &&
+                  rrdensity::Offset + 4 * rrdensity::Count <= FiniteOffset &&
+                  FiniteOffset + 8 <= 256);
     std::array<UINT, 2> ReadFinite() {
         std::array<UINT, 2> v{};
         void *m{};
-        D3D12_RANGE r{20, 20 + sizeof(v)};
+        D3D12_RANGE r{FiniteOffset, FiniteOffset + sizeof(v)};
         Check(readback->Map(0, &r, &m), "live finite statistics map failed");
-        memcpy(v.data(), static_cast<const char *>(m) + 20, sizeof(v));
+        memcpy(v.data(), static_cast<const char *>(m) + FiniteOffset, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;

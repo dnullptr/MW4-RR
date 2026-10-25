@@ -7,8 +7,9 @@ Texture2D<float4> Reconstructed:register(t1);
 Texture2D<float4> CurrentColor:register(t2);
 RWTexture2D<float4> GameOutput:register(u0);
 // Stats bytes: 0 bad frame, 4 copied frame, 8 isolated guide pixels, 12 sanitized SSS samples,
-// 16 water pixels (rr_water_masks.hlsl), 20 non-finite color pixels RR receives, 24 non-finite
-// RR output pixels; 64+ ray density (rr_vrrt_probability.hlsl).
+// 16 water pixels (rr_water_masks.hlsl), 20..63 hit distance statistics (rr_hit_condition.hlsl),
+// 64..227 ray density (rr_vrrt_probability.hlsl), 228 non-finite color pixels RR receives,
+// 232 non-finite RR output pixels.
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
 // Flags bit0: tolerate isolated unusable guide pixels. Each such pixel keeps
@@ -31,14 +32,14 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  // One unconditional write also avoids FXC dropping an initial zero store
  // when later branches conditionally overwrite the same raw buffer address.
  Stats.Store4(0,uint4(bad,0,0,0));
- Stats.Store2(20,uint2(0,0)); // not 16: WaterPass zeroes the water count
+ Stats.Store2(228,uint2(0,0)); // not 16..227: the water, hit distance and density passes zero those
 }
 [numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){
  if(id.x>=RenderW||id.y>=RenderH)return;
  uint old;
  // Counted only: the game's color (slot 10) at its subrect, as Display's fallback reads it.
  float3 color=CurrentColor.Load(int3(ColorX+id.x,ColorY+id.y,0)).rgb;
- if(!Finite3(color))Stats.InterlockedAdd(20,1,old);
+ if(!Finite3(color))Stats.InterlockedAdd(228,1,old);
  uint status=Status.Load(int3(id.xy,0));
  if(status>=1&&status<=3)return;
  if(status==4&&(Flags&TolerateIsolated)!=0){Stats.InterlockedAdd(8,1,old);return;}
@@ -61,7 +62,7 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
   return;
  }
  float3 color=Reconstructed.Load(int3(id.xy,0)).rgb;
- if(!Finite3(color)){uint old;Stats.InterlockedAdd(24,1,old);}
+ if(!Finite3(color)){uint old;Stats.InterlockedAdd(232,1,old);}
  // Color scale test (rr_color_scale.h): undo the scale on RR's input. 0 = off.
  if(OutputScale>0)color*=OutputScale;
  GameOutput[id.xy]=float4(color,1);

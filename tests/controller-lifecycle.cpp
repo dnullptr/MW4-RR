@@ -195,10 +195,11 @@ struct ControllerCpuTest {
         assert(logged == "RR feature retirement failed (export missing); allocations retained\n");
         logged.clear();
     }
-    // Each stats reader maps only its own bytes: the water count (16) and the
-    // non-finite counts (20, 24) never overlap.
+    // Each stats reader maps only its own bytes, one after another: the gate (0..15), the
+    // water count (16), the hit distance statistics (20..63), the ray density (64..227)
+    // and the non-finite counts (228, 232).
     static void StatsReaders() {
-        UINT words[64];
+        UINT words[64]; // the whole 256-byte readback
         for (UINT i = 0; i < 64; ++i)
             words[i] = 100 + i; // word i holds 100 + its byte offset / 4
         GpuFrame g;
@@ -209,8 +210,14 @@ struct ControllerCpuTest {
         assert(readback->read.Begin == 0 && readback->read.End == 16);
         assert(g.ReadWaterPixels() == 104);
         assert(readback->read.Begin == 16 && readback->read.End == 20);
-        assert((g.ReadFinite() == std::array<UINT, 2>{105, 106}));
-        assert(readback->read.Begin == 20 && readback->read.End == 28);
+        const auto hit = g.ReadHitStats();
+        assert(hit.front() == 105 && hit.back() == 115);
+        assert(readback->read.Begin == 20 && readback->read.End == 64);
+        const auto rates = g.ReadRates();
+        assert(rates.front() == 116 && rates.back() == 156);
+        assert(readback->read.Begin == 64 && readback->read.End == 228);
+        assert((g.ReadFinite() == std::array<UINT, 2>{157, 158}));
+        assert(readback->read.Begin == 228 && readback->read.End == 236);
     }
     static void WeaponDepth() {
         // The weapon depth test restarts RR only when its setting differs from the depth
