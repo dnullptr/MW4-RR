@@ -34,8 +34,11 @@ static_assert(!rrwater::Wanted(rrwater::Settings{}));
 static_assert(rrwater::ValidGuide(rrwater::Physical) == rrwater::Physical);
 static_assert(rrwater::ValidGuide(rrwater::GuideCount) == rrwater::Mirror);
 static_assert(std::string_view(rrwater::guide_labels[rrwater::Mirror]) == "Game mirror (today)");
-static_assert(rrwater::Flags(true, false, false) == 1 && rrwater::Flags(false, true, false) == 2 &&
-              rrwater::Flags(false, false, true) == 4);
+static_assert(rrwater::Flags(true, false, false, 0) == 1 &&
+              rrwater::Flags(false, true, false, 0) == 2 &&
+              rrwater::Flags(false, false, true, 0) == 4 &&
+              rrwater::Flags(false, true, false, 255) == 0xFF02);
+static_assert(rrwater::Settings{}.discard_strength == 1.0f);
 // Stored values 0..2 keep their meaning; unknown values read as raw lighting.
 static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
@@ -627,11 +630,15 @@ int main() {
     assert(coverage.Last() == 0.0 && coverage.LastPrepass(rrwater::Override) == 0.1);
     assert(coverage.LastPrepass(rrwater::PrepassCount) < 0);
     water.discard = true;
+    water.discard_strength = 0.5f;
+    assert(rrwater::DiscardLevel(1.0f) == 255 && rrwater::DiscardLevel(0.5f) == 128 &&
+           rrwater::DiscardLevel(0.0f) == 0 && rrwater::DiscardLevel(2.0f) == 255 &&
+           rrwater::DiscardLevel(std::numeric_limits<float>::quiet_NaN()) == 0);
     assert(!coverage.Report(1000 + rrwater::Tracker::Interval - 1, report, water));
     assert(coverage.Report(1000 + rrwater::Tracker::Interval, report, water));
     assert(report.find("frames=2 waterPixels avg=12.50% max=25.00% framesWithoutWater=1") !=
            std::string::npos);
-    assert(report.find("responsivity=off(1.00) discard=on animatedMask=off guides=0") !=
+    assert(report.find("responsivity=off(1.00) discard=on(0.50) animatedMask=off guides=0") !=
            std::string::npos);
     assert(report.find("prepass avg/max: special=20.00/30.00% waterFlag=12.50/25.00% "
                        "override=7.50/10.00% bit31=13.00/26.00% specialRejected=0.50/1.00%") !=

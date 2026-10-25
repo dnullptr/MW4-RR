@@ -30,6 +30,9 @@ inline float Clamp(float strength) {
 struct Settings {
     bool responsivity{}, discard{}, animated{};
     float strength = DefaultStrength;
+    // How much RR history the discard drops: 1 sends the full 10000, lower values
+    // a smaller disocclusion value (DiscardValue), so RR keeps part of it.
+    float discard_strength = DefaultStrength;
     unsigned guide = Mirror;
 };
 // Any RR mask that needs the water classification at SR time.
@@ -45,11 +48,16 @@ inline bool UseResponsivity(const Settings &s, bool water_used, bool preset_know
                             unsigned preset) {
     return s.responsivity && Clamp(s.strength) != 0 && water_used && preset_known && preset == 6;
 }
-// Flags read by shaders/rr_water_masks.hlsl (header word 15).
+// Flags read by shaders/rr_water_masks.hlsl (header word 15). Bits 8-15 carry
+// the discard strength as 0..255; the shader sends 10000^(level/255), 0 for 0.
 inline constexpr unsigned FlagResponsivity = 1, FlagDiscard = 2, FlagSssMask = 4;
-inline constexpr unsigned Flags(bool responsivity, bool discard, bool sss_mask) {
+inline unsigned DiscardLevel(float strength) {
+    return static_cast<unsigned>(Clamp(strength) * 255.0f + 0.5f);
+}
+inline constexpr unsigned Flags(bool responsivity, bool discard, bool sss_mask,
+                                unsigned discard_level) {
     return (responsivity ? FlagResponsivity : 0u) | (discard ? FlagDiscard : 0u) |
-           (sss_mask ? FlagSssMask : 0u);
+           (sss_mask ? FlagSssMask : 0u) | ((discard_level & 255u) << 8);
 }
 // Pixel counts per cs_prepass flag, so the log and panel show which kind of
 // special surface the water is. The guide shader codes each surface pixel
@@ -119,12 +127,13 @@ class Tracker {
             char text[640];
             int n = std::snprintf(text, sizeof(text),
                                   "Water (%llus): frames=%u waterPixels avg=%.2f%% max=%.2f%% "
-                                  "framesWithoutWater=%u responsivity=%s(%.2f) discard=%s "
+                                  "framesWithoutWater=%u responsivity=%s(%.2f) discard=%s(%.2f) "
                                   "animatedMask=%s guides=%u prepass avg/max:",
                                   static_cast<unsigned long long>((now - since) / 1000), frames,
                                   100.0 * share_sum / frames, 100.0 * share_max, empty,
                                   s.responsivity ? "on" : "off", Clamp(s.strength),
-                                  s.discard ? "on" : "off", s.animated ? "on" : "off",
+                                  s.discard ? "on" : "off", Clamp(s.discard_strength),
+                                  s.animated ? "on" : "off",
                                   ValidGuide(s.guide));
             static constexpr const char *names[PrepassCount] = {
                 "special", "waterFlag", "override", "bit31", "specialRejected"};

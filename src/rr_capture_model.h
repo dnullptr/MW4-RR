@@ -176,7 +176,7 @@ struct Header {
     float responsivity_strength{};
     // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
     bool water_responsivity{}, water_discard{}, water_animated{};
-    float water_strength{};
+    float water_strength{}, water_discard_strength{};
     unsigned water_guide{};
     // Sky edge responsivity mask test (rr_sky_edge.h).
     bool sky_edge_enabled{};
@@ -436,6 +436,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("water_responsivity"), h.water_responsivity);
     JsonNumber(s.Key("water_strength"), h.water_strength);
     JsonBool(s.Key("water_discard"), h.water_discard);
+    JsonNumber(s.Key("water_discard_strength"), h.water_discard_strength);
     JsonBool(s.Key("water_animated"), h.water_animated);
     JsonUint(s.Key("water_guide"), h.water_guide);
     JsonBool(s.Key("weapon_depth"), h.weapon_depth);
