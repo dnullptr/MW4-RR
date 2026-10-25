@@ -268,6 +268,40 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("Tells RR to hold SSS pixels steadier over time: less boiling, but moving "
                        "SSS surfaces may ghost. Supported on RR preset F only.");
     ImGui::Separator();
+    // Session-only: not saved, so a test mode never sticks across restarts.
+    ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
+    int ray_noise = static_cast<int>(rrapply::NoiseOf(rrapply::noise.load()));
+    if (ImGui::Combo("Ray draws per lobe", &ray_noise, rrapply::noise_labels,
+                     rrapply::NoiseCount))
+        rrapply::noise = rrapply::NoiseOf(static_cast<unsigned>(ray_noise));
+    bool ray_untile = rrapply::untile;
+    if (ImGui::Checkbox("Break the 128-pixel noise repeat", &ray_untile))
+        rrapply::untile = ray_untile;
+    const unsigned ray_variant = rrapply::Selected();
+    const char *ray_reason = rrapply::variant_status[ray_variant].load();
+    switch (rrapply::Current(ray_variant)) {
+    case rrapply::State::Off:
+        ImGui::TextUnformatted("Ray selection: off (game's own)");
+        break;
+    case rrapply::State::Active:
+        ImGui::Text("Ray selection: active (%s)", rrapply::Name(ray_variant));
+        break;
+    case rrapply::State::Unavailable:
+        ImGui::Text("Ray selection: unavailable (%s); game's own in use",
+                    ray_reason ? ray_reason : "not prepared");
+        break;
+    case rrapply::State::Waiting:
+        ImGui::TextUnformatted("Ray selection: waiting for RR");
+        break;
+    }
+    ImGui::TextWrapped("Session-only test. The game uses one noise value per pixel for both ray "
+                       "lobes, so lobe 2's rays land on the pixels lobe 1's rays hit. Separate "
+                       "draws gives lobe 2 its own noise value. Opposite draws makes lobe 2's "
+                       "rays avoid lobe 1's, so fewer pixels get no fresh ray at all. Either way "
+                       "each lobe keeps the game's ray rate. The repeat break shifts the game's "
+                       "128-pixel noise tile differently in each 128-pixel block of the screen. "
+                       "Judge with frame generation off.");
+    ImGui::Separator();
     if (changed) {
         ApplyEnabled();
         SaveToggles();

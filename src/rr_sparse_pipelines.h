@@ -3,6 +3,8 @@
 #include "feed_fg_identity.h"
 #include "rr_shader_versions.h"
 #include "rr_lighting_source.h"
+#include "rr_sss_vertex_proof.h"
+#include "rr_vrrt_apply_shader.h"
 #include "../build/rr_sparse.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
 #include <mutex>
@@ -32,6 +34,8 @@ struct Entry {
     ID3D12PipelineState *scale{};
     // Same preparation per non-raw lighting source, indexed by source - 1.
     std::array<ID3D12PipelineState *, rrlighting::Count - 1> native_lobe{};
+    // VRRT apply only: the ray selection test's patched copies, indexed by rrapply variant.
+    std::array<ID3D12PipelineState *, rrapply::Variants> apply{};
 };
 // rrlighting::Source applied by the first spatial pass replacement.
 inline std::atomic<unsigned> lobe_source{};
@@ -88,7 +92,8 @@ inline void Corrected(reshade::api::device *d) {
 }
 inline void Created(reshade::api::device *d, reshade::api::pipeline p, uint64_t actual,
                     reshade::api::pipeline alternate = {}, ID3D12PipelineState *scale = nullptr,
-                    std::array<ID3D12PipelineState *, rrlighting::Count - 1> lobes = {}) {
+                    std::array<ID3D12PipelineState *, rrlighting::Count - 1> lobes = {},
+                    std::array<ID3D12PipelineState *, rrapply::Variants> apply = {}) {
     std::lock_guard lock(mutex);
     pipelines.erase(p.handle);
     auto h = OriginalHash(actual);
@@ -102,7 +107,7 @@ inline void Created(reshade::api::device *d, reshade::api::pipeline p, uint64_t 
     bool valid = rrversion::NativeTemporal(actual) ||
                  (h == Vrrt && rrversion::SourceBytes(actual) != 0) ||
                  (actual == RRSpatialPassthroughHash && scale);
-    pipelines[p.handle] = {d, h, valid, false, alternate, false, scale, lobes};
+    pipelines[p.handle] = {d, h, valid, false, alternate, false, scale, lobes, apply};
     if (!valid)
         ++unsafe_revision[d];
 }
@@ -212,6 +217,59 @@ inline ID3D12PipelineState *MakeScale(reshade::api::device *d, reshade::api::pip
                                       reshade::api::pipeline p) {
     return MakeScaleVariant(d, root, p, ScaleId, {RRVrrtScale, sizeof(RRVrrtScale)});
 }
+inline constexpr std::array<GUID, rrapply::Variants> ApplyVariantId = {
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x10}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x11}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x12}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x13}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x14}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x15}}};
+// Optional ray selection test: the game's apply shader with rrapply's edits, on the game's
+// root signature. Any failure leaves that variant missing and the native shader in use.
+inline std::array<ID3D12PipelineState *, rrapply::Variants>
+MakeApplyVariants(reshade::api::device *d, reshade::api::pipeline_layout root, uint32_t count,
+                  const reshade::api::pipeline_subobject *objects, reshade::api::pipeline p) noexcept {
+    std::array<ID3D12PipelineState *, rrapply::Variants> result{};
+    static std::array<std::atomic<bool>, rrapply::Variants> reported{};
+    try {
+        const reshade::api::shader_desc *shader = nullptr;
+        for (uint32_t i = 0; objects && i < count; ++i)
+            if (objects[i].type == reshade::api::pipeline_subobject_type::compute_shader &&
+                objects[i].count == 1 && objects[i].data)
+                shader = static_cast<const reshade::api::shader_desc *>(objects[i].data);
+        if (!shader || !shader->code)
+            return result;
+        const auto prepared =
+            rrapply::Shaders().Get(shader->code, shader->code_size, rrsss::ReplayCompiler());
+        for (unsigned v = 1; v < rrapply::Variants; ++v) {
+            const char *status = prepared.status[v];
+            if (const auto &code = prepared.code[v]) {
+                result[v] = MakeScaleVariant(d, root, p, ApplyVariantId[v],
+                                             {code->data(), code->size()});
+                if (!result[v])
+                    status = "pipeline-creation-failed";
+            }
+            rrapply::variant_status[v].store(status, std::memory_order_relaxed);
+            if (reported[v].exchange(true) || !logger)
+                continue;
+            char line[512], hex[65] = "-";
+            if (result[v])
+                rrapply::Sha256Hex(prepared.code[v]->data(), prepared.code[v]->size(), hex);
+            if (result[v])
+                snprintf(line, sizeof(line), "Ray selection test: %s shader ready (%zu bytes, SHA-256 %s)",
+                         rrapply::Name(v), prepared.code[v]->size(), hex);
+            else
+                snprintf(line, sizeof(line),
+                         "Ray selection test: %s unavailable (%s%s%s); native shader kept",
+                         rrapply::Name(v), status ? status : "unknown",
+                         prepared.detail.empty() ? "" : ": ", prepared.detail.c_str());
+            logger(line);
+        }
+    } catch (...) {
+        result = {};
+    }
+    return result;
+}
 // Optional: a missing variant falls back to raw lighting.
 inline std::array<ID3D12PipelineState *, rrlighting::Count - 1>
 MakeNativeLobeScales(reshade::api::device *d, reshade::api::pipeline_layout root,
@@ -240,7 +298,7 @@ inline void Initialize(reshade::api::device *d, reshade::api::pipeline_layout ro
         return;
     }
     if (h == Vrrt && rrversion::SourceBytes(actual)) {
-        Created(d, p, actual);
+        Created(d, p, actual, {}, nullptr, {}, MakeApplyVariants(d, root, count, objects, p));
         return;
     }
     {
@@ -316,6 +374,17 @@ inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Scale(reshade::api::device *d
                 result = variant;
         }
     }
+    return result;
+}
+// The ray selection test's patched copy of a recognized VRRT apply pipeline, if it was built.
+inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Apply(reshade::api::device *d, uint64_t original,
+                                                         unsigned variant) {
+    std::lock_guard lock(mutex);
+    auto at = pipelines.find(original);
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> result;
+    if (variant && variant < rrapply::Variants && at != pipelines.end() &&
+        at->second.device == d && at->second.hash == Vrrt && at->second.replacement)
+        result = at->second.apply[variant];
     return result;
 }
 inline reshade::api::pipeline Bind(reshade::api::command_list *list,

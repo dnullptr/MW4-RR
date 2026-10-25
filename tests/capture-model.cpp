@@ -648,7 +648,7 @@ static void ManifestShape() {
                               "\"specular_hit_enabled\": false", "\"tolerate_isolated\": false",
                               "\"lighting_input\": 0",           "\"responsivity_enabled\": false",
                               "\"responsivity_strength\": -0.5", "\"guide_test\": 0",
-                              "\"sky_depth_test\": false"};
+                              "\"sky_depth_test\": false",     "\"ray_selection\": 0"};
     for (const char *s : settings)
         assert(Contains(m, s));
     assert(Contains(m, "\"2\": \"sky\""));

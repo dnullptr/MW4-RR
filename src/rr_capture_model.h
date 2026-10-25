@@ -97,6 +97,7 @@ struct Header {
     std::string created;
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{};
+    unsigned ray_selection{}; // rrapply variant of the last VRRT apply dispatch; 0 = native.
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
         responsivity_enabled{}, sky_depth_test{};
@@ -323,6 +324,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonNumber(s.Key("responsivity_strength"), h.responsivity_strength);
     JsonUint(s.Key("guide_test"), h.guide_test);
     JsonBool(s.Key("sky_depth_test"), h.sky_depth_test);
+    JsonUint(s.Key("ray_selection"), h.ray_selection);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";

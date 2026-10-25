@@ -839,6 +839,14 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
             if (!PreserveNativeSampling(list, x, y, z))
                 return false;
             rrbypass::Used(device, b.pipeline, b.shader);
+            // Ray selection test: the patched copy runs this dispatch only, on the same root
+            // arguments; RestoreLightingPipeline rebinds the game's PSO at the next dispatch.
+            if (const auto variant = rrapply::Selected()) {
+                const auto patched = rrbypass::Apply(device, b.pipeline, variant);
+                if (patched)
+                    native->SetPipelineState(patched.Get());
+                rrapply::Dispatched(variant, patched != nullptr);
+            }
             return false;
         }
         if (!LiveRR().SamplingReady(native.Get()))

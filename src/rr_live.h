@@ -5,6 +5,7 @@
 #include "rr_ray_density.h"
 #include "rr_responsivity.h"
 #include "rr_sky_depth_test.h"
+#include "rr_vrrt_apply_patch.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_status.h"
@@ -649,6 +650,7 @@ class Controller {
             h.responsivity_strength = responsivity_strength;
             h.guide_test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
             h.sky_depth_test = rrskydepth::enabled.load(std::memory_order_relaxed);
+            h.ray_selection = rrapply::last_variant.load(std::memory_order_relaxed);
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {
