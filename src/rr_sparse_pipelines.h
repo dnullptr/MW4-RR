@@ -428,7 +428,6 @@ inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Scale(reshade::api::device *d
     }
     return result;
 }
-// The ray selection test's patched copy of a recognized VRRT apply pipeline, if it was built.
 // The ray selection test's copy of a VRRT apply pipeline, or null for the native one. The first
 // request for a variant builds the copies (once per input) and creates its pipeline on this
 // recording thread, a one-off pause when the test is first switched on.
