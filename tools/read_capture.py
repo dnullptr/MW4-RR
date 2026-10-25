@@ -6,7 +6,7 @@ From another script:  sys.path.insert(0, 'tools'); from read_capture import load
 Arrays are float32 (H, W[, C]) for float and R8_UNORM formats, uint32 (H, W) for R32_UINT, else
 uint8 (H, W, bpp).
 CLI: python tools/read_capture.py FOLDER [--npz OUT.npz]   |   python tools/read_capture.py --self-test
-Test passes that change RR's inputs (color_scale, depth_floor): undo them with
+Test passes that change RR's inputs (color_scale, contrast_knee, depth_floor): undo them with
 tools/analyze_sky_edges.py undo_tests(manifest, frames).
 """
 import argparse
@@ -28,7 +28,7 @@ LIGHTING = ['Off (raw lighting)', 'Lobe 1 from native temporal', 'Lobe 2 from na
             'SSS pixels: lobe 2 native temporal', 'SSS pixels: lobe 2 fill gaps',
             'SSS pixels: both lobes native temporal', 'SSS pixels: both lobes fill gaps']
 # Per-frame test settings and their off values; the summary shows only the ones that are on.
-FRAME_TESTS = {'color_scale': 1, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
+FRAME_TESTS = {'color_scale': 1, 'contrast_knee': 0, 'guide_test': 0, 'depth_floor': 0, 'responsivity_source': 'none',
                'hit_distance_test': 0, 'water_masks': False, 'water_guide': 0}
 
 
