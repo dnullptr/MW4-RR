@@ -339,6 +339,12 @@ class SyntheticCaptureTests(unittest.TestCase):
     def setUpClass(cls):
         cls.clean = run()
 
+    def test_weapon_depth_capture_refused(self):
+        manifest, frames = make_capture(None, False)
+        manifest['settings']['weapon_depth'] = True
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            ase.analyze(manifest, frames, tmp)
+
     def test_a_consistent_inputs(self):
         m = self.clean
         self.assertEqual(verdict(m, 'H1'), 'supports')

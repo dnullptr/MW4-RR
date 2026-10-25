@@ -4,8 +4,10 @@
 #include "rr_guide_health.h"
 #include "rr_ray_density.h"
 #include "rr_responsivity.h"
+#include "rr_water.h"
 #include "rr_sky_depth_test.h"
 #include "rr_vrrt_apply_patch.h"
+#include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 #include "rr_status.h"
@@ -35,7 +37,7 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
-        bool sss_used{}, awaiting_prepass{}, hit_used{};
+        bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
@@ -96,8 +98,8 @@ class Controller {
     rrdensity::Tracker density;
     bool tolerate_isolated = true;
     bool responsivity_enabled{}, responsivity_active{};
-    // Development tests (sky edge mask, color brightness, sky depth floor): one
-    // texture each, shared by every slot, created on first use and released by
+    // Development tests (sky edge mask, color brightness, sky depth floor, weapon
+    // depth): one texture each, shared by every slot, created on first use and released by
     // Reconfigure. They sit in the persistent ledger, so pool projections count
     // each once, and the reserve grows by exactly their size (test_reserve,
     // given back on release).
@@ -109,11 +111,27 @@ class Controller {
     };
     // wide_output: RR's output while the color test brightens its input, in FP32
     // so the brightened result does not clip in the FP16 rr_output.
-    DevTest sky_edge_test, color_test, depth_test, wide_output;
+    // weapon_test: the linear depth RR reads while the weapon depth test runs.
+    DevTest sky_edge_test, color_test, depth_test, wide_output, weapon_test;
     UINT64 test_reserve{};
+    // Weapon depth test (rrweapondepth): weapon_linear is the depth type the current RR
+    // feature was created with; weapon_hold says why the test stays off until its setting
+    // next changes. The hold outlives Reconfigure, so a test that cannot run restarts RR
+    // once, never over and over.
+    enum class WeaponHold { None, Memory, Projection, Refused };
+    bool weapon_linear{};
+    WeaponHold weapon_hold{};
+    unsigned weapon_hold_changes{};
+    rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
     // Color scale RR's history was built with (color brightness test).
     float applied_color_scale = 1.0f;
     float responsivity_strength = rrresponsivity::DefaultStrength;
+    // Running water tests (rr_water.h): session-only, off by default.
+    rrwater::Settings water;
+    rrwater::Status water_status;
+    rrwater::Tracker water_stats;
+    bool water_failed{};
+    UINT64 water_retry_after{};
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
@@ -204,6 +222,69 @@ class Controller {
             return false;
         }
     }
+    // The mandatory depth copy for a w x h input, as the SSS and glass
+    // reservations protect it.
+    UINT64 DepthCopyBytes(UINT w, UINT h) const {
+        if (!pipelines.device)
+            return 0;
+        auto texture = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+        texture.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto buffer = rrprivate::Buffer(((UINT64(w) * 4 + 255) & ~255ull) * h);
+        UINT64 total{};
+        for (const auto &d : {texture, buffer}) {
+            const auto n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
+                return 0;
+            total += n;
+        }
+        return total;
+    }
+    // Water storage is optional and all or nothing: a slot runs the water tests
+    // only while every prepared slot holds the storage, so RR never sees them
+    // switch on and off from frame to frame. Like the SSS storage it waits for
+    // a mandatory SR allocation, then reserves the whole pool with water
+    // storage on every slot plus the prepass and depth copy the SSS and glass
+    // reservations protect, so no later mandatory reservation needs more memory
+    // because of it. A slot used for the first time later gets its storage at
+    // that first prepass. A budget or memory shortage leaves the water tests
+    // waiting and retries a second later; any other failure turns them off for
+    // the session instead of turning RR off.
+    bool PrepareWater(GpuFrame &frame, UINT64 now) {
+        bool complete = frame.water.ready, warm = frame.rr_output != nullptr;
+        for (const auto &s : slots) {
+            complete = complete && (!s.gpu.heap || s.gpu.water.ready);
+            warm = warm || s.gpu.rr_output != nullptr;
+        }
+        if (complete)
+            return true;
+        if (!warm || now < water_retry_after)
+            return false;
+        try {
+            const auto need = GpuFrame::WaterBytes(pipelines.device.Get(), frame.w, frame.h);
+            const auto depth = need ? DepthCopyBytes(frame.w, frame.h) : 0;
+            bool ready = depth && ReservePool(slots.size(), nullptr, nullptr, frame.w, frame.h,
+                                              0, need, depth);
+            for (auto &s : slots)
+                if (ready && s.gpu.heap && !s.gpu.water.ready)
+                    ready = s.gpu.PrepareWater(pipelines, budget);
+            if (ready) {
+                water_retry_after = 0;
+                return true;
+            }
+            if (!water_retry_after)
+                Log("Water tests waiting for GPU budget; allocation will retry");
+        } catch (const rrprivate::AllocationDeferred &) {
+            if (!water_retry_after)
+                Log("Water tests waiting for GPU memory; allocation will retry");
+        } catch (const std::exception &e) {
+            water_failed = true;
+            const std::string line = std::string("Water tests unavailable: ") + e.what();
+            Log(line.c_str());
+            return false;
+        }
+        water_retry_after = now + 1000;
+        return false;
+    }
     bool Complete(const Slot &s) const {
         if (s.poisoned)
             return false;
@@ -251,7 +332,29 @@ class Controller {
         initialized = true;
     }
     bool NeedsReconfigure() const {
-        return layout_pending || (preset.has_effective && preset.desired != preset.effective);
+        return layout_pending || (preset.has_effective && preset.desired != preset.effective) ||
+               (feature && weapon_linear != WeaponDepthWanted());
+    }
+    // The weapon depth test's setting, unless held off since its last change. RR's depth
+    // type is fixed at creation, so a new feature takes it and a change restarts RR.
+    bool WeaponDepthWanted() const {
+        return rrweapondepth::enabled.load(std::memory_order_relaxed) &&
+               (weapon_hold == WeaponHold::None ||
+                weapon_hold_changes != rrweapondepth::changes.load(std::memory_order_relaxed));
+    }
+    void HoldWeaponDepth(WeaponHold why, unsigned changes) {
+        // Frames already in flight on the same RR repeat the same hold: log it once.
+        if (weapon_hold == why && weapon_hold_changes == changes)
+            return;
+        weapon_hold = why;
+        weapon_hold_changes = changes;
+        // UseTest already logged a memory failure.
+        if (why == WeaponHold::Projection)
+            Log("Weapon depth test: the game's projection does not map to linear depth; test "
+                "off until its setting changes");
+        else if (why == WeaponHold::Refused)
+            Log("Weapon depth test: RR did not accept linear depth; test off until its setting "
+                "changes, RR runs with hardware depth");
     }
     void QueueReconfigure() {
         layout_pending = true;
@@ -302,6 +405,7 @@ class Controller {
             s.gpu.Release(budget);
             s = {};
         }
+        water_retry_after = 0;
         sss_mask = {};
         sss_mask_guide.Reset();
         history.Reset();
@@ -309,7 +413,9 @@ class Controller {
         persistent.Release(budget);
         // The test textures were in the persistent ledger; give back the reserve
         // they added, never below what is still allocated.
-        sky_edge_test = color_test = depth_test = wide_output = {};
+        sky_edge_test = color_test = depth_test = wide_output = weapon_test = {};
+        weapon_linear = false;
+        weapon_logged = {};
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
@@ -373,6 +479,10 @@ class Controller {
                 health.Frame(v);
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
+                if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
+                    water_stats.Add(s.gpu.ReadWaterPixels(),
+                                    UINT64((std::min)(s.options.width, s.gpu.w)) *
+                                        (std::min)(s.options.height, s.gpu.h));
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  s.sss_used && !s.guides_withheld && s.sss.admission.accepted,
                                  s.transparency_used && !s.guides_withheld &&
@@ -384,6 +494,8 @@ class Controller {
                     m.stats = v;
                     m.delivered = v[0] == 0 && v[1] != 0;
                     m.replaced_sr = s.replaced_sr;
+                    m.water_masks = s.water_used;
+                    m.water_guide = s.gpu.water_guide;
                     try {
                         capture.Complete(std::move(s.captured));
                     } catch (...) {
@@ -425,6 +537,8 @@ class Controller {
         if (health.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (density.Report(GetTickCount64(), report))
+            Log(report.c_str());
+        if (water_stats.Report(GetTickCount64(), report, water))
             Log(report.c_str());
     }
     // A submitted SR recording that resolves its guide hands it to later
@@ -480,6 +594,8 @@ class Controller {
         sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
         sources[rrcapture::ResponsivityMask] = {r.responsivity};
         sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+        sources[rrcapture::DisocclusionMask] = {r.disocclusion};
+        sources[rrcapture::AnimatedTextureMask] = {r.animated};
         sources[rrcapture::RrOutput] = {r.output, 0, 0, o.out_width, o.out_height};
         return sources;
     }
@@ -650,6 +766,13 @@ class Controller {
             h.responsivity_strength = responsivity_strength;
             h.guide_test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
             h.sky_depth_test = rrskydepth::enabled.load(std::memory_order_relaxed);
+            h.water_responsivity = water.responsivity;
+            h.water_strength = water.strength;
+            h.water_discard = water.discard;
+            h.water_animated = water.animated;
+            h.water_guide = water.guide;
+            // One RR history, so one feature and one depth type for the whole run.
+            h.weapon_depth = done[0].meta.linear_depth;
             h.ray_selection = rrapply::last_variant.load(std::memory_order_relaxed);
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
@@ -717,13 +840,65 @@ class Controller {
     }
     TestState DepthFloorTest() {
         std::lock_guard lock(mutex);
-        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed),
-                    rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
-                        rrguidetest::SkySurface);
+        const bool wanted = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed)) ==
+                            rrguidetest::SkySurface;
+        // While the weapon depth test runs, its linear depth carries the floor instead.
+        if (wanted && weapon_linear && weapon_test.active)
+            return Test(weapon_test, weapon_test.changes, true);
+        return Test(depth_test, rrguidetest::changes.load(std::memory_order_relaxed), wanted);
+    }
+    // Weapon depth test state for the panel. Restarting: RR is being recreated with the
+    // depth type the setting asks for (the change takes effect once in-flight frames retire).
+    enum class WeaponState { Off, Active, Waiting, Restarting, NoMemory, Unsupported, Refused };
+    WeaponState WeaponDepthState() {
+        std::lock_guard lock(mutex);
+        const bool running = enabled && !failed && !retired && feature;
+        if (!rrweapondepth::enabled.load(std::memory_order_relaxed))
+            return running && weapon_linear ? WeaponState::Restarting : WeaponState::Off;
+        if (!WeaponDepthWanted())
+            return weapon_hold == WeaponHold::Memory       ? WeaponState::NoMemory
+                   : weapon_hold == WeaponHold::Projection ? WeaponState::Unsupported
+                                                           : WeaponState::Refused;
+        if (!running)
+            return WeaponState::Waiting;
+        if (!weapon_linear)
+            return WeaponState::Restarting;
+        return weapon_test.active ? WeaponState::Active : WeaponState::Waiting;
     }
     bool Running() {
         std::lock_guard lock(mutex);
         return enabled && !failed && !retired && feature;
+    }
+    // Running water tests (rr_water.h). Nothing is allocated or sent to RR
+    // until a test is on; then each slot keeps its water storage until the
+    // next rebuild (Reconfigure), like the SSS storage. Every test, the guide
+    // mode included, applies from the first prepass that has that storage. A
+    // nonzero colour subrect origin keeps the guide mode but drops the masks,
+    // as it drops the SSS and glass guides.
+    void SetWater(const rrwater::Settings &value) {
+        std::lock_guard lock(mutex);
+        water = value;
+        water.strength = rrwater::Clamp(value.strength);
+        water.guide = rrwater::ValidGuide(value.guide);
+        if (!rrwater::Wanted(water))
+            water_retry_after = 0;
+    }
+    // What the latest evaluation sent, limited to what would still be sent now.
+    rrwater::Status WaterStatus() {
+        std::lock_guard lock(mutex);
+        auto v = water_status;
+        v.wanted = rrwater::Wanted(water);
+        v.unavailable = water_failed;
+        const bool live = v.wanted && enabled && !failed && !retired && !water_failed;
+        v.waiting_memory = live && water_retry_after != 0;
+        v.ready = v.ready && live;
+        v.responsivity = v.responsivity && v.ready &&
+                         rrwater::UseResponsivity(water, true, preset.has_effective,
+                                                  preset.effective);
+        v.discard = v.discard && v.ready && water.discard;
+        v.animated = v.animated && v.ready && water.animated;
+        v.coverage = v.ready ? float(water_stats.Last()) : -1.0f;
+        return v;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -879,14 +1054,15 @@ class Controller {
             if (!s.gpu.rr_output) {
                 return false;
             }
-            UINT64 base = 0, depth = 0;
+            UINT64 base = 0, depth = 0, water_bytes = 0;
             for (const auto &slot : slots) {
                 UINT64 b{}, d{};
                 if (!SlotReservationParts(pipelines.device.Get(), slot.gpu, budget.limit, b, d) ||
-                    b < slot.gpu.sss.bytes)
+                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.water.bytes)
                     return false;
-                base = (std::max)(base, b - slot.gpu.sss.bytes);
+                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.water.bytes);
                 depth = (std::max)(depth, d);
+                water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -902,10 +1078,11 @@ class Controller {
             UINT64 required{};
             const auto optional_sss = rrsss::Gpu::RequiredBytes(pipelines.device.Get(), s.gpu.w,
                                                                 s.gpu.h, stencil.samples);
-            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, 0,
+            // Water test storage (rr_water.h) takes the otherwise unused hit term.
+            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, water_bytes,
                                         persistent.bytes, required) ||
                 !budget.Reserve(pipelines.device.Get(), required) ||
-                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, 0,
+                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, water_bytes,
                                         budget.limit, slots.size())) {
                 return false;
             }
@@ -1254,6 +1431,10 @@ class Controller {
             auto &s = *free;
             s.busy = true;
             s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+            // A null classification view unless a water test wants it this frame.
+            // The guide mode follows it, so every water test waits and fails together.
+            s.gpu.WaterTarget(pipelines, rrwater::Wanted(water) && !water_failed &&
+                                             PrepareWater(s.gpu, GetTickCount64()));
             s.pre = cl;
             s.pre_live = true;
             s.awaiting_prepass = false;
@@ -1267,7 +1448,7 @@ class Controller {
             rrcompute::Tracker::Internal state_guard;
             cl->Dispatch(x, y, z);
             dispatched = true;
-            s.gpu.Convert(cl, pipelines);
+            s.gpu.Convert(cl, pipelines, s.gpu.water_written ? water.guide : rrwater::Mirror);
             restore.Restore(cl, true);
             return true;
         } catch (const std::exception &e) {
@@ -1577,6 +1758,50 @@ class Controller {
             // radiance/history. Explicit toggles and real frame rejection still Reject.
             s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
                           !o.color_x && !o.color_y;
+            // Water tests read the classification this slot's prepass wrote.
+            s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
+                            !o.color_x && !o.color_y;
+
+            auto projection = s->projection;
+            if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
+                static bool described{};
+                if (!described) {
+                    described = true;
+                    char line[200];
+                    rrskydepth::Describe(projection, line, sizeof(line));
+                    Log(line);
+                }
+                rrskydepth::Apply(projection);
+            }
+            // Weapon depth test: RR's depth type is fixed when RR is created, so a frame
+            // follows the feature's type and a new feature takes the setting's. Linear depth
+            // matches the projection RR is given; with the sky guide test, sky stands for
+            // that test's depth floor.
+            const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
+            bool weapon_on = feature ? weapon_linear : WeaponDepthWanted();
+            rrweapondepth::Mapping weapon_map;
+            const bool weapon_mapped =
+                weapon_on &&
+                rrweapondepth::Map(s->projection, projection,
+                                   s->gpu.guide_test == rrguidetest::SkySurface
+                                       ? rrguidetest::DepthFloor
+                                       : 0.0f,
+                                   weapon_map);
+            if (!UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
+                         DXGI_FORMAT_R32_FLOAT, "Weapon depth test") &&
+                weapon_on) {
+                // No GPU memory or an unsupported projection holds the test off. A texture
+                // left at another size is only released: the restart allocates it again.
+                if (!weapon_mapped || weapon_test.blocked)
+                    HoldWeaponDepth(weapon_mapped ? WeaponHold::Memory : WeaponHold::Projection,
+                                    weapon_changes);
+                // A linear-depth RR is never given hardware depth: restart it instead.
+                if (feature) {
+                    QueueReconfigure();
+                    return false;
+                }
+                weapon_on = false;
+            }
 
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
@@ -1597,13 +1822,33 @@ class Controller {
                 Require(api.Valid(), "live NGX exports missing");
                 Require(NVSDK_NGX_SUCCEED(api.allocate(&parameters)) && parameters,
                         "live NGX parameter allocation failed");
-                rreval::CreateParameters(*parameters, o, preset.desired);
+                rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
                 auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
                                           parameters, &feature);
+                if (weapon_on && (NVSDK_NGX_FAILED(created) || !feature)) {
+                    // RR refused linear depth: hold the test and create RR as before.
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    weapon_on = weapon_test.active = false;
+                    feature = nullptr;
+                    rreval::CreateParameters(*parameters, o, preset.desired);
+                    created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
+                                         parameters, &feature);
+                }
                 Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
                 preset.Created();
+                weapon_linear = weapon_on;
+                if (weapon_on) {
+                    int sent = -1;
+                    parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
+                    char line[160];
+                    snprintf(line, sizeof(line),
+                             "Weapon depth test: RR created with linear depth (game create flags "
+                             "0x%x, sent 0x%x)",
+                             unsigned(o.flags), unsigned(sent));
+                    Log(line);
+                }
             }
             // Development tests (shared textures, see UseTest). RR takes one mask:
             // while in use, the sky edge mask replaces the SSS one.
@@ -1646,15 +1891,35 @@ class Controller {
             applied_color_scale = applied;
             // The guide mode this slot's guides were converted with, not the panel's
             // current one, so normals and depth always come from the same mode.
+            // The weapon depth test's linear depth carries the floor itself.
             const bool depth_on =
-                UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface,
+                UseTest(depth_test, s->gpu.guide_test == rrguidetest::SkySurface && !weapon_on,
                         rrguidetest::changes.load(std::memory_order_relaxed), s->gpu.w, s->gpu.h,
                         DXGI_FORMAT_R32_FLOAT, "Sky depth floor");
             // The SSS guide and color before transparency are in the game's color
             // scale, so they are left out while the test scales RR's color.
             s->guides_withheld = color_on;
+            // Water masks, written by WaterPass below. RR takes one responsivity
+            // mask: the water one carries the SSS values too when both are on, and
+            // the sky edge test replaces both.
+            const bool water_responsivity =
+                           !sky_edge_on &&
+                           rrwater::UseResponsivity(water, s->water_used, preset.has_effective,
+                                                    preset.effective),
+                       water_discard = s->water_used && water.discard,
+                       water_animated = s->water_used && water.animated,
+                       water_merge = water_responsivity && responsivity_active;
+            if (s->water_used)
+                s->gpu.WaterHeader(rrwater::Clamp(water.strength),
+                                   rrwater::Flags(water_responsivity, water_discard, water_merge));
+            water_status = {};
+            water_status.ready = s->water_used;
+            water_status.responsivity = water_responsivity;
+            water_status.discard = water_discard;
+            water_status.animated = water_animated;
             rreval::Resources resources{color_on ? color_test.texture.Get() : s->gpu.sr[0].Get(),
-                                        depth_on           ? depth_test.texture.Get()
+                                        weapon_on          ? weapon_test.texture.Get()
+                                        : depth_on         ? depth_test.texture.Get()
                                         : s->gpu.use_depth ? s->gpu.depth.Get()
                                                            : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
@@ -1669,25 +1934,30 @@ class Controller {
                                             ? s->gpu.transparency.guide.Get()
                                             : nullptr,
                                         sky_edge_on           ? sky_edge_test.texture.Get()
+                                        : water_responsivity  ? s->gpu.water.responsivity.Get()
                                         : responsivity_active ? s->gpu.sss.mask.Get()
                                                               : nullptr,
-                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr,
+                                        water_discard ? s->gpu.water.disocclusion.Get()
+                                                      : nullptr,
+                                        water_animated ? s->gpu.water.mask.Get() : nullptr};
             // The test copies are read at their own origin.
             auto evaluated = o;
             if (color_on)
                 evaluated.color_x = evaluated.color_y = 0;
-            if (depth_on)
+            if (depth_on || weapon_on)
                 evaluated.depth_x = evaluated.depth_y = 0;
-            auto projection = s->projection;
-            if (rrskydepth::enabled.load(std::memory_order_relaxed)) {
-                static bool described{};
-                if (!described) {
-                    described = true;
-                    char line[200];
-                    rrskydepth::Describe(projection, line, sizeof(line));
-                    Log(line);
-                }
-                rrskydepth::Apply(projection);
+            if (weapon_on && (weapon_map.scale != weapon_logged.scale ||
+                              weapon_map.offset != weapon_logged.offset ||
+                              weapon_map.sky != weapon_logged.sky)) {
+                weapon_logged = weapon_map;
+                char line[224];
+                snprintf(line, sizeof(line),
+                         "Weapon depth test: world depth %g / (depth + %g), sky %g, weapon "
+                         "slice in front of %g",
+                         weapon_map.scale, weapon_map.offset, weapon_map.sky,
+                         weapon_map.scale / (1 + weapon_map.offset));
+                Log(line);
             }
             rreval::EvaluateParameters(*parameters, evaluated, resources, s->view.data(),
                                        projection.data());
@@ -1704,6 +1974,9 @@ class Controller {
             }
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
+            if (s->water_used)
+                s->gpu.WaterPass(cl.Get(), pipelines,
+                                 water_merge ? s->gpu.sss.mask.Get() : nullptr);
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1716,6 +1989,9 @@ class Controller {
             if (depth_on)
                 s->gpu.FloorDepth(cl.Get(), pipelines, depth_test.texture.Get(), o.depth_x,
                                   o.depth_y, rrguidetest::DepthFloor);
+            if (weapon_on)
+                s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
+                                   o.depth_y, weapon_map);
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1724,6 +2000,8 @@ class Controller {
             if (capture.Active())
                 captured = CaptureLocked(*s, cl.Get(), resources, evaluated,
                                          reset || color_scale_changed, projection);
+            if (captured)
+                s->captured.meta.linear_depth = weapon_on;
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1737,13 +2015,15 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(),
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-            for (auto *t : {&sky_edge_test, &color_test, &depth_test})
+            for (auto *t : {&sky_edge_test, &color_test, &depth_test, &weapon_test})
                 if (t->active)
                     s->gpu.TestFinish(cl.Get(), t->texture.Get());
             // Readable by the gate's Display (GateEnd), then back to COMMON below.
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (s->water_used)
+                s->gpu.WaterFinish(cl.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)
@@ -1758,8 +2038,15 @@ class Controller {
                     Change(cl.Get(), s->gpu.sr[i].Get(),
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
-            if (!s->inference_ok)
-                Failure("RR inference failed; native SR retained");
+            if (!s->inference_ok) {
+                // A linear-depth RR that fails: restart it with hardware depth rather than
+                // turning RR off.
+                if (weapon_on) {
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes);
+                    QueueReconfigure();
+                } else
+                    Failure("RR inference failed; native SR retained");
+            }
             return s->inference_ok;
         } catch (const std::exception &e) {
             Failure(e.what());

@@ -11,6 +11,7 @@
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
 #include "../src/rr_specular_distance.h"
+#include "../src/rr_water.h"
 #include <cassert>
 #include <limits>
 #include <string_view>
@@ -21,6 +22,13 @@ static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
 static_assert(defaults.tolerate_isolated && defaults.native_lobe == rrlighting::Raw);
 static_assert(!defaults.responsivity &&
               defaults.responsivity_strength == rrresponsivity::DefaultStrength);
+// Water tests start off; unknown guide modes read as the game mirror.
+static_assert(!rrwater::Wanted(rrwater::Settings{}));
+static_assert(rrwater::ValidGuide(rrwater::Physical) == rrwater::Physical);
+static_assert(rrwater::ValidGuide(rrwater::GuideCount) == rrwater::Mirror);
+static_assert(std::string_view(rrwater::guide_labels[rrwater::Mirror]) == "Game mirror (today)");
+static_assert(rrwater::Flags(true, false, false) == 1 && rrwater::Flags(false, true, false) == 2 &&
+              rrwater::Flags(false, false, true) == 4);
 // Stored values 0..2 keep their meaning; unknown values read as raw lighting.
 static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
@@ -231,4 +239,41 @@ int main() {
     assert(report.find("clamp=1") != std::string::npos);
     report.clear();
     assert(!density.Report(1000 + 2 * rrdensity::Tracker::Interval, report) && report.empty());
+
+    // Water responsivity needs preset F, a nonzero strength and this frame's water.
+    rrwater::Settings water;
+    water.responsivity = true;
+    assert(rrwater::UseResponsivity(water, true, true, 6));
+    assert(!rrwater::UseResponsivity(water, false, true, 6));
+    assert(!rrwater::UseResponsivity(water, true, false, 6));
+    for (unsigned preset : {0u, 4u, 5u})
+        assert(!rrwater::UseResponsivity(water, true, true, preset));
+    water.strength = -0.5f; // clamps to 0
+    assert(!rrwater::UseResponsivity(water, true, true, 6));
+    assert(rrwater::Clamp(2.0f) == 1.0f && rrwater::Clamp(0.25f) == 0.25f);
+    assert(rrwater::Clamp(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
+    // A guide mode alone still classifies water, so coverage is logged.
+    water = {};
+    water.guide = rrwater::Material;
+    assert(rrwater::Wanted(water) && !rrwater::Masks(water));
+    water.guide = 99;
+    assert(!rrwater::Wanted(water));
+
+    // Water coverage reports once per interval, only with frames, then starts over.
+    rrwater::Tracker coverage;
+    assert(!coverage.Report(1000, report, water) && coverage.Last() < 0);
+    coverage.Add(25, 100);
+    coverage.Add(0, 100);
+    coverage.Add(5, 0); // no pixels: ignored
+    assert(coverage.Last() == 0.0);
+    water.discard = true;
+    assert(!coverage.Report(1000 + rrwater::Tracker::Interval - 1, report, water));
+    assert(coverage.Report(1000 + rrwater::Tracker::Interval, report, water));
+    assert(report.find("frames=2 waterPixels avg=12.5% max=25.0% framesWithoutWater=1") !=
+           std::string::npos);
+    assert(report.find("responsivity=off(1.00) discard=on animatedMask=off guides=0") !=
+           std::string::npos);
+    report.clear();
+    assert(!coverage.Report(1000 + 2 * rrwater::Tracker::Interval, report, water) &&
+           report.empty() && coverage.Last() == 0.0);
 }

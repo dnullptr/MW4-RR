@@ -78,6 +78,9 @@ def main():
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
+    # Running water test masks (src/rr_water.h).
+    header(out / 'rr_water_masks.generated.h', [
+        ('RRWaterMasks', compile_hlsl('rr_water_masks.hlsl', 'rr_water_masks'), False)])
     for source, entry, symbol, leaf in [
         ('rr_convert_guides.hlsl', 'main', 'RRGuideShader', 'rr_convert_guides'),
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
@@ -85,6 +88,7 @@ def main():
         ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
         ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask'),
         ('rr_sky_depth_floor.hlsl', 'main', 'RRSkyDepthFloor', 'rr_sky_depth_floor'),
+        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth'),
         ('rr_color_scale.hlsl', 'main', 'RRColorScale', 'rr_color_scale')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
