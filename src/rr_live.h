@@ -4,6 +4,7 @@
 #include "rr_guide_health.h"
 #include "rr_ray_density.h"
 #include "rr_responsivity.h"
+#include "rr_water.h"
 #include "rr_sky_depth_test.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
@@ -35,7 +36,7 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
-        bool sss_used{}, awaiting_prepass{}, hit_used{};
+        bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
         // The color brightness test kept the SSS and transparency guides from RR.
@@ -115,6 +116,12 @@ class Controller {
     // Color scale RR's history was built with (color brightness test).
     float applied_color_scale = 1.0f;
     float responsivity_strength = rrresponsivity::DefaultStrength;
+    // Running water tests (rr_water.h): session-only, off by default.
+    rrwater::Settings water;
+    rrwater::Status water_status;
+    rrwater::Tracker water_stats;
+    bool water_failed{};
+    UINT64 water_retry_after{};
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
@@ -210,6 +217,69 @@ class Controller {
             sss_retry_after = now + 1000;
             return false;
         }
+    }
+    // The mandatory depth copy for a w x h input, as the SSS and glass
+    // reservations protect it.
+    UINT64 DepthCopyBytes(UINT w, UINT h) const {
+        if (!pipelines.device)
+            return 0;
+        auto texture = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+        texture.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto buffer = rrprivate::Buffer(((UINT64(w) * 4 + 255) & ~255ull) * h);
+        UINT64 total{};
+        for (const auto &d : {texture, buffer}) {
+            const auto n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
+                return 0;
+            total += n;
+        }
+        return total;
+    }
+    // Water storage is optional and all or nothing: a slot runs the water tests
+    // only while every prepared slot holds the storage, so RR never sees them
+    // switch on and off from frame to frame. Like the SSS storage it waits for
+    // a mandatory SR allocation, then reserves the whole pool with water
+    // storage on every slot plus the prepass and depth copy the SSS and glass
+    // reservations protect, so no later mandatory reservation needs more memory
+    // because of it. A slot used for the first time later gets its storage at
+    // that first prepass. A budget or memory shortage leaves the water tests
+    // waiting and retries a second later; any other failure turns them off for
+    // the session instead of turning RR off.
+    bool PrepareWater(GpuFrame &frame, UINT64 now) {
+        bool complete = frame.water.ready, warm = frame.rr_output != nullptr;
+        for (const auto &s : slots) {
+            complete = complete && (!s.gpu.heap || s.gpu.water.ready);
+            warm = warm || s.gpu.rr_output != nullptr;
+        }
+        if (complete)
+            return true;
+        if (!warm || now < water_retry_after)
+            return false;
+        try {
+            const auto need = GpuFrame::WaterBytes(pipelines.device.Get(), frame.w, frame.h);
+            const auto depth = need ? DepthCopyBytes(frame.w, frame.h) : 0;
+            bool ready = depth && ReservePool(slots.size(), nullptr, nullptr, frame.w, frame.h,
+                                              0, need, depth);
+            for (auto &s : slots)
+                if (ready && s.gpu.heap && !s.gpu.water.ready)
+                    ready = s.gpu.PrepareWater(pipelines, budget);
+            if (ready) {
+                water_retry_after = 0;
+                return true;
+            }
+            if (!water_retry_after)
+                Log("Water tests waiting for GPU budget; allocation will retry");
+        } catch (const rrprivate::AllocationDeferred &) {
+            if (!water_retry_after)
+                Log("Water tests waiting for GPU memory; allocation will retry");
+        } catch (const std::exception &e) {
+            water_failed = true;
+            const std::string line = std::string("Water tests unavailable: ") + e.what();
+            Log(line.c_str());
+            return false;
+        }
+        water_retry_after = now + 1000;
+        return false;
     }
     bool Complete(const Slot &s) const {
         if (s.poisoned)
@@ -320,6 +390,7 @@ class Controller {
             s.gpu.Release(budget);
             s = {};
         }
+        water_retry_after = 0;
         sss_mask = {};
         sss_mask_guide.Reset();
         history.Reset();
@@ -396,6 +467,10 @@ class Controller {
                              {finite[0], finite[1], sss, glass, s.hit_used, s.responsivity_used});
                 if (s.gate_recorded && s.native_sampling)
                     density.Add(s.gpu.ReadRates());
+                if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
+                    water_stats.Add(s.gpu.ReadWaterPixels(),
+                                    UINT64((std::min)(s.options.width, s.gpu.w)) *
+                                        (std::min)(s.options.height, s.gpu.h));
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  sss, glass, s.replaced_sr, s.hit_used);
                 if (s.captured.buffer) {
@@ -403,6 +478,8 @@ class Controller {
                     m.stats = v;
                     m.delivered = v[0] == 0 && v[1] != 0;
                     m.replaced_sr = s.replaced_sr;
+                    m.water_masks = s.water_used;
+                    m.water_guide = s.gpu.water_guide;
                     try {
                         capture.Complete(std::move(s.captured));
                     } catch (...) {
@@ -444,6 +521,8 @@ class Controller {
         if (health.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (density.Report(GetTickCount64(), report))
+            Log(report.c_str());
+        if (water_stats.Report(GetTickCount64(), report, water))
             Log(report.c_str());
     }
     // A submitted SR recording that resolves its guide hands it to later
@@ -499,6 +578,8 @@ class Controller {
         sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
         sources[rrcapture::ResponsivityMask] = {r.responsivity};
         sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+        sources[rrcapture::DisocclusionMask] = {r.disocclusion};
+        sources[rrcapture::AnimatedTextureMask] = {r.animated};
         sources[rrcapture::RrOutput] = {r.output, 0, 0, o.out_width, o.out_height};
         return sources;
     }
@@ -669,6 +750,11 @@ class Controller {
             h.responsivity_strength = responsivity_strength;
             h.guide_test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
             h.sky_depth_test = rrskydepth::enabled.load(std::memory_order_relaxed);
+            h.water_responsivity = water.responsivity;
+            h.water_strength = water.strength;
+            h.water_discard = water.discard;
+            h.water_animated = water.animated;
+            h.water_guide = water.guide;
             h.lighting_input = capture_lighting;
             capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
         } catch (const std::exception &e) {
@@ -742,6 +828,37 @@ class Controller {
     bool Running() {
         std::lock_guard lock(mutex);
         return enabled && !failed && !retired && feature;
+    }
+    // Running water tests (rr_water.h). Nothing is allocated or sent to RR
+    // until a test is on; then each slot keeps its water storage until the
+    // next rebuild (Reconfigure), like the SSS storage. Every test, the guide
+    // mode included, applies from the first prepass that has that storage. A
+    // nonzero colour subrect origin keeps the guide mode but drops the masks,
+    // as it drops the SSS and glass guides.
+    void SetWater(const rrwater::Settings &value) {
+        std::lock_guard lock(mutex);
+        water = value;
+        water.strength = rrwater::Clamp(value.strength);
+        water.guide = rrwater::ValidGuide(value.guide);
+        if (!rrwater::Wanted(water))
+            water_retry_after = 0;
+    }
+    // What the latest evaluation sent, limited to what would still be sent now.
+    rrwater::Status WaterStatus() {
+        std::lock_guard lock(mutex);
+        auto v = water_status;
+        v.wanted = rrwater::Wanted(water);
+        v.unavailable = water_failed;
+        const bool live = v.wanted && enabled && !failed && !retired && !water_failed;
+        v.waiting_memory = live && water_retry_after != 0;
+        v.ready = v.ready && live;
+        v.responsivity = v.responsivity && v.ready &&
+                         rrwater::UseResponsivity(water, true, preset.has_effective,
+                                                  preset.effective);
+        v.discard = v.discard && v.ready && water.discard;
+        v.animated = v.animated && v.ready && water.animated;
+        v.coverage = v.ready ? float(water_stats.Last()) : -1.0f;
+        return v;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -897,14 +1014,15 @@ class Controller {
             if (!s.gpu.rr_output) {
                 return false;
             }
-            UINT64 base = 0, depth = 0;
+            UINT64 base = 0, depth = 0, water_bytes = 0;
             for (const auto &slot : slots) {
                 UINT64 b{}, d{};
                 if (!SlotReservationParts(pipelines.device.Get(), slot.gpu, budget.limit, b, d) ||
-                    b < slot.gpu.sss.bytes)
+                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.water.bytes)
                     return false;
-                base = (std::max)(base, b - slot.gpu.sss.bytes);
+                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.water.bytes);
                 depth = (std::max)(depth, d);
+                water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -920,10 +1038,11 @@ class Controller {
             UINT64 required{};
             const auto optional_sss = rrsss::Gpu::RequiredBytes(pipelines.device.Get(), s.gpu.w,
                                                                 s.gpu.h, stencil.samples);
-            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, 0,
+            // Water test storage (rr_water.h) takes the otherwise unused hit term.
+            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, water_bytes,
                                         persistent.bytes, required) ||
                 !budget.Reserve(pipelines.device.Get(), required) ||
-                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, 0,
+                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, water_bytes,
                                         budget.limit, slots.size())) {
                 return false;
             }
@@ -1281,6 +1400,10 @@ class Controller {
             auto &s = *free;
             s.busy = true;
             s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+            // A null classification view unless a water test wants it this frame.
+            // The guide mode follows it, so every water test waits and fails together.
+            s.gpu.WaterTarget(pipelines, rrwater::Wanted(water) && !water_failed &&
+                                             PrepareWater(s.gpu, GetTickCount64()));
             s.pre = cl;
             s.pre_live = true;
             s.awaiting_prepass = false;
@@ -1294,7 +1417,7 @@ class Controller {
             rrcompute::Tracker::Internal state_guard;
             cl->Dispatch(x, y, z);
             dispatched = true;
-            s.gpu.Convert(cl, pipelines);
+            s.gpu.Convert(cl, pipelines, s.gpu.water_written ? water.guide : rrwater::Mirror);
             restore.Restore(cl, true);
             return true;
         } catch (const std::exception &e) {
@@ -1604,6 +1727,9 @@ class Controller {
             // radiance/history. Explicit toggles and real frame rejection still Reject.
             s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
                           !o.color_x && !o.color_y;
+            // Water tests read the classification this slot's prepass wrote.
+            s->water_used = rrwater::Wanted(water) && !water_failed && s->gpu.water_written &&
+                            !o.color_x && !o.color_y;
 
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
@@ -1688,6 +1814,24 @@ class Controller {
             // The SSS guide and color before transparency are in the game's color
             // scale, so they are left out while the test scales RR's color.
             s->guides_withheld = color_on;
+            // Water masks, written by WaterPass below. RR takes one responsivity
+            // mask: the water one carries the SSS values too when both are on, and
+            // the sky edge test replaces both.
+            const bool water_responsivity =
+                           !sky_edge_on &&
+                           rrwater::UseResponsivity(water, s->water_used, preset.has_effective,
+                                                    preset.effective),
+                       water_discard = s->water_used && water.discard,
+                       water_animated = s->water_used && water.animated,
+                       water_merge = water_responsivity && responsivity_active;
+            if (s->water_used)
+                s->gpu.WaterHeader(rrwater::Clamp(water.strength),
+                                   rrwater::Flags(water_responsivity, water_discard, water_merge));
+            water_status = {};
+            water_status.ready = s->water_used;
+            water_status.responsivity = water_responsivity;
+            water_status.discard = water_discard;
+            water_status.animated = water_animated;
             rreval::Resources resources{color_on ? color_test.texture.Get() : s->gpu.sr[0].Get(),
                                         depth_on           ? depth_test.texture.Get()
                                         : s->gpu.use_depth ? s->gpu.depth.Get()
@@ -1704,9 +1848,13 @@ class Controller {
                                             ? s->gpu.transparency.guide.Get()
                                             : nullptr,
                                         sky_edge_on           ? sky_edge_test.texture.Get()
+                                        : water_responsivity  ? s->gpu.water.responsivity.Get()
                                         : responsivity_active ? s->gpu.sss.mask.Get()
                                                               : nullptr,
-                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr,
+                                        water_discard ? s->gpu.water.disocclusion.Get()
+                                                      : nullptr,
+                                        water_animated ? s->gpu.water.mask.Get() : nullptr};
             s->responsivity_used = resources.responsivity != nullptr;
             // The test copies are read at their own origin.
             auto evaluated = o;
@@ -1740,6 +1888,9 @@ class Controller {
             }
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
+            if (s->water_used)
+                s->gpu.WaterPass(cl.Get(), pipelines,
+                                 water_merge ? s->gpu.sss.mask.Get() : nullptr);
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1780,6 +1931,8 @@ class Controller {
             if (wide_output.active)
                 Change(cl.Get(), wide_output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (s->water_used)
+                s->gpu.WaterFinish(cl.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)

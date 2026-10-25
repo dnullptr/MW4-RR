@@ -2,17 +2,19 @@
 private:
 bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
                  const D3D12_RESOURCE_DESC *native_depth = nullptr, UINT guide_width = 0,
-                 UINT guide_height = 0, UINT64 extra_persistent = 0) {
-    UINT64 base{}, depth{}, sss{}, glass{}, output{};
+                 UINT guide_height = 0, UINT64 extra_persistent = 0, UINT64 pending_water = 0,
+                 UINT64 depth_floor = 0) {
+    UINT64 base{}, depth{}, sss{}, glass{}, output{}, water{};
     auto allocation = [&](const D3D12_RESOURCE_DESC &d) {
         return pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
     };
     for (const auto &s : slots) {
         UINT64 b{}, d{};
         if (!SlotReservationParts(pipelines.device.Get(), s.gpu, budget.limit, b, d) ||
-            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes)
+            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes ||
+            b - s.gpu.sss.bytes - s.gpu.transparency.bytes < s.gpu.water.bytes)
             return false;
-        b -= s.gpu.sss.bytes + s.gpu.transparency.bytes;
+        b -= s.gpu.sss.bytes + s.gpu.transparency.bytes + s.gpu.water.bytes;
         if (s.gpu.rr_output) {
             const auto n = allocation(s.gpu.rr_output->GetDesc());
             if (!n || n == UINT64_MAX || n > b)
@@ -24,7 +26,10 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
         depth = (std::max)(depth, d);
         sss = (std::max)(sss, s.gpu.sss.bytes);
         glass = (std::max)(glass, s.gpu.transparency.bytes);
+        water = (std::max)(water, s.gpu.water.bytes);
     }
+    water = (std::max)(water, pending_water);
+    depth = (std::max)(depth, depth_floor);
     if (guide_width || guide_height) {
         const auto bytes =
             GpuFrame::RequiredPrepassBytes(pipelines.device.Get(), guide_width, guide_height);
@@ -55,7 +60,8 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
     }
     UINT64 required{};
     if (extra_persistent > UINT64_MAX - persistent.bytes || output > UINT64_MAX - base ||
-        !rrtrans::RequiredSlots(count, base + output, depth, sss, glass, 0,
+        // Water test storage (rr_water.h) takes the otherwise unused hit term.
+        !rrtrans::RequiredSlots(count, base + output, depth, sss, glass, water,
                                 persistent.bytes + extra_persistent, required))
         return false;
     return budget.Reserve(pipelines.device.Get(), required);
