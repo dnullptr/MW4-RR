@@ -788,7 +788,10 @@ struct GuideSet {
                     w, h, i == 3 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT));
             resources[i] = &r;
         }
+        color =
+            &fakes.emplace_back("color", rrlive::TextureDesc(w, h, DXGI_FORMAT_R11G11B10_FLOAT));
     }
+    FakeResource *color{}; // RR's input colour (GpuFrame::sr[0])
 };
 
 // A prepared slot: device, pipeline helpers, owner and Gpu.
@@ -878,7 +881,7 @@ static void TestPipelineBuild() {
         "check-options", Format("check-format %u", DXGI_FORMAT_R16G16B16A16_FLOAT),
         "root-signature", "compute-pipeline"};
     assert(events == order);
-    // [0] root CBV b0 (control), [1] table t0-t1 then u0-u2, [2] root UAV u3 (stats).
+    // [0] root CBV b0 (control), [1] table t0-t2 then u0-u2, [2] root UAV u3 (stats).
     assert(p.parameters.size() == 3 && p.flags == D3D12_ROOT_SIGNATURE_FLAG_NONE && !p.samplers);
     for (const auto &q : p.parameters)
         assert(q.visibility == D3D12_SHADER_VISIBILITY_ALL);
@@ -887,13 +890,13 @@ static void TestPipelineBuild() {
     const auto &table = p.parameters[1];
     assert(table.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && table.ranges.size() == 2);
     assert(table.ranges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
-           table.ranges[0].NumDescriptors == 2 && table.ranges[0].BaseShaderRegister == 0 &&
+           table.ranges[0].NumDescriptors == 3 && table.ranges[0].BaseShaderRegister == 0 &&
            table.ranges[0].RegisterSpace == 0 &&
            table.ranges[0].OffsetInDescriptorsFromTableStart == 0);
     assert(table.ranges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
            table.ranges[1].NumDescriptors == 3 && table.ranges[1].BaseShaderRegister == 0 &&
            table.ranges[1].RegisterSpace == 0 &&
-           table.ranges[1].OffsetInDescriptorsFromTableStart == 2);
+           table.ranges[1].OffsetInDescriptorsFromTableStart == 3);
     assert(p.parameters[2].type == D3D12_ROOT_PARAMETER_TYPE_UAV && p.parameters[2].reg == 3 &&
            p.parameters[2].space == 0);
     assert(p.code == RRTransparencyBlend && p.code_size == sizeof(RRTransparencyBlend));
@@ -946,12 +949,12 @@ static void TestPipelineLive() {
     assert(d->pParameters[1].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
            t.NumDescriptorRanges == 2);
     assert(t.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
-           t.pDescriptorRanges[0].NumDescriptors == 2 &&
+           t.pDescriptorRanges[0].NumDescriptors == 3 &&
            t.pDescriptorRanges[0].OffsetInDescriptorsFromTableStart == 0);
     assert(t.pDescriptorRanges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
            t.pDescriptorRanges[1].NumDescriptors == 3 &&
            t.pDescriptorRanges[1].BaseShaderRegister == 0 &&
-           t.pDescriptorRanges[1].OffsetInDescriptorsFromTableStart == 2);
+           t.pDescriptorRanges[1].OffsetInDescriptorsFromTableStart == 3);
     assert(d->pParameters[2].ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV &&
            d->pParameters[2].Descriptor.ShaderRegister == 3);
     pipeline = {};
@@ -1070,7 +1073,7 @@ static void TestPrepare() {
     const std::vector<std::string> order = Join(
         SizeQueries(),
         {Format("create-heap type=%u n=1 flags=0 mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
-         Format("create-heap type=%u n=5 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+         Format("create-heap type=%u n=6 flags=%u mask=0", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
          "map control sub=0 read=0-0", "map readback sub=0 read=all",
          Format("rtv coverage fmt=%u dim=%u at=0x10000", DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -1145,7 +1148,7 @@ static void TestPrepareResumes() {
         events.clear();
         assert(gpu.Prepare(owner, p, budget, Scene()) && gpu.Ready());
         assert(owner.calls.size() == 4 && device.heaps.size() == 2);
-        assert(events[0] == (at ? Format("create-heap type=%u n=5 flags=%u mask=0",
+        assert(events[0] == (at ? Format("create-heap type=%u n=6 flags=%u mask=0",
                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
                                 : Format("create-heap type=%u n=1 flags=0 mask=0",
@@ -1379,9 +1382,25 @@ static void TestControl() {
     auto c = Make(Tuning{}, 1919, 1081);
     c.admitted = 7;
     c.reserved[2] = 9;
+    assert(c.flags & PatternFlag);
+    // No colour SRV written yet: the pattern is off for the dispatch.
+    events.clear();
+    s.gpu.WriteControl(c);
+    auto unpatterned = c;
+    unpatterned.flags &= ~PatternFlag;
+    assert(!memcmp(memory, &unpatterned, sizeof(c)));
+    GuideSet g;
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
     events.clear();
     s.gpu.WriteControl(c);
     assert(!memcmp(memory, &c, sizeof(c)));
+    // A null colour clears it again; the caller's control is never changed.
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, nullptr);
+    s.gpu.WriteControl(c);
+    assert(!memcmp(memory, &unpatterned, sizeof(c)) && (c.flags & PatternFlag));
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
+    s.gpu.WriteControl(c);
+    events.clear();
     // Seal writes word 0 only.
     s.gpu.Seal(true);
     UINT word{};
@@ -1415,9 +1434,10 @@ static void TestControlZero() {
     memcpy(&mapped, memory, sizeof(mapped));
     for (auto z : mapped.zero)
         assert(z == 0);
-    // Every other word is the caller's.
+    // Every other word is the caller's (the pattern is off: no colour SRV).
     auto expected = c;
     memset(expected.zero, 0, sizeof(expected.zero));
+    expected.flags &= ~PatternFlag;
     assert(!memcmp(&mapped, &expected, sizeof(mapped)));
 }
 
@@ -1427,26 +1447,69 @@ static void TestDescriptors() {
     const auto heap = s.Heap(false).cpu;
     assert(!s.gpu.Described());
     events.clear();
-    s.gpu.WriteDescriptors(s.pipelines, g.resources);
-    assert(s.gpu.Described());
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
+    assert(s.gpu.Described() && s.gpu.colored);
+    // [1] status, [3..5] guides, then [2] the colour as a Texture2D of its own format.
+    auto color_srv = [&](const char *name, DXGI_FORMAT format) {
+        return Format("srv %s fmt=%u dim=%u map=%#x most=0 mips=1 plane=0 clamp=0 at=%#zx", name,
+                      unsigned(format), D3D12_SRV_DIMENSION_TEXTURE2D,
+                      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, heap + 64);
+    };
     const std::vector<std::string> expected = {
         Format("srv status fmt=%u dim=%u map=%#x most=0 mips=1 plane=0 clamp=0 at=%#zx",
                DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE2D,
                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, heap + 32),
         Format("uav normal counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
-               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 64),
-        Format("uav diffuse counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
                DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 96),
+        Format("uav diffuse counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
+               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 128),
         Format("uav specular counter=null fmt=%u dim=%u mip=0 plane=0 at=%#zx",
-               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 128)};
+               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D, heap + 160),
+        color_srv("color", DXGI_FORMAT_R11G11B10_FLOAT)};
     assert(events == expected);
-    // Immutable until the slot retires: the same guides write nothing again,
-    // other guides are refused.
+    // The guides are immutable until the slot retires: the same guides write
+    // only the colour again, other guides are refused.
     events.clear();
-    s.gpu.WriteDescriptors(s.pipelines, g.resources);
-    assert(events.empty());
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
+    assert(events == std::vector<std::string>{color_srv("color", DXGI_FORMAT_R11G11B10_FLOAT)});
+    // The colour may change every frame; its format is the view's.
+    FakeResource wide("wide", rrlive::TextureDesc(1920, 1080, DXGI_FORMAT_R16G16B16A16_FLOAT));
+    events.clear();
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, &wide);
+    assert(events == std::vector<std::string>{color_srv("wide", DXGI_FORMAT_R16G16B16A16_FLOAT)});
+    assert(s.gpu.colored);
+    // A null colour, or one the pattern cannot read, gets a null R11G11B10
+    // Texture2D SRV, and the pattern is off for that dispatch.
+    auto null_color = [&](ID3D12Resource *color) {
+        s.gpu.colored = true;
+        events.clear();
+        s.gpu.WriteDescriptors(s.pipelines, g.resources, color);
+        return !s.gpu.colored &&
+               events == std::vector<std::string>{color_srv("null", DXGI_FORMAT_R11G11B10_FLOAT)};
+    };
+    assert(null_color(nullptr));
+    auto changed = [&](auto change) {
+        FakeResource bad("bad", rrlive::TextureDesc(1920, 1080, DXGI_FORMAT_R11G11B10_FLOAT));
+        change(bad.desc);
+        return null_color(&bad);
+    };
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.Width = 1919; }));
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.Height = 1079; }));
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.Format = DXGI_FORMAT_R10G10B10A2_UNORM; }));
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS; }));
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.SampleDesc.Count = 4; }));
+    assert(changed([](D3D12_RESOURCE_DESC &d) { d.DepthOrArraySize = 2; }));
+    assert(
+        changed([](D3D12_RESOURCE_DESC &d) { d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D; }));
+    // A larger colour (the guides are the render size) is read at the same coordinates.
+    FakeResource large("large", rrlive::TextureDesc(2560, 1440, DXGI_FORMAT_R32G32B32A32_FLOAT));
+    events.clear();
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, &large);
+    assert(s.gpu.colored &&
+           events == std::vector<std::string>{color_srv("large", DXGI_FORMAT_R32G32B32A32_FLOAT)});
+    events.clear();
     GuideSet other;
-    assert(Throws([&] { s.gpu.WriteDescriptors(s.pipelines, other.resources); }));
+    assert(Throws([&] { s.gpu.WriteDescriptors(s.pipelines, other.resources, g.color); }));
     assert(events.empty() && s.gpu.Described());
 
     // Every guide is checked before any view is written.
@@ -1455,7 +1518,8 @@ static void TestDescriptors() {
         GuideSet bad;
         change(bad);
         events.clear();
-        const bool threw = Throws([&] { t.gpu.WriteDescriptors(t.pipelines, bad.resources); });
+        const bool threw =
+            Throws([&] { t.gpu.WriteDescriptors(t.pipelines, bad.resources, bad.color); });
         return threw && events.empty() && !t.gpu.Described();
     };
     assert(refused([](GuideSet &b) { b.resources[1].Reset(); }));
@@ -1469,7 +1533,7 @@ static void TestDescriptors() {
     Gpu unprepared;
     FakeDevice device;
     FakePipelines p(&device);
-    assert(Throws([&] { unprepared.WriteDescriptors(p, g.resources); }));
+    assert(Throws([&] { unprepared.WriteDescriptors(p, g.resources, g.color); }));
 }
 
 static void TestRecord() {
@@ -1477,7 +1541,7 @@ static void TestRecord() {
     GuideSet g;
     Pipeline pipeline;
     assert(pipeline.Prepare(s.pipelines));
-    s.gpu.WriteDescriptors(s.pipelines, g.resources);
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
     FakeList list;
     events.clear();
     s.gpu.Record(&list, pipeline, g.resources, 1919, 1081);
@@ -1523,7 +1587,7 @@ static void TestHarvest() {
     GuideSet g;
     Pipeline pipeline;
     assert(pipeline.Prepare(s.pipelines));
-    s.gpu.WriteDescriptors(s.pipelines, g.resources);
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
     FakeList list;
     s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
     memcpy(memory, values, sizeof(values)); // the recorded copy lands on the GPU
@@ -1546,7 +1610,7 @@ static void TestHarvestUnexecuted() {
     GuideSet g;
     Pipeline pipeline;
     assert(pipeline.Prepare(s.pipelines));
-    s.gpu.WriteDescriptors(s.pipelines, g.resources);
+    s.gpu.WriteDescriptors(s.pipelines, g.resources, g.color);
     FakeList list;
     s.gpu.Record(&list, pipeline, g.resources, 1920, 1080);
     const UINT values[] = {1, 2000, 300, 9600};
@@ -1576,7 +1640,7 @@ static void TestRelease() {
     assert(events == unmapped);
     assert(!s.gpu.Ready() && !s.gpu.target && !s.gpu.control && !s.gpu.stats && !s.gpu.readback);
     assert(!s.gpu.rtv && !s.gpu.heap && !s.gpu.bytes && !s.gpu.ControlAddress());
-    assert(!s.gpu.Described() && s.gpu.Matches(Scene(1280, 720)));
+    assert(!s.gpu.Described() && !s.gpu.colored && s.gpu.Matches(Scene(1280, 720)));
     for (auto &r : s.owner.resources)
         assert(r.refs == 1);
     for (auto &h : s.device.heaps)
