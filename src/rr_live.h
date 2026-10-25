@@ -205,8 +205,9 @@ class Controller {
             if (done == UINT64_MAX || done < signaled)
                 return false;
         }
-        // Pooled and collected readback buffers may belong to the device being retired.
-        if (capture.Active())
+        // Pooled and collected readback buffers may belong to the device being retired. An Armed
+        // capture has none yet and keeps waiting for RR.
+        if (capture.state == rrcapture::State::Collecting)
             CaptureFailed("RR was reconfigured");
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
@@ -369,9 +370,28 @@ class Controller {
         }
         LogCaptureFailure();
     }
-    // Copies what RR is given this frame, plus the Status guide, before RR reads it. Every
-    // source is in NON_PIXEL_SHADER_RESOURCE here and Record leaves it there.
-    void CaptureLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
+    // Everything a capture copies this frame: what RR is given, the Status guide and RR's output.
+    rrcapture::Sources CaptureSources(const Slot &s, const rreval::Resources &r,
+                                      const rreval::Options &o) const {
+        rrcapture::Sources sources{};
+        sources[rrcapture::Color] = {r.color, o.color_x, o.color_y};
+        sources[rrcapture::Depth] = {r.depth, o.depth_x, o.depth_y};
+        sources[rrcapture::Motion] = {r.motion, o.motion_x, o.motion_y};
+        sources[rrcapture::NormalRoughness] = {r.normal};
+        sources[rrcapture::DiffuseAlbedo] = {r.diffuse};
+        sources[rrcapture::SpecularAlbedo] = {r.specular};
+        sources[rrcapture::Status] = {s.gpu.guides[3].Get()};
+        sources[rrcapture::SssGuide] = {r.sss};
+        sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
+        sources[rrcapture::ResponsivityMask] = {r.responsivity};
+        sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+        sources[rrcapture::RrOutput] = {r.output, 0, 0, o.out_width, o.out_height};
+        return sources;
+    }
+    // Copies what RR is given this frame, plus the Status guide, before RR reads it: inputs
+    // [0, RrOutput), each in NON_PIXEL_SHADER_RESOURCE here, where Record leaves it. Returns
+    // whether it recorded this frame; CaptureOutputLocked then adds RR's output.
+    bool CaptureLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
                        const rreval::Options &o, bool reset,
                        const std::array<float, 16> &projection) {
         try {
@@ -382,25 +402,14 @@ class Controller {
                     if (v.captured.buffer && v.captured.session == capture.session)
                         ++in_flight;
                 if (!capture.Wants(in_flight))
-                    return;
+                    return false;
             }
-            rrcapture::Sources sources{};
-            sources[rrcapture::Color] = {r.color, o.color_x, o.color_y};
-            sources[rrcapture::Depth] = {r.depth, o.depth_x, o.depth_y};
-            sources[rrcapture::Motion] = {r.motion, o.motion_x, o.motion_y};
-            sources[rrcapture::NormalRoughness] = {r.normal};
-            sources[rrcapture::DiffuseAlbedo] = {r.diffuse};
-            sources[rrcapture::SpecularAlbedo] = {r.specular};
-            sources[rrcapture::Status] = {s.gpu.guides[3].Get()};
-            sources[rrcapture::SssGuide] = {r.sss};
-            sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
-            sources[rrcapture::ResponsivityMask] = {r.responsivity};
-            sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+            const auto sources = CaptureSources(s, r, o);
             ID3D12Device *device = pipelines.device.Get();
             rrcapture::Capture frame;
             if (!rrcapture::Plan(device, o.width, o.height, sources, frame)) {
                 CaptureFailed("unsupported input layout");
-                return;
+                return false;
             }
             char line[160];
             const auto mb = [](UINT64 bytes) {
@@ -422,35 +431,35 @@ class Controller {
             if (armed) {
                 if (frame.bytes > UINT64_MAX / rrcapture::Frames) {
                     CaptureFailed("capture too large");
-                    return;
+                    return false;
                 }
                 if (!admit(frame.bytes * rrcapture::Frames))
-                    return;
+                    return false;
                 std::vector<ComPtr<ID3D12Resource>> buffers;
                 for (unsigned i = 0; i < rrcapture::Frames; ++i) {
                     buffers.push_back(allocate());
                     if (!buffers.back())
-                        return;
+                        return false;
                 }
                 capture.Begin(std::move(buffers));
                 snprintf(line, sizeof(line), "RR capture: collecting %u frames, %llu MB each",
                          rrcapture::Frames, mb(frame.bytes));
                 Log(line);
-                return; // The allocation hitch stays out of the run.
+                return false; // The allocation hitch stays out of the run.
             }
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
                 frame.buffer.Reset();
             if (!frame.buffer) {
                 if (!admit(frame.bytes))
-                    return;
+                    return false;
                 frame.buffer = allocate();
                 if (!frame.buffer)
-                    return;
+                    return false;
             }
             if (!capture.Count()) {
                 LogCaptureFailure();
-                return;
+                return false;
             }
             auto &m = frame.meta;
             m.serial = s.serial;
@@ -499,9 +508,25 @@ class Controller {
                 m.cpu_time_ms = double(now.QuadPart) * 1000.0 / double(frequency.QuadPart);
             frame.session = capture.session;
             // Nothing below throws: the recorded copies always keep their buffer alive.
-            rrcapture::Record(cl, frame, sources);
+            rrcapture::Record(cl, frame, sources, 0, rrcapture::RrOutput,
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             s.capture_hold = frame.buffer;
             s.captured = std::move(frame);
+            return true;
+        } catch (const std::exception &e) {
+            CaptureFailed(e.what());
+        } catch (...) {
+            CaptureFailed("unexpected error");
+        }
+        return false;
+    }
+    // Adds RR's output to the frame CaptureLocked recorded, right after a successful evaluate.
+    // rr_output is in UNORDERED_ACCESS here, where Record leaves it for GateEnd.
+    void CaptureOutputLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
+                             const rreval::Options &o) {
+        try {
+            rrcapture::Record(cl, s.captured, CaptureSources(s, r, o), rrcapture::RrOutput,
+                              rrcapture::InputCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         } catch (const std::exception &e) {
             CaptureFailed(e.what());
         } catch (...) {
@@ -921,6 +946,9 @@ class Controller {
         if (enabled == value)
             return;
         enabled = value;
+        // Collecting holds readback buffers; an Armed capture keeps waiting for RR.
+        if (!value && capture.state == rrcapture::State::Collecting)
+            CaptureFailed("RR was turned off");
         if (++generation == 0) {
             Failure("RR enable generation overflow");
             return;
@@ -1460,8 +1488,9 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            bool captured = false;
             if (capture.Active())
-                CaptureLocked(*s, cl.Get(), resources, o, reset, projection);
+                captured = CaptureLocked(*s, cl.Get(), resources, o, reset, projection);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
@@ -1470,6 +1499,8 @@ class Controller {
                 Log("RR evaluation threw; restoring resources for native SR");
             }
             s->inference_ok = NVSDK_NGX_SUCCEED(evaluated_result);
+            if (captured && s->inference_ok)
+                CaptureOutputLocked(*s, cl.Get(), resources, o);
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(),
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);

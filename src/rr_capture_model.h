@@ -26,6 +26,7 @@ enum Input : unsigned {
     ColorBeforeTransparency,
     ResponsivityMask,
     SpecularHitDistance,
+    RrOutput,
     InputCount
 };
 inline constexpr const char *names[InputCount] = {"color",
@@ -38,7 +39,8 @@ inline constexpr const char *names[InputCount] = {"color",
                                                   "sss_guide",
                                                   "color_before_transparency",
                                                   "responsivity_mask",
-                                                  "specular_hit_distance"};
+                                                  "specular_hit_distance",
+                                                  "rr_output"};
 
 struct FormatInfo {
     unsigned dxgi;
@@ -134,6 +136,18 @@ inline void JsonNumber(std::string &out, double v) {
     }
     char text[32]; // Locale independent, and the same text as printf("%.9g").
     const auto r = std::to_chars(text, text + sizeof text, v, std::chars_format::general, 9);
+    if (r.ec == std::errc{})
+        out.append(text, r.ptr);
+    else
+        out += "null";
+}
+inline void JsonFixed(std::string &out, double v) { // Three decimals, locale independent.
+    if (!std::isfinite(v)) {
+        out += "null";
+        return;
+    }
+    char text[320]; // Room for any finite double.
+    const auto r = std::to_chars(text, text + sizeof text, v, std::chars_format::fixed, 3);
     if (r.ec == std::errc{})
         out.append(text, r.ptr);
     else
@@ -275,7 +289,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonUint(cf.Key("motion_vectors_dilated"), c.motion_dilated);
     JsonUint(cf.Key("motion_vectors_jittered"), c.motion_jittered);
     o += "\n      }";
-    JsonNumber(f.Key("cpu_time_ms"), m.cpu_time_ms);
+    JsonFixed(f.Key("cpu_time_ms"), m.cpu_time_ms);
     f.Key("inputs");
     o += "{\n        ";
     JsonFields in(o, ",\n        ");
@@ -409,7 +423,8 @@ template <class F> class Sequence {
                 Recycle(std::move(f.buffer));
                 continue;
             }
-            if (!run.empty() && (f.meta.serial != run.back().meta.serial + 1 ||
+            // A reset frame begins a new RR history, so it can only start a run.
+            if (!run.empty() && (f.meta.reset || f.meta.serial != run.back().meta.serial + 1 ||
                                  f.width != run.back().width || f.height != run.back().height))
                 Restart();
             run.push_back(std::move(f));

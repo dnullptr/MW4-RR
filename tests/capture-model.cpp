@@ -40,6 +40,12 @@ static Seq Collecting() {
 static bool Contains(const std::string &text, const char *part) {
     return text.find(part) != std::string::npos;
 }
+static std::size_t Count(const std::string &text, const char *part) {
+    std::size_t n = 0;
+    for (std::size_t p = text.find(part); p != std::string::npos; p = text.find(part, p + 1))
+        ++n;
+    return n;
+}
 // Brackets and braces nest and balance, outside strings; strings and escapes terminate.
 static bool Balanced(const std::string &text) {
     std::string open;
@@ -188,6 +194,31 @@ static void GapAndSizeRestart() {
     assert(s.run.size() == 1 && s.run[0].meta.serial == 56 && s.run[0].height == 5);
     Done(s, Make(56, 7, true, 8, 5)); // Repeated serial is not consecutive.
     assert(s.Settle().empty() && s.run.size() == 1 && s.run[0].buffer == 7);
+}
+
+static void ResetOnlyStartsRun() {
+    // RR's history restarts at 13, so 10..12 cannot lead into it.
+    Seq s = Collecting();
+    for (unsigned i = 10; i <= 20; ++i) {
+        Frame<int> f = Make(i, int(i));
+        f.meta.reset = i == 13;
+        Done(s, f);
+    }
+    const auto done = s.Settle();
+    assert(done.size() == Frames && s.state == State::Writing && s.run.empty());
+    for (unsigned i = 0; i < Frames; ++i)
+        assert(done[i].meta.serial == 13 + i && done[i].meta.reset == (i == 0));
+    assert(s.pool.size() == 11); // 8 + the buffers of 10..12, as for a gap.
+    // A reset frame that comes first starts a run like any other.
+    Seq t = Collecting();
+    Frame<int> first = Make(30, 1);
+    first.meta.reset = true;
+    Done(t, first);
+    assert(t.Settle().empty() && t.run.size() == 1 && t.run[0].meta.serial == 30);
+    for (unsigned i = 31; i < 38; ++i)
+        Done(t, Make(i, int(i)));
+    const auto run = t.Settle();
+    assert(run.size() == Frames && run.front().meta.serial == 30 && t.state == State::Writing);
 }
 
 static void StaleSessions() {
@@ -425,9 +456,11 @@ static void Names() {
     assert(FileName(0, Color) == "frame0_color.bin");
     assert(FileName(7, SpecularHitDistance) == "frame7_specular_hit_distance.bin");
     assert(FileName(12, ColorBeforeTransparency) == "frame12_color_before_transparency.bin");
+    assert(FileName(7, RrOutput) == "frame7_rr_output.bin");
     assert(std::string(names[NormalRoughness]) == "normal_roughness");
-    assert(std::string(names[InputCount - 1]) == "specular_hit_distance");
-    assert(InputCount == 11 && Frames == 8 && MaxAttempts == 600);
+    assert(std::string(names[SpecularHitDistance]) == "specular_hit_distance");
+    assert(std::string(names[InputCount - 1]) == "rr_output");
+    assert(RrOutput == 11 && InputCount == 12 && Frames == 8 && MaxAttempts == 600);
 
     assert(Format(26) && std::string(Format(26)->name) == "R11G11B10_FLOAT");
     assert(Format(26)->bytes == 4);
@@ -465,6 +498,21 @@ static void Json() {
     JsonNumber(s, std::numeric_limits<double>::quiet_NaN());
     JsonNumber(s, std::numeric_limits<double>::infinity());
     JsonNumber(s, -std::numeric_limits<float>::infinity());
+    assert(s == "nullnullnull");
+    s.clear();
+    JsonFixed(s, 1e8 + 0.125); // Milliseconds since boot keep their microseconds.
+    assert(s == "100000000.125");
+    s.clear();
+    JsonFixed(s, 123456.789);
+    JsonFixed(s, -0.5);
+    assert(s == "123456.789-0.500");
+    s.clear();
+    JsonFixed(s, -std::numeric_limits<double>::max()); // Every finite value prints in full.
+    assert(s.size() == 314 && s.front() == '-' && s.compare(s.size() - 4, 4, ".000") == 0);
+    s.clear();
+    JsonFixed(s, std::numeric_limits<double>::quiet_NaN());
+    JsonFixed(s, std::numeric_limits<double>::infinity());
+    JsonFixed(s, -std::numeric_limits<double>::infinity());
     assert(s == "nullnullnull");
     s.clear();
     JsonString(s, "a\"b\\c\n\r\t\x01\x1f ok");
@@ -571,8 +619,10 @@ static void ManifestShape() {
     h.sss_enabled = true;
     h.responsivity_strength = -0.5f;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
+    frames[1].meta.cpu_time_ms = 1e8 + 0.125;
     const std::string m = Manifest(h, frames);
     assert(Balanced(m));
+    assert(Contains(m, "\"cpu_time_ms\": 100000000.125")); // Fixed, where %.9g would round.
     const char *top[] = {"\"format\": \"mw4-rr-capture\"",
                          "\"version\": 1",
                          "\"created\": \"2026-10-25T10:31:02\"",
@@ -663,14 +713,40 @@ static void ManifestShape() {
     assert(Contains(m, "\"format\": \"DXGI_87\", \"dxgi_format\": 87"));
     assert(Contains(m, "\"source_size\": [8, 6]"));
     assert(Contains(m, "\"source_offset\": [0, 0]"));
-    // 16 matrix numbers per matrix, 11 inputs per frame.
-    std::size_t nulls = 0;
-    for (std::size_t p = m.find("\": null"); p != std::string::npos; p = m.find("\": null", p + 1))
-        ++nulls;
-    assert(nulls == 2 * (InputCount - 2) + 2); // Nine absent inputs per frame, and "far".
+    // Ten absent inputs per frame, and "far".
+    assert(Count(m, "\": null") == 2 * (InputCount - 2) + 2);
     // No frames at all is still valid.
     const std::string empty = Manifest(h, std::vector<Frame<int>>{});
     assert(Balanced(empty) && Contains(empty, "\"frame_count\": 0"));
+}
+
+// rr_output is the output size: each input's own width and height go in the manifest.
+static void ManifestOutputSize() {
+    Header h;
+    h.render_width = 4;
+    h.render_height = 3;
+    h.output_width = 8;
+    h.output_height = 6;
+    Frame<int> f = Make(9, 0);
+    f.regions[Color] = Region{true, 26, 4, 3, 4, 0, 256, 0, 0, 8, 6};
+    f.regions[RrOutput] = Region{true, 10, 8, 6, 8, 1024, 256, 0, 0, 8, 6};
+    const std::string m = Manifest(h, std::vector<Frame<int>>{f});
+    assert(Balanced(m));
+    assert(Contains(m, "\"color\": {\"file\": \"frame0_color.bin\", \"format\": "
+                       "\"R11G11B10_FLOAT\", \"dxgi_format\": 26, \"width\": 4, \"height\": 3, "
+                       "\"bytes_per_pixel\": 4"));
+    assert(Contains(m, "\"rr_output\": {\"file\": \"frame0_rr_output.bin\", \"format\": "
+                       "\"R16G16B16A16_FLOAT\", \"dxgi_format\": 10, \"width\": 8, \"height\": 6, "
+                       "\"bytes_per_pixel\": 8, \"source_offset\": [0, 0], "
+                       "\"source_size\": [8, 6]}"));
+    // All 12 inputs in table order, and no others: two present, ten null.
+    std::size_t at = m.find("\"inputs\": {");
+    assert(at != std::string::npos);
+    for (unsigned i = 0; i < InputCount; ++i) {
+        at = m.find("\"" + std::string(names[i]) + "\": ", at);
+        assert(at != std::string::npos);
+    }
+    assert(InputCount == 12 && Count(m, "\": null") == 10 && Count(m, "{\"file\": ") == 2);
 }
 
 // Writes two 4 x 3 frames: color (R11G11B10_FLOAT, every texel R=1 G=0.5 B=2) and status
@@ -750,6 +826,7 @@ int main(int argc, char **argv) {
     SettleAcrossCalls();
     UndeliveredClearsRun();
     GapAndSizeRestart();
+    ResetOnlyStartsRun();
     StaleSessions();
     FailDropsLater();
     CountOverflow();
@@ -763,6 +840,7 @@ int main(int argc, char **argv) {
     JsonNumberMatchesPrintf();
     LocaleIndependent();
     ManifestShape();
+    ManifestOutputSize();
     std::puts("capture model tests passed");
     return argc > 1 ? WriteSample(argv[1]) : 0;
 }

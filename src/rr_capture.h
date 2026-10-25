@@ -18,15 +18,16 @@ using Microsoft::WRL::ComPtr;
 using Capture = Frame<ComPtr<ID3D12Resource>>;
 using Session = Sequence<Capture>;
 
-// One per Input; resource == nullptr means not sent this frame. Every resource is in
-// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE when Record runs; only subresource 0 is copied.
+// One per Input; resource == nullptr means not sent this frame. The box at (x, y) is w x h, where
+// 0 means the render size passed to Plan. Only subresource 0 is copied.
 struct Source {
     ID3D12Resource *resource{};
-    UINT x{}, y{};
+    UINT x{}, y{}, w{}, h{};
 };
 using Sources = std::array<Source, InputCount>;
 
-// Lays out a w x h box of every present source in one buffer. Leaves out untouched on failure.
+// Lays out the box of every present source in one buffer; w x h is the render size, which out
+// keeps as its width and height. Leaves out untouched on failure.
 inline bool Plan(ID3D12Device *device, UINT w, UINT h, const Sources &sources, Capture &out) {
     if (!device || !w || !h)
         return false;
@@ -40,27 +41,28 @@ inline bool Plan(ID3D12Device *device, UINT w, UINT h, const Sources &sources, C
         for (unsigned j = 0; j < i; ++j)
             if (sources[j].resource == s.resource)
                 return false; // Its barriers would conflict.
+        const UINT bw = s.w ? s.w : w, bh = s.h ? s.h : h;
         const auto d = s.resource->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 ||
-            (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || UINT64(s.x) + w > d.Width ||
-            UINT64(s.y) + h > d.Height)
+            (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || UINT64(s.x) + bw > d.Width ||
+            UINT64(s.y) + bh > d.Height)
             return false;
-        auto copy = rrlive::TextureDesc(w, h, d.Format);
+        auto copy = rrlive::TextureDesc(bw, bh, d.Format);
         copy.Flags = D3D12_RESOURCE_FLAG_NONE;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
         UINT rows{};
         UINT64 row{}, total{};
         device->GetCopyableFootprints(&copy, 0, 1, offset, &fp, &rows, &row, &total);
         // A planar format's footprint names its plane format, which Record could not rebuild.
-        if (rows != h || row % w || total == UINT64_MAX ||
+        if (rows != bh || row % bw || total == UINT64_MAX ||
             total > UINT64_MAX - (align - 1) - offset || fp.Footprint.Format != d.Format)
             return false;
         Region &r = regions[i];
         r.present = true;
         r.format = d.Format;
-        r.width = w;
-        r.height = h;
-        r.bytes_per_pixel = unsigned(row / w);
+        r.width = bw;
+        r.height = bh;
+        r.bytes_per_pixel = unsigned(row / bw);
         r.offset = fp.Offset;
         r.pitch = fp.Footprint.RowPitch;
         r.source_x = s.x;
@@ -96,24 +98,26 @@ inline ComPtr<ID3D12Resource> Allocate(ID3D12Device *device, UINT64 bytes) {
         r.Reset();
     return r;
 }
-// frame comes from Plan with the same sources; frame.buffer holds at least frame.bytes.
-inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const Sources &sources) {
+// Copies inputs [first, end), each moved from state to COPY_SOURCE and back. frame comes from
+// Plan with the same sources; frame.buffer holds at least frame.bytes.
+inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const Sources &sources,
+                   unsigned first, unsigned end, D3D12_RESOURCE_STATES state) {
     if (!cl || !frame.buffer)
         return;
+    end = std::min(end, unsigned(InputCount));
     std::array<D3D12_RESOURCE_BARRIER, InputCount> barriers{};
     UINT n = 0;
     // Subresource 0 is what RR reads; other mips or slices may be in any state.
-    for (unsigned i = 0; i < InputCount; ++i)
+    for (unsigned i = first; i < end; ++i)
         if (frame.regions[i].present && sources[i].resource) {
             auto &b = barriers[n++];
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition = {sources[i].resource, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE};
+            b.Transition = {sources[i].resource, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
         }
     if (!n)
         return;
     cl->ResourceBarrier(n, barriers.data());
-    for (unsigned i = 0; i < InputCount; ++i) {
+    for (unsigned i = first; i < end; ++i) {
         const Region &r = frame.regions[i];
         if (!r.present || !sources[i].resource)
             continue;

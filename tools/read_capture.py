@@ -1,4 +1,4 @@
-"""Read raw frame captures written by the mw4-rr addon (F7 hotkey).
+"""Read raw frame captures written by the mw4-rr addon (Pause/Break hotkey).
 
 A capture folder holds manifest.json (written last) and frame<i>_<name>.bin raw texel files.
 From another script:  sys.path.insert(0, 'tools'); from read_capture import load
@@ -131,12 +131,14 @@ def self_test():
     pair = (np.arange(16, dtype='<f4') * 0.1).reshape(height, width, 2)
     sss = (np.arange(8, dtype='<f2') - 4).reshape(height, width)
     odd = np.arange(24, dtype=np.uint8).reshape(height, width, 3)
+    output = (np.arange(128, dtype='<f2') / 64).reshape(4, 8, 4)  # output size, not render size
     names = ['color', 'depth', 'motion', 'normal_roughness', 'diffuse_albedo', 'specular_albedo',
              'status', 'sss_guide', 'color_before_transparency', 'responsivity_mask',
-             'specular_hit_distance']
+             'specular_hit_distance', 'rr_output']
     images = [('color', color, 26), ('depth', depth, 41), ('motion', motion, 34),
               ('normal_roughness', normal, 10), ('specular_albedo', pair, 16),
-              ('status', status, 42), ('sss_guide', sss, 54), ('specular_hit_distance', odd, 99)]
+              ('status', status, 42), ('sss_guide', sss, 54), ('specular_hit_distance', odd, 99),
+              ('rr_output', output, 10)]
 
     with tempfile.TemporaryDirectory() as tmp:
         folder = Path(tmp)
@@ -144,9 +146,10 @@ def self_test():
         for i, used in enumerate([images, images[:1]]):
             inputs = dict.fromkeys(names)
             for name, array, fmt in used:
+                h, w = array.shape[:2]
                 (folder / f'frame{i}_{name}.bin').write_bytes(array.tobytes())
-                inputs[name] = {'file': f'frame{i}_{name}.bin', 'dxgi_format': fmt, 'width': width,
-                                'height': height, 'bytes_per_pixel': array.nbytes // (width * height)}
+                inputs[name] = {'file': f'frame{i}_{name}.bin', 'dxgi_format': fmt, 'width': w,
+                                'height': h, 'bytes_per_pixel': array.nbytes // (w * h)}
             frames_json.append({'index': i, 'serial': 10 + i, 'sl_frame': 20 + i, 'delivered': True,
                                 'reset': bool(i), 'reset_reasons': 3 * i, 'jitter': [0.25, -0.125],
                                 'inputs': inputs})
@@ -180,6 +183,9 @@ def self_test():
         np.testing.assert_array_equal(frames[0]['status'], status)
         np.testing.assert_array_equal(frames[0]['specular_hit_distance'], odd)
         expect(frames[0]['specular_hit_distance'].dtype == np.uint8, 'unknown format is uint8')
+        got = frames[0]['rr_output']
+        expect(got.dtype == np.float32 and got.shape == (4, 8, 4), 'rr_output keeps its own size')
+        np.testing.assert_array_equal(got, output.astype(np.float32))
 
         text = '\n'.join(summary(manifest, frames))
         expect('  status: 0=1 1=2 2=2 3=1 4=1 other=1' in text, 'status histogram with garbage texel')
@@ -187,9 +193,11 @@ def self_test():
         expect('  status: 0=0 1=1 2=0 3=0 4=0 other=2' in floats, 'status histogram on floats')
         expect('  depth: 0/0.892857/1.75 (1 non-finite)' in text, 'depth range')
         expect('reset_reasons=3(rejected|cut)' in text, 'reset reasons')
+        expect('  rr_output: 0/0.992188/1.98438' in text, 'rr_output range')
         np.savez(folder / 'out.npz', **npz_arrays(frames))
         with np.load(folder / 'out.npz') as npz:
-            expect(len(npz.files) == 9 and 'frame1_color' in npz.files, 'npz keys')
+            expect(len(npz.files) == 10 and 'frame1_color' in npz.files, 'npz keys')
+            expect(npz['frame0_rr_output'].shape == (4, 8, 4), 'npz rr_output shape')
             np.testing.assert_array_equal(npz['frame0_status'], status)
 
         (folder / 'frame0_status.bin').write_bytes(status.tobytes()[:-4])

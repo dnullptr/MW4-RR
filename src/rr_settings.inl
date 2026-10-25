@@ -165,8 +165,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         break;
     }
     ImGui::TextWrapped("Saves 8 consecutive frames of everything RR is given, plus the Status "
-                       "guide, to mw4-rr-captures in the game folder. About 50 bytes per render "
-                       "pixel per frame. Session only.");
+                       "guide and RR's output, to mw4-rr-captures in the game folder. About 50 "
+                       "bytes per render pixel plus 8 per output pixel, per frame. Session only.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
