@@ -91,6 +91,13 @@ static void OnRuntime(reshade::api::effect_runtime *) {
             }
             down[i] = pressed;
         }
+        // Pause/Break, as every F key is taken; not with Ctrl (Ctrl+Pause is Break) or Alt held.
+        static bool pause_down{};
+        const bool pause = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+        if (pause && !pause_down && foreground == GetCurrentProcessId() &&
+            !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_MENU) & 0x8000))
+            LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
+        pause_down = pause;
         if (changed) {
             ApplyEnabled();
             SaveToggles();
@@ -135,6 +142,31 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
+    if (ImGui::Button("Capture RR inputs (Pause)"))
+        LiveRR().RequestCapture(requested_lobe);
+    const auto capture = LiveRR().CaptureStatus();
+    switch (capture.state) {
+    case rrcapture::State::Armed:
+        ImGui::TextUnformatted("Capture: waiting for RR");
+        break;
+    case rrcapture::State::Collecting:
+        ImGui::Text("Capture: collecting %u/8 frames", capture.collected);
+        break;
+    case rrcapture::State::Writing:
+        ImGui::TextUnformatted("Capture: writing files...");
+        break;
+    case rrcapture::State::Saved:
+        ImGui::TextWrapped("Capture saved to %s", capture.message.c_str());
+        break;
+    case rrcapture::State::Failed:
+        ImGui::TextWrapped("Capture failed: %s", capture.message.c_str());
+        break;
+    case rrcapture::State::Idle:
+        break;
+    }
+    ImGui::TextWrapped("Saves 8 consecutive frames of everything RR is given, plus the Status "
+                       "guide, to mw4-rr-captures in the game folder. About 50 bytes per render "
+                       "pixel per frame. Session only.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);

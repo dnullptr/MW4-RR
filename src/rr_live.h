@@ -14,6 +14,7 @@
 #include "rr_ngx_api.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
+#include "rr_capture.h"
 #include <mutex>
 #include <deque>
 #ifdef RR_FILTER_DIAGNOSTIC
@@ -52,6 +53,9 @@ class Controller {
         std::array<float, 16> view{}, projection{};
         std::array<Observed, 4> states{};
         rreval::Options options;
+        rrcapture::Capture captured; // The frame recorded on this slot, if any.
+        // Held until the slot retires: a replayed SR recording must never copy into freed memory.
+        ComPtr<ID3D12Resource> capture_hold;
     };
     struct Call {
         bool locked{};
@@ -102,6 +106,9 @@ class Controller {
     NVSDK_NGX_Handle *feature{};
     rreval::Options key;
     rreval::Api (*resolve)(HMODULE) = &rreval::Api::Load;
+    rrcapture::Session capture;
+    std::shared_ptr<rrcapture::Outcome> capture_outcome;
+    unsigned capture_lighting{};
     void Log(const char *s) {
         if (logger)
             logger(s);
@@ -284,12 +291,31 @@ class Controller {
                                  s.sss_used && s.sss.admission.accepted,
                                  s.transparency_used && s.transparency_accepted, s.replaced_sr,
                                  s.hit_used);
+                if (s.captured.buffer) {
+                    auto &m = s.captured.meta;
+                    m.stats = v;
+                    m.delivered = v[0] == 0 && v[1] != 0;
+                    m.replaced_sr = s.replaced_sr;
+                    try {
+                        capture.Complete(std::move(s.captured));
+                    } catch (...) {
+                        CaptureFailed("out of memory");
+                    }
+                    s.captured = {};
+                }
                 if (v[0] || !v[1]) {
                     policy.Reject();
                 }
             }
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
                 !s.pending_sr && Complete(s)) {
+                if (s.captured.buffer) {
+                    try {
+                        capture.Recycle(std::move(s.captured.buffer));
+                    } catch (...) {
+                        CaptureFailed("out of memory");
+                    }
+                }
                 auto cache = std::move(s.gpu);
                 cache.Retire();
                 s = {};
@@ -297,11 +323,214 @@ class Controller {
                 s.busy = false;
             }
         }
+        if (!capture.completed.empty()) {
+            std::vector<rrcapture::Capture> done;
+            try {
+                done = capture.Settle();
+            } catch (...) {
+                CaptureFailed("out of memory");
+            }
+            if (!done.empty())
+                WriteCaptureLocked(std::move(done));
+        }
         std::string report;
         if (health.Report(GetTickCount64(), report))
             Log(report.c_str());
         if (density.Report(GetTickCount64(), report))
             Log(report.c_str());
+    }
+    void LogCaptureFailure() {
+        char line[320];
+        snprintf(line, sizeof(line), "RR capture failed: %s", capture.message.c_str());
+        try {
+            Log(line);
+        } catch (...) {
+        }
+    }
+    // A capture problem ends the capture, never RR. Fail is ignored while Writing, so a writer
+    // that could not start (writer = true) ends its session with Finished instead.
+    void CaptureFailed(const char *why, bool writer = false) {
+        if (writer ? capture.state != rrcapture::State::Writing : !capture.Active())
+            return; // Nothing to stop, or a running writer owns the outcome.
+        try {
+            if (writer)
+                capture.Finished(false, why);
+            else
+                capture.Fail(why);
+        } catch (...) { // The text could not be allocated; an empty one allocates nothing.
+            if (writer)
+                capture.Finished(false, {});
+            else
+                capture.Fail({});
+        }
+        LogCaptureFailure();
+    }
+    // Copies what RR is given this frame, plus the Status guide, before RR reads it. Every
+    // source is in NON_PIXEL_SHADER_RESOURCE here and Record leaves it there.
+    void CaptureLocked(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Resources &r,
+                       const rreval::Options &o, bool reset,
+                       const std::array<float, 16> &projection) {
+        try {
+            rrcapture::Sources sources{};
+            sources[rrcapture::Color] = {r.color, o.color_x, o.color_y};
+            sources[rrcapture::Depth] = {r.depth, o.depth_x, o.depth_y};
+            sources[rrcapture::Motion] = {r.motion, o.motion_x, o.motion_y};
+            sources[rrcapture::NormalRoughness] = {r.normal};
+            sources[rrcapture::DiffuseAlbedo] = {r.diffuse};
+            sources[rrcapture::SpecularAlbedo] = {r.specular};
+            sources[rrcapture::Status] = {s.gpu.guides[3].Get()};
+            sources[rrcapture::SssGuide] = {r.sss};
+            sources[rrcapture::ColorBeforeTransparency] = {r.before_transparency};
+            sources[rrcapture::ResponsivityMask] = {r.responsivity};
+            sources[rrcapture::SpecularHitDistance] = {r.specular_hit};
+            ID3D12Device *device = pipelines.device.Get();
+            rrcapture::Capture frame;
+            if (!rrcapture::Plan(device, o.width, o.height, sources, frame)) {
+                CaptureFailed("unsupported input layout");
+                return;
+            }
+            const auto mb = [](UINT64 bytes) {
+                return static_cast<unsigned long long>((bytes >> 20) + ((bytes & 0xFFFFF) != 0));
+            };
+            char line[160];
+            if (capture.state == rrcapture::State::Armed) {
+                if (frame.bytes > UINT64_MAX / rrcapture::Frames) {
+                    CaptureFailed("capture too large");
+                    return;
+                }
+                const UINT64 total = frame.bytes * rrcapture::Frames;
+                if (!rrcapture::Admit(device, total)) {
+                    snprintf(line, sizeof(line), "not enough memory for %llu MB", mb(total));
+                    CaptureFailed(line);
+                    return;
+                }
+                std::vector<ComPtr<ID3D12Resource>> buffers;
+                for (unsigned i = 0; i < rrcapture::Frames; ++i) {
+                    buffers.push_back(rrcapture::Allocate(device, frame.bytes));
+                    if (!buffers.back()) {
+                        CaptureFailed("cannot allocate readback memory");
+                        return;
+                    }
+                }
+                capture.Begin(std::move(buffers));
+                snprintf(line, sizeof(line), "RR capture: collecting %u frames, %llu MB each",
+                         rrcapture::Frames, mb(frame.bytes));
+                Log(line);
+                return; // The allocation hitch stays out of the run.
+            }
+            unsigned in_flight = 0;
+            for (const auto &v : slots)
+                if (v.captured.buffer && v.captured.session == capture.session)
+                    ++in_flight;
+            if (!capture.Wants(in_flight))
+                return;
+            frame.buffer = capture.Take();
+            if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
+                frame.buffer.Reset();
+            if (!frame.buffer) {
+                if (!rrcapture::Admit(device, frame.bytes)) {
+                    snprintf(line, sizeof(line), "not enough memory for %llu MB", mb(frame.bytes));
+                    CaptureFailed(line);
+                    return;
+                }
+                frame.buffer = rrcapture::Allocate(device, frame.bytes);
+                if (!frame.buffer) {
+                    CaptureFailed("cannot allocate readback memory");
+                    return;
+                }
+            }
+            if (!capture.Count()) {
+                LogCaptureFailure();
+                return;
+            }
+            auto &m = frame.meta;
+            m.serial = s.serial;
+            m.sl_frame = s.frame;
+            m.viewport = s.viewport;
+            m.reset = reset;
+            m.reset_reasons = policy.LastReason();
+            const auto pair = [](auto *to, auto a, auto b) {
+                to[0] = a;
+                to[1] = b;
+            };
+            pair(m.jitter, o.jitter_x, o.jitter_y);
+            pair(m.motion_scale, o.motion_x_scale, o.motion_y_scale);
+            m.pre_exposure = o.pre_exposure;
+            m.exposure_scale = o.exposure_scale;
+            pair(m.color_subrect, o.color_x, o.color_y);
+            pair(m.depth_subrect, o.depth_x, o.depth_y);
+            pair(m.motion_subrect, o.motion_x, o.motion_y);
+            std::copy_n(s.view.begin(), 16, m.world_to_view);
+            std::copy_n(projection.begin(), 16, m.view_to_clip);
+            const auto &c = s.camera;
+            auto &k = m.camera;
+            std::copy_n(c.position, 3, k.position);
+            std::copy_n(c.right, 3, k.right);
+            std::copy_n(c.up, 3, k.up);
+            std::copy_n(c.forward, 3, k.forward);
+            std::copy_n(c.jitter, 2, k.jitter);
+            std::copy_n(c.motion_scale, 2, k.motion_scale);
+            std::copy_n(c.projection, 16, k.projection);
+            std::copy_n(c.inverse, 16, k.inverse);
+            k.near_plane = c.near_plane;
+            k.far_plane = c.far_plane;
+            k.fov = c.fov;
+            k.aspect = c.aspect;
+            k.depth_inverted = c.depth_inverted;
+            k.camera_motion = c.camera_motion;
+            k.motion3d = c.motion3d;
+            k.reset = c.reset;
+            k.orthographic = c.orthographic;
+            k.motion_dilated = c.motion_dilated;
+            k.motion_jittered = c.motion_jittered;
+            LARGE_INTEGER now{}, frequency{};
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&frequency);
+            if (frequency.QuadPart)
+                m.cpu_time_ms = double(now.QuadPart) * 1000.0 / double(frequency.QuadPart);
+            frame.session = capture.session;
+            // Nothing below throws: the recorded copies always keep their buffer alive.
+            rrcapture::Record(cl, frame, sources);
+            s.capture_hold = frame.buffer;
+            s.captured = std::move(frame);
+        } catch (const std::exception &e) {
+            CaptureFailed(e.what());
+        } catch (...) {
+            CaptureFailed("unexpected error");
+        }
+    }
+    // Starts the background writer for a complete run; the session is already Writing.
+    void WriteCaptureLocked(std::vector<rrcapture::Capture> done) {
+        try {
+            rrcapture::Header h;
+            h.render_width = done[0].width;
+            h.render_height = done[0].height;
+            h.output_width = key.out_width;
+            h.output_height = key.out_height;
+            h.quality = key.quality;
+            h.preset = preset.has_effective ? preset.effective : preset.desired;
+            h.sss_enabled = sss_enabled;
+            h.transparency_enabled = transparency_enabled;
+            h.specular_hit_enabled = hit_enabled;
+            h.tolerate_isolated = tolerate_isolated;
+            h.responsivity_enabled = responsivity_enabled;
+            h.responsivity_strength = responsivity_strength;
+            h.guide_test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
+            h.sky_depth_test = rrskydepth::enabled.load(std::memory_order_relaxed);
+            h.lighting_input = capture_lighting;
+            capture_outcome = rrcapture::Write(std::move(done), std::move(h), logger);
+        } catch (const std::exception &e) {
+            CaptureFailed(e.what(), true);
+        } catch (...) {
+            CaptureFailed("unexpected error", true);
+        }
+    }
+    void CaptureOutcomeLocked() { // A finished writer ends its session.
+        if (capture.state != rrcapture::State::Writing || !capture_outcome)
+            return;
+        std::lock_guard lock(capture_outcome->mutex);
+        if (capture_outcome->done)
+            capture.Finished(capture_outcome->ok, std::move(capture_outcome->text));
     }
 #include "rr_live_pool.inl"
   public:
@@ -702,6 +931,27 @@ class Controller {
         std::lock_guard lock(mutex);
         return {preset.desired, preset.effective, preset.has_effective,
                 preset.Pending() || layout_pending};
+    }
+    // Session-only development capture of RR's inputs; nothing is allocated or recorded until
+    // requested.
+    void RequestCapture(unsigned lighting_input) {
+        std::lock_guard lock(mutex);
+        CaptureOutcomeLocked(); // A writer that has finished no longer blocks a new request.
+        if (capture.Request()) {
+            capture_lighting = lighting_input;
+            capture_outcome.reset();
+            Log("RR capture: requested");
+        }
+    }
+    struct CaptureView {
+        rrcapture::State state{};
+        unsigned collected{};
+        std::string message;
+    };
+    CaptureView CaptureStatus() {
+        std::lock_guard lock(mutex);
+        CaptureOutcomeLocked();
+        return {capture.state, unsigned(capture.run.size()), capture.message};
     }
     rreval::Options Options() {
         std::lock_guard lock(mutex);
@@ -1201,6 +1451,8 @@ class Controller {
             if (s->hit_used)
                 Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (capture.Active())
+                CaptureLocked(*s, cl.Get(), resources, o, reset, projection);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             try {
