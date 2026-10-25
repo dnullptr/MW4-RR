@@ -9,6 +9,7 @@
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
 #include "rr_sss_producer.h"
+#include "rr_sss_mask.h"
 #include "rr_inputs.h"
 #include "rr_internal.h"
 #include "rr_ngx_api.h"
@@ -92,6 +93,9 @@ class Controller {
     ComPtr<ID3D12Resource> transparency_source;
     bool sss_enabled{}, sss_failed{};
     UINT64 sss_retry_after{};
+    // Latest guide an admitted SR submission resolves, for SSS-masked lighting.
+    rrsssmask::Record sss_mask;
+    ComPtr<ID3D12Resource> sss_mask_guide;
     bool hit_enabled{};
     unsigned hit_reports{};
     HMODULE runtime{};
@@ -218,6 +222,8 @@ class Controller {
             s.gpu.Release(budget);
             s = {};
         }
+        sss_mask = {};
+        sss_mask_guide.Reset();
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
@@ -303,6 +309,18 @@ class Controller {
         if (density.Report(GetTickCount64(), report))
             Log(report.c_str());
     }
+    // A submitted SR recording that resolves its guide hands it to later
+    // SSS-masked lighting if admitted. A rejected one writes zeros, so a record
+    // of that same guide is dropped. A discarded recording never gets here.
+    void SealSssMask(const Slot &s, bool accepted) {
+        if (accepted) {
+            sss_mask = {true, s.frame, s.generation, s.gpu.w, s.gpu.h};
+            sss_mask_guide = s.gpu.sss.guide;
+        } else if (sss_mask_guide && sss_mask_guide == s.gpu.sss.guide) {
+            sss_mask = {};
+            sss_mask_guide.Reset();
+        }
+    }
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
@@ -336,8 +354,32 @@ class Controller {
         std::lock_guard lock(mutex);
         if (sss_enabled != value) {
             sss_enabled = value;
+            sss_mask = {};
+            sss_mask_guide.Reset();
             policy.Reject();
         }
+    }
+    // The SSS guide an SSS-masked first spatial pass on cl's frame reads, or null
+    // for raw lighting; age is how many frames older it is. A guide is resolved
+    // after its own frame's first spatial pass, so this is an earlier frame's,
+    // submitted before cl; that recording leaves it COMMON.
+    ComPtr<ID3D12Resource> SssMask(ID3D12GraphicsCommandList *cl, unsigned *age = nullptr) {
+        std::lock_guard lock(mutex);
+        if (!sss_enabled || sss_failed || !sss_mask_guide)
+            return {};
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return {};
+                match = &s;
+            }
+        if (!match ||
+            !rrsssmask::Usable(sss_mask, match->frame, generation, match->gpu.w, match->gpu.h))
+            return {};
+        if (age)
+            *age = match->frame - sss_mask.frame;
+        return sss_mask_guide;
     }
     void ToggleSss() {
         std::lock_guard lock(mutex);
@@ -1321,6 +1363,8 @@ class Controller {
                     rrsss::Admit(a, c, b, s.pre_submitted, s.sss.submitted, baseline);
                 s.sss.admission.Seal(b, sss_accept);
                 s.gpu.header_map[7] = sss_accept ? 1u : 0u;
+                if (s.sss_used)
+                    SealSssMask(s, sss_accept);
                 s.transparency_accepted =
                     s.transparency_used && s.transparency.written && s.transparency.anchored &&
                     (s.transparency.producer_copy

@@ -1,6 +1,7 @@
 #pragma once
 #include "rr_settings_model.h"
 #include "rr_lighting_source.h"
+#include "rr_sss_mask.h"
 #include "rr_responsivity.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
@@ -152,7 +153,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "highlights get slightly darker. AO fix keeps raw colour but stops the "
                        "boost from washing out the occlusion value each lighting pixel carries: "
                        "A uses each fresh ray's own value and the game's where no ray landed, B "
-                       "uses the game's everywhere.");
+                       "uses the game's everywhere. SSS pixels options apply native temporal or "
+                       "fill gaps only where the previous frame's Subsurface Scattering guide is "
+                       "nonzero and keep raw lighting everywhere else; they need the SSS guide "
+                       "(F11) and show raw lighting without it.");
+    if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
+        ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
     if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
         LiveRR().SetResponsivity(requested_responsivity, requested_strength);

@@ -12,13 +12,25 @@ enum Source : unsigned {
     CapStrong,   // raw, capped at 4x
     WFill,       // raw colour; 4th half unboosted where sampled, native elsewhere
     WNative,     // raw colour; 4th half from native temporal everywhere
+    // The same selection only where the previous frame's SSS guide is nonzero;
+    // raw lighting everywhere else, and everywhere while no guide is available.
+    SssNative2,  // lobe 2 from native temporal on SSS pixels
+    SssFill2,    // lobe 2 fill gaps on SSS pixels
+    SssNative3,  // both lobes from native temporal on SSS pixels
+    SssFill3,    // both lobes fill gaps on SSS pixels
     Count
 };
 inline constexpr const char *labels[Count] = {
     "Off (raw lighting)", "Lobe 1 from native temporal", "Lobe 2 from native temporal",
     "Lobe 2 fill gaps", "Both lobes fill gaps", "Raw, cap bright samples (8x)",
-    "Raw, cap bright samples (4x)", "Raw, AO fix A (fill gaps)", "Raw, AO fix B (native)"};
+    "Raw, cap bright samples (4x)", "Raw, AO fix A (fill gaps)", "Raw, AO fix B (native)",
+    "SSS pixels: lobe 2 native temporal", "SSS pixels: lobe 2 fill gaps",
+    "SSS pixels: both lobes native temporal", "SSS pixels: both lobes fill gaps"};
 inline constexpr unsigned Valid(unsigned source) {
     return source < Count ? source : Raw;
+}
+// SSS-masked sources read the guide at t2, which only the private root binds.
+inline constexpr bool SssMasked(unsigned source) {
+    return source >= SssNative2 && source < Count;
 }
 } // namespace rrlighting

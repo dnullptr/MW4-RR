@@ -59,15 +59,18 @@ def main():
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
         # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio,
-        # 4th-half source.
+        # 4th-half source, SSS guide mask.
         *[(f'RRVrrtScale{name}{suffix}',
            compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
                         flags=('-Ges', '-D', f'RR_NATIVE_LOBE={mask}', '-D', f'RR_NATIVE_FILL={fill}',
-                               '-D', f'RR_CAP_RATIO={cap}', '-D', f'RR_W_SOURCE={w}', *extra)), False)
-          for name, mask, fill, cap, w in (('Native1', 1, 0, 0, 0), ('Native2', 2, 0, 0, 0),
-                                           ('Fill2', 2, 1, 0, 0), ('Fill3', 3, 1, 0, 0),
-                                           ('Cap8', 0, 0, 8, 0), ('Cap4', 0, 0, 4, 0),
-                                           ('WFill', 0, 0, 0, 1), ('WNative', 0, 0, 0, 2))
+                               '-D', f'RR_CAP_RATIO={cap}', '-D', f'RR_W_SOURCE={w}',
+                               '-D', f'RR_SSS_MASK={sss}', *extra)), False)
+          for name, mask, fill, cap, w, sss in (('Native1', 1, 0, 0, 0, 0), ('Native2', 2, 0, 0, 0, 0),
+                                                ('Fill2', 2, 1, 0, 0, 0), ('Fill3', 3, 1, 0, 0, 0),
+                                                ('Cap8', 0, 0, 8, 0, 0), ('Cap4', 0, 0, 4, 0, 0),
+                                                ('WFill', 0, 0, 0, 1, 0), ('WNative', 0, 0, 0, 2, 0),
+                                                ('SssNative2', 2, 0, 0, 0, 1), ('SssFill2', 2, 1, 0, 0, 1),
+                                                ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
