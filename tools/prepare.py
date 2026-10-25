@@ -56,8 +56,6 @@ def main():
         ('RRSpatialPassthrough', compile_hlsl('rr_spatial_passthrough.hlsl', 'rr_spatial_passthrough'), True)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
-        ('RRVrrtProbabilityTarget', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability_target', flags=('-Ges', '-D', 'RR_READ_TARGET=1')), False),
-        ('RRVrrtBudget', compile_hlsl('rr_vrrt_budget.hlsl', 'rr_vrrt_budget', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
         # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio,
@@ -70,7 +68,9 @@ def main():
                                            ('Fill2', 2, 1, 0, 0), ('Fill3', 3, 1, 0, 0),
                                            ('Cap8', 0, 0, 8, 0), ('Cap4', 0, 0, 4, 0),
                                            ('WFill', 0, 0, 0, 1), ('WNative', 0, 0, 0, 2))
-          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
+          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
+        *[(f'RRVrrtGovernor{m}', compile_hlsl('rr_vrrt_governor.hlsl', f'rr_vrrt_governor{m}', flags=('-Ges', '-D', f'RR_GOVERNOR_LOBES={m}')), False) for m in (1, 2, 3)],
+    ])
 
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
