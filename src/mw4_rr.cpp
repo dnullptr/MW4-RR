@@ -15,6 +15,7 @@
 #include "rr_sss_pipeline.h"
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
+#include "rr_game_config.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -878,22 +879,47 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     return false;
 }
-static bool VrsConfigAllowsRR() {
+// The campaign settings file: read-only flag and text, for the RR gate and the config report.
+static rrgameconfig::File ReadGameConfig() {
+    rrgameconfig::File file;
     wchar_t local[32768]{};
     auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
     if (!size || size >= 32768)
-        return false;
+        return file;
     const auto path =
         std::filesystem::path(local) / L"Activision/Call of Duty/players/s.1.0.cod26.txt";
     const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_READONLY))
-        return false;
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return file;
+    file.readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    file.state = rrgameconfig::FileState::Unreadable;
     std::ifstream input(path);
     if (!input)
-        return false;
+        return file;
     std::ostringstream text;
     text << input.rdbuf();
-    return rrvrsconfig::Allowed(text.str(), true, true);
+    file.text = text.str();
+    file.state = rrgameconfig::FileState::Read;
+    return file;
+}
+static bool VrsGateAllows(const rrgameconfig::File &file) {
+    return file.state == rrgameconfig::FileState::Read &&
+           rrvrsconfig::Allowed(file.text, file.readonly, true);
+}
+static bool VrsConfigAllowsRR() { return VrsGateAllows(ReadGameConfig()); }
+// Once per session, from LoadSettings. Logs and counts only: RR is never blocked by it.
+static unsigned ReportGameConfig() {
+    try {
+        const auto file = ReadGameConfig();
+        std::vector<std::string> lines;
+        const auto warnings = rrgameconfig::Report(file, VrsGateAllows(file), lines);
+        for (const auto &line : lines)
+            WriteLog(line.c_str());
+        return warnings;
+    } catch (...) {
+        WriteLog("Game config check failed; RR is not affected");
+        return 0;
+    }
 }
 #include "rr_settings.inl"
 static bool RegisterRuntimeCallbacks(HMODULE module) {

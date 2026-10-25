@@ -11,6 +11,7 @@
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
+static unsigned config_warnings{}; // settings that differ from INSTALLATION.txt
 static rrsettings::Preferences preferences;
 static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
@@ -65,6 +66,7 @@ static void LoadSettings() {
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
     ApplyEnabled();
+    config_warnings = ReportGameConfig();
 }
 static const char *PresetLabel(unsigned value) {
     for (unsigned i = 0; i < 4; ++i)
@@ -384,6 +386,11 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     if (!config_allowed)
         ImGui::TextWrapped("RR configuration unavailable. Check that the campaign settings file is "
                            "read-only and contains a supported VRS value. See README.");
+    if (config_warnings)
+        ImGui::TextWrapped("Game config: %u %s from INSTALLATION.txt (RR still runs). See "
+                           "ReShade.log.",
+                           config_warnings,
+                           config_warnings == 1 ? "setting differs" : "settings differ");
     if (status.rr == rrstatus::State::Unavailable)
         ImGui::TextWrapped("The game shut down its NGX runtime. Restart the game to restore RR.");
     const auto options = LiveRR().Options();
