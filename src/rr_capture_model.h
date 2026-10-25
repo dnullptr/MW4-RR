@@ -1,11 +1,13 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 namespace rrcapture {
@@ -101,6 +103,7 @@ struct Header {
 template <class Buffer> struct Frame {
     Buffer buffer{};
     unsigned width{}, height{};
+    unsigned session{}; // The Sequence::session this frame was recorded in.
     std::uint64_t bytes{};
     std::array<Region, InputCount> regions{};
     Meta meta;
@@ -121,9 +124,12 @@ inline void JsonNumber(std::string &out, double v) {
         out += "null";
         return;
     }
-    char text[32];
-    std::snprintf(text, sizeof text, "%.9g", v);
-    out += text;
+    char text[32]; // Locale independent, and the same text as printf("%.9g").
+    const auto r = std::to_chars(text, text + sizeof text, v, std::chars_format::general, 9);
+    if (r.ec == std::errc{})
+        out.append(text, r.ptr);
+    else
+        out += "null";
 }
 inline void JsonString(std::string &out, const char *s) {
     out += '"';
@@ -323,13 +329,15 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
 }
 
 enum class State { Idle, Armed, Collecting, Writing, Saved, Failed };
-// Finds 8 consecutive delivered frames. F supplies buffer, width, height and meta; a buffer is
-// empty when !buffer. Single threaded: callers serialize access.
+// Finds 8 consecutive delivered frames. F supplies buffer, width, height, session and meta; a
+// buffer is empty when !buffer. Single threaded: callers serialize access.
+// Each Request starts a new session. Callers stamp frame.session = session when they record a
+// frame, so a copy still in flight from an earlier session is dropped when it completes.
 template <class F> class Sequence {
   public:
     using Buffer = decltype(F::buffer);
     State state = State::Idle;
-    unsigned attempts{};
+    unsigned attempts{}, session{};
     std::string message;
     std::vector<Buffer> pool;
     std::vector<F> run, completed;
@@ -342,6 +350,7 @@ template <class F> class Sequence {
         pool.clear();
         run.clear();
         completed.clear();
+        ++session;
         state = State::Armed;
         return true;
     }
@@ -385,8 +394,8 @@ template <class F> class Sequence {
         std::stable_sort(queue.begin(), queue.end(),
                          [](const F &a, const F &b) { return a.meta.serial < b.meta.serial; });
         for (F &f : queue) {
-            if (state != State::Collecting)
-                continue;
+            if (f.session != session || state != State::Collecting)
+                continue; // From an earlier session, or nothing is collecting: drop it.
             if (!f.meta.delivered) {
                 Restart();
                 Recycle(std::move(f.buffer));

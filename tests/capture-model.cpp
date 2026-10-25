@@ -3,8 +3,11 @@
 #endif
 #include "../src/rr_capture_model.h"
 #include <cassert>
+#include <clocale>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -21,6 +24,11 @@ static Frame<int> Make(unsigned serial, int buffer, bool delivered = true, unsig
     f.meta.serial = serial;
     f.meta.delivered = delivered;
     return f;
+}
+// Completes a frame the way production does: stamped with the session it was recorded in.
+static void Done(Seq &s, Frame<int> f) {
+    f.session = s.session;
+    s.Complete(std::move(f));
 }
 static Seq Collecting() {
     Seq s;
@@ -60,9 +68,10 @@ static void Lifecycle() {
     Seq s;
     assert(s.state == State::Idle && !s.Active());
     assert(!s.Wants(0));
-    assert(s.Request() && s.state == State::Armed && s.Active());
-    assert(!s.Request()); // Ignored while Armed.
-    assert(!s.Wants(0));  // Armed does not collect yet.
+    assert(s.session == 0);
+    assert(s.Request() && s.state == State::Armed && s.Active() && s.session == 1);
+    assert(!s.Request() && s.session == 1); // Ignored while Armed.
+    assert(!s.Wants(0));                    // Armed does not collect yet.
     s.Begin({1, 2, 3, 4, 5, 6, 7, 8});
     assert(s.state == State::Collecting && s.Active() && s.pool.size() == 8);
     assert(!s.Request()); // Ignored while Collecting.
@@ -75,10 +84,11 @@ static void Lifecycle() {
     assert(s.state == State::Saved && s.message == "folder" && !s.Active());
     s.pool = {9};
     assert(s.Request() && s.state == State::Armed); // Saved -> Armed clears everything.
+    assert(s.session == 2);
     assert(s.attempts == 0 && s.message.empty() && s.pool.empty() && s.run.empty());
     s.Fail("boom");
     assert(s.state == State::Failed && s.message == "boom" && !s.Active());
-    assert(s.Request() && s.state == State::Armed && s.message.empty());
+    assert(s.Request() && s.state == State::Armed && s.message.empty() && s.session == 3);
     // Begin only leaves Armed.
     Seq idle;
     idle.Begin({1});
@@ -113,14 +123,14 @@ static void InOrderAfterShuffle() {
     for (int i = 0; i < 8; ++i)
         (void)t.Take(); // The eight buffers are all in flight.
     for (unsigned serial : order)
-        t.Complete(Make(serial, int(serial)));
+        Done(t, Make(serial, int(serial)));
     const auto done = t.Settle();
     assert(done.size() == Frames && t.state == State::Writing && t.run.empty());
     for (unsigned i = 0; i < Frames; ++i)
         assert(done[i].meta.serial == 10 + i && done[i].buffer == int(10 + i));
     assert(t.completed.empty());
     // Writing drops later completions.
-    t.Complete(Make(18, 99));
+    Done(t, Make(18, 99));
     assert(t.Settle().empty() && t.state == State::Writing && t.pool.empty());
 }
 
@@ -128,10 +138,10 @@ static void SettleAcrossCalls() {
     // Consecutive frames arriving in separate polls still build one run.
     Seq s = Collecting();
     for (unsigned i = 0; i < 7; ++i) {
-        s.Complete(Make(20 + i, int(i + 1)));
+        Done(s, Make(20 + i, int(i + 1)));
         assert(s.Settle().empty() && s.run.size() == i + 1);
     }
-    s.Complete(Make(27, 8));
+    Done(s, Make(27, 8));
     const auto done = s.Settle();
     assert(done.size() == Frames && s.state == State::Writing && s.run.empty());
     assert(done.front().meta.serial == 20 && done.back().meta.serial == 27);
@@ -142,9 +152,9 @@ static void UndeliveredClearsRun() {
     for (int i = 0; i < 8; ++i)
         (void)s.Take(); // All eight buffers are in flight.
     for (unsigned i = 0; i < 3; ++i)
-        s.Complete(Make(30 + i, int(i + 1)));
+        Done(s, Make(30 + i, int(i + 1)));
     assert(s.Settle().empty() && s.run.size() == 3 && s.pool.empty());
-    s.Complete(Make(33, 4, false)); // Not delivered.
+    Done(s, Make(33, 4, false)); // Not delivered.
     assert(s.Settle().empty());
     assert(s.run.empty() && s.state == State::Collecting);
     assert(s.pool.size() == 4); // The three run buffers and the bad frame's own.
@@ -153,40 +163,87 @@ static void UndeliveredClearsRun() {
         sum += b;
     assert(sum == 1 + 2 + 3 + 4);
     // An undelivered frame inside one batch clears the frames sorted before it.
-    s.Complete(Make(41, 6));
-    s.Complete(Make(40, 5));
-    s.Complete(Make(42, 7, false));
-    s.Complete(Make(43, 8));
+    Done(s, Make(41, 6));
+    Done(s, Make(40, 5));
+    Done(s, Make(42, 7, false));
+    Done(s, Make(43, 8));
     assert(s.Settle().empty());
     assert(s.run.size() == 1 && s.run[0].meta.serial == 43 && s.pool.size() == 7);
 }
 
 static void GapAndSizeRestart() {
     Seq s = Collecting();
-    s.Complete(Make(50, 1));
-    s.Complete(Make(51, 2));
-    s.Complete(Make(53, 3)); // Serial gap.
+    Done(s, Make(50, 1));
+    Done(s, Make(51, 2));
+    Done(s, Make(53, 3)); // Serial gap.
     assert(s.Settle().empty());
     assert(s.run.size() == 1 && s.run[0].meta.serial == 53 && s.run[0].buffer == 3);
     assert(s.pool.size() == 10 && s.state == State::Collecting); // 8 + the two recycled.
-    s.Complete(Make(54, 4));
-    s.Complete(Make(55, 5, true, 8, 6)); // Size change.
+    Done(s, Make(54, 4));
+    Done(s, Make(55, 5, true, 8, 6)); // Size change.
     assert(s.Settle().empty());
     assert(s.run.size() == 1 && s.run[0].meta.serial == 55 && s.run[0].width == 8);
-    s.Complete(Make(56, 6, true, 8, 5)); // Height alone differs.
+    Done(s, Make(56, 6, true, 8, 5)); // Height alone differs.
     assert(s.Settle().empty());
     assert(s.run.size() == 1 && s.run[0].meta.serial == 56 && s.run[0].height == 5);
-    s.Complete(Make(56, 7, true, 8, 5)); // Repeated serial is not consecutive.
+    Done(s, Make(56, 7, true, 8, 5)); // Repeated serial is not consecutive.
     assert(s.Settle().empty() && s.run.size() == 1 && s.run[0].buffer == 7);
+}
+
+static void StaleSessions() {
+    Seq s = Collecting();
+    assert(s.session == 1);
+    // Eight copies of session 1 are still in flight when the capture fails and is asked for again.
+    std::vector<Frame<int>> stale;
+    for (unsigned i = 0; i < 8; ++i) {
+        (void)s.Take();
+        stale.push_back(Make(60 + i, 70 + int(i)));
+        stale.back().session = s.session;
+    }
+    s.Fail("RR did not deliver 8 consecutive frames");
+    assert(s.Request() && s.session == 2 && s.state == State::Armed);
+    for (Frame<int> &f : stale) // They finish while the new session is still Armed.
+        s.Complete(f);
+    assert(s.Settle().empty() && s.completed.empty() && s.state == State::Armed);
+    s.Begin({11, 12, 13, 14, 15, 16, 17, 18});
+    for (Frame<int> &f : stale) // And again once it is Collecting.
+        s.Complete(f);
+    assert(s.Settle().empty());
+    assert(s.state == State::Collecting && s.run.empty() && s.completed.empty());
+    assert(s.pool == (std::vector<int>{11, 12, 13, 14, 15, 16, 17, 18})); // Nothing recycled.
+    // In one batch, stale frames neither join nor break the new run, whatever their serials.
+    for (Frame<int> &f : stale)
+        s.Complete(f);
+    Frame<int> bad = Make(103, 90, false), twin = Make(101, 91);
+    bad.session = twin.session = 1;
+    s.Complete(bad);
+    s.Complete(twin);
+    for (unsigned i = 0; i < 8; ++i)
+        Done(s, Make(100 + i, 20 + int(i)));
+    const auto done = s.Settle();
+    assert(done.size() == Frames && s.state == State::Writing);
+    for (unsigned i = 0; i < Frames; ++i)
+        assert(done[i].meta.serial == 100 + i && done[i].session == 2);
+    assert(s.pool.size() == 8);
+    // The same holds after a save: a straggler from the finished session is dropped.
+    Frame<int> late = Make(200, 95);
+    late.session = s.session;
+    s.Finished(true, "folder");
+    assert(s.Request() && s.session == 3);
+    s.Complete(late);
+    assert(s.Settle().empty() && s.state == State::Armed && s.completed.empty());
+    s.Begin({1});
+    s.Complete(late);
+    assert(s.Settle().empty() && s.run.empty() && s.pool == std::vector<int>{1});
 }
 
 static void FailDropsLater() {
     Seq s = Collecting();
     s.run.assign(2, Make(1, 0));
-    s.Complete(Make(5, 5));
+    Done(s, Make(5, 5));
     s.Fail("no good");
     assert(s.state == State::Failed && s.run.empty() && s.pool.empty() && s.completed.empty());
-    s.Complete(Make(6, 6)); // A copy that finished after the failure.
+    Done(s, Make(6, 6)); // A copy that finished after the failure.
     assert(s.Settle().empty());
     assert(s.state == State::Failed && s.run.empty() && s.pool.empty() && s.completed.empty());
     assert(s.message == "no good");
@@ -250,6 +307,7 @@ static void MoveOnlyBuffers() {
             f.buffer = s.Take();
             f.meta.serial = 5 + i;
             f.meta.delivered = i == 0;
+            f.session = s.session;
             s.Complete(std::move(f));
         }
         assert(s.Settle().empty());
@@ -328,6 +386,12 @@ static void Json() {
     JsonNumber(s, 1e30);
     assert(s == "1e+30");
     s.clear();
+    JsonNumber(s, -0.0);
+    JsonNumber(s, 100000000.0);
+    JsonNumber(s, 1234567890.0); // Ten digits no longer fit in nine.
+    JsonNumber(s, 0.00001);
+    assert(s == "-01000000001.23456789e+091e-05");
+    s.clear();
     JsonNumber(s, std::numeric_limits<double>::quiet_NaN());
     JsonNumber(s, std::numeric_limits<double>::infinity());
     JsonNumber(s, -std::numeric_limits<float>::infinity());
@@ -365,6 +429,64 @@ static Frame<int> Rich(unsigned serial) {
     d.height = 3;
     d.bytes_per_pixel = 3;
     return f;
+}
+
+// JsonNumber must print what printf("%.9g") prints in the C locale.
+static void JsonNumberMatchesPrintf() {
+    std::uint64_t x = 88172645463325252ull; // xorshift64, a fixed sequence
+    auto next = [&] {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return x;
+    };
+    unsigned checked = 0;
+    for (unsigned i = 0; i < 50000; ++i) {
+        const std::uint64_t bits = next();
+        const std::uint32_t f32 = static_cast<std::uint32_t>(bits >> 32);
+        float f;
+        std::memcpy(&f, &f32, sizeof f);
+        double d;
+        std::memcpy(&d, &bits, sizeof d);
+        for (double v : {double(f), d, double(i) * 0.37, double(i) * 1e-7, double(i) * 1e7}) {
+            if (!std::isfinite(v))
+                continue;
+            char want[32];
+            std::snprintf(want, sizeof want, "%.9g", v);
+            std::string got;
+            JsonNumber(got, v);
+            assert(got == want);
+            ++checked;
+        }
+    }
+    assert(checked > 200000);
+}
+// printf follows the process locale, so a comma-decimal one would corrupt a manifest. The test
+// only has something to check where such a locale is installed.
+static void LocaleIndependent() {
+    bool ran = false;
+    for (const char *name : {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR"}) {
+        if (!std::setlocale(LC_ALL, name) || *std::localeconv()->decimal_point != ',')
+            continue;
+        char printed[32];
+        std::snprintf(printed, sizeof printed, "%.9g", 0.5);
+        assert(std::string(printed) == "0,5"); // The locale is really in effect.
+        std::string s;
+        JsonNumber(s, 0.5);
+        JsonNumber(s, -1234.5);
+        JsonNumber(s, 1e-7);
+        assert(s == "0.5-1234.51e-07");
+        Header h;
+        h.responsivity_strength = -0.5f;
+        const std::string m = Manifest(h, std::vector<Frame<int>>{Rich(1)});
+        assert(Contains(m, "\"responsivity_strength\": -0.5") &&
+               Contains(m, "\"jitter\": [0.25, -0.125]"));
+        ran = true;
+        break;
+    }
+    std::setlocale(LC_ALL, "C");
+    std::puts(ran ? "locale check ran with a comma-decimal locale"
+                  : "locale check skipped: no comma-decimal locale installed");
 }
 
 static void ManifestShape() {
@@ -558,6 +680,7 @@ int main(int argc, char **argv) {
     SettleAcrossCalls();
     UndeliveredClearsRun();
     GapAndSizeRestart();
+    StaleSessions();
     FailDropsLater();
     CountOverflow();
     FinishedTransitions();
@@ -565,6 +688,8 @@ int main(int argc, char **argv) {
     Packing();
     Names();
     Json();
+    JsonNumberMatchesPrintf();
+    LocaleIndependent();
     ManifestShape();
     std::puts("capture model tests passed");
     return argc > 1 ? WriteSample(argv[1]) : 0;
