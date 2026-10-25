@@ -88,6 +88,16 @@ struct Camera {
     unsigned depth_inverted{}, camera_motion{}, motion3d{}, reset{}, orthographic{},
         motion_dilated{}, motion_jittered{};
 };
+// Which responsivity mask RR took (Meta::responsivity_source). The water mask also carries the
+// SSS values when both are on; the sky edge test replaces both.
+enum ResponsivitySource : unsigned { NoMask, SssMask, SkyEdgeMask, WaterMask, SourceCount };
+inline constexpr const char *responsivity_sources[SourceCount] = {"none", "sss", "sky_edge",
+                                                                  "water"};
+inline const char *ResponsivitySourceName(unsigned source) {
+    return source < SourceCount ? responsivity_sources[source] : "unknown";
+}
+// A reset_reasons bit beyond HistoryPolicy's: the color brightness test changed its scale.
+inline constexpr unsigned ColorScaleReset = 16;
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
     bool delivered{}, reset{}, replaced_sr{};
@@ -95,6 +105,12 @@ struct Meta {
     // which ones RR took), and the water guide mode its guides were converted with.
     bool water_masks{};
     unsigned water_guide{};
+    bool linear_depth{}; // Depth is linear view depth (the weapon depth test), not hardware depth.
+    // Tree-noise tests: the color brightness test's factor on RR's color (RR's output is in the
+    // same scaled domain; 1 = off), the guide test mode this frame's guides were converted with,
+    // the depth sky was lifted to (0 = not lifted), and the responsivity mask RR took.
+    float color_scale = 1.0f, depth_floor{};
+    unsigned guide_test{}, responsivity_source{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
     unsigned color_subrect[2]{}, depth_subrect[2]{}, motion_subrect[2]{};
@@ -108,12 +124,16 @@ struct Header {
         guide_test{}, lighting_input{};
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
-        responsivity_enabled{}, sky_depth_test{};
+        responsivity_enabled{}, sky_depth_test{}, weapon_depth{};
     float responsivity_strength{};
     // Running water tests (rr_water.h); water_guide is an rrwater::Guide.
     bool water_responsivity{}, water_discard{}, water_animated{};
     float water_strength{};
     unsigned water_guide{};
+    // Sky edge responsivity mask test (rr_sky_edge.h).
+    bool sky_edge_enabled{};
+    float sky_edge_strength{};
+    unsigned sky_edge_radius{};
 };
 template <class Buffer> struct Frame {
     Buffer buffer{};
@@ -263,6 +283,10 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
     JsonBool(f.Key("water_masks"), m.water_masks);
     JsonUint(f.Key("water_guide"), m.water_guide);
+    JsonNumber(f.Key("color_scale"), m.color_scale);
+    JsonUint(f.Key("guide_test"), m.guide_test);
+    JsonNumber(f.Key("depth_floor"), m.depth_floor);
+    JsonString(f.Key("responsivity_source"), ResponsivitySourceName(m.responsivity_source));
     f.Key("stats");
     o += '{';
     JsonFields st(o, ", ");
@@ -343,11 +367,15 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonBool(s.Key("water_discard"), h.water_discard);
     JsonBool(s.Key("water_animated"), h.water_animated);
     JsonUint(s.Key("water_guide"), h.water_guide);
+    JsonBool(s.Key("weapon_depth"), h.weapon_depth);
+    JsonBool(s.Key("sky_edge_enabled"), h.sky_edge_enabled);
+    JsonNumber(s.Key("sky_edge_strength"), h.sky_edge_strength);
+    JsonUint(s.Key("sky_edge_radius"), h.sky_edge_radius);
     o += "\n  }";
     top.Key("status_values") +=
         R"({"0": "padding", "1": "ordinary", "2": "sky", "3": "special", "4": "invalid"})";
     top.Key("reset_reason_bits") +=
-        R"({"1": "rejected", "2": "cut", "4": "generation", "8": "gap"})";
+        R"({"1": "rejected", "2": "cut", "4": "generation", "8": "gap", "16": "color_scale"})";
     top.Key("formats");
     o += "{\n    ";
     JsonFields fm(o, ",\n    ");

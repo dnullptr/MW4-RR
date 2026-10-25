@@ -6,6 +6,7 @@
 #include "rr_water.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
+#include "rr_weapon_depth.h"
 #include "rr_sky_edge.h"
 #include "rr_color_scale.h"
 // CPU settings and UI only. Rendering threads service preset changes.
@@ -176,6 +177,31 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool sky_depth = rrskydepth::enabled;
     if (ImGui::Checkbox("Sky depth test: finite far plane", &sky_depth))
         rrskydepth::enabled = sky_depth;
+    bool weapon_depth = rrweapondepth::enabled;
+    if (ImGui::Checkbox("Weapon depth test: give the weapon its own depth", &weapon_depth)) {
+        rrweapondepth::enabled = weapon_depth;
+        ++rrweapondepth::changes;
+    }
+    using WeaponState = rrlive::Controller::WeaponState;
+    const auto weapon = LiveRR().WeaponDepthState();
+    ImGui::Text("Weapon depth: %s",
+                weapon == WeaponState::Active       ? "active (RR uses linear depth)"
+                : weapon == WeaponState::Off        ? "off"
+                : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
+                : weapon == WeaponState::NoMemory
+                    ? "off: not enough GPU memory (turn it off and on to retry)"
+                : weapon == WeaponState::Unsupported
+                    ? "off: the game's projection is not supported (turn it off and on to retry)"
+                : weapon == WeaponState::Refused
+                    ? "off: RR did not accept linear depth (turn it off and on to retry)"
+                : !rr_running ? "waiting for RR"
+                              : "waiting");
+    ImGui::TextWrapped("Session-only test. The game draws the weapon and hands with their own "
+                       "camera, so RR normally sees them as one flat card. On, RR gets linear "
+                       "depth in which the weapon keeps its own depth steps, still in front of "
+                       "everything else; the rest of the scene keeps the same distances, with "
+                       "the sky very far instead of infinitely far. Turning it on or off "
+                       "restarts RR, like a preset change.");
     bool sky_edge = rrskyedge::enabled;
     if (ImGui::Checkbox("Steadier sky edges (responsivity mask)", &sky_edge)) {
         rrskyedge::enabled = sky_edge;

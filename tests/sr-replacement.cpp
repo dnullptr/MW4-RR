@@ -192,6 +192,12 @@ static void CreationParameters() {
     rreval::CreateParameters(q, o);
     assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
     assert(flags == 0x1bf);
+    // Linear depth (the weapon depth test) drops DepthInverted as well, AutoExposure still.
+    o.flags = 75;
+    RecordingParams l;
+    rreval::CreateParameters(l, o, 6, true);
+    assert(NVSDK_NGX_SUCCEED(l.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
+    assert(flags == 3);
 }
 static RecordingParams *capability_map{};
 static NVSDK_NGX_Result capability_result = NVSDK_NGX_Result_Success;
@@ -327,14 +333,18 @@ static void NgxLog() {
     o.out_height = 2160;
     o.quality = 1;
     o.flags = 75;
-    rrngxlog::DescribeCreation(o, 6, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 6, false, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset F, quality 1, flags 75 -> 11, render 2224x1248, "
                          "output 3840x2160"));
+    // Linear depth (the weapon depth test): the flags RR got lose DepthInverted too.
+    rrngxlog::DescribeCreation(o, 6, true, text, sizeof(text));
+    assert(!strcmp(text, "RR created: preset F, quality 1, flags 75 -> 3, render 2224x1248, "
+                         "output 3840x2160"));
     o.flags = 0;
-    rrngxlog::DescribeCreation(o, 0, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 0, false, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset Default, quality 1, flags 0 -> 0, render 2224x1248, "
                          "output 3840x2160"));
-    rrngxlog::DescribeCreation(o, 1, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 1, false, text, sizeof(text));
     assert(!strncmp(text, "RR created: preset unknown,", strlen("RR created: preset unknown,")));
 }
 int main() {

@@ -108,7 +108,10 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{};
+static unsigned releases{}, destroys{}, log_lines{};
+static void CountLog(const char *) {
+    ++log_lines;
+}
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -208,10 +211,65 @@ struct ControllerCpuTest {
         assert((g.ReadFinite() == std::array<UINT, 2>{105, 106}));
         assert(readback->read.Begin == 20 && readback->read.End == 28);
     }
+    static void WeaponDepth() {
+        // The weapon depth test restarts RR only when its setting differs from the depth
+        // type RR was created with. A test that could not run stays off through Reconfigure
+        // until its setting next changes, so it restarts RR once, never over and over.
+        using State = Controller::WeaponState;
+        auto *const created = reinterpret_cast<NVSDK_NGX_Handle *>(1);
+        Controller c;
+        rrweapondepth::enabled = true;
+        ++rrweapondepth::changes;
+        assert(c.WeaponDepthWanted() && !c.NeedsReconfigure()); // The next RR takes it.
+        assert(c.WeaponDepthState() == State::Waiting);
+        c.enabled = true;
+        c.feature = created; // Created with hardware depth.
+        assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
+        c.weapon_linear = true;
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Waiting);
+        c.weapon_test.active = true;
+        assert(c.WeaponDepthState() == State::Active);
+        c.logger = CountLog;
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
+        assert(c.WeaponDepthState() == State::Refused && log_lines == 1);
+        c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes);
+        assert(log_lines == 1); // Frames still in flight repeat the hold; logged once.
+        c.logger = nullptr;
+        c.feature = nullptr; // Released by Reconfigure in the game; no NGX here.
+        c.QueueReconfigure();
+        assert(c.Reconfigure());
+        assert(!c.weapon_linear && !c.weapon_test.active && !c.WeaponDepthWanted());
+        c.feature = created; // Recreated with hardware depth: no second restart.
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Refused);
+        ++rrweapondepth::changes; // Turned off and on again: tried again.
+        assert(c.WeaponDepthWanted() && c.NeedsReconfigure());
+        c.HoldWeaponDepth(Controller::WeaponHold::Memory, rrweapondepth::changes);
+        assert(c.WeaponDepthState() == State::NoMemory && !c.NeedsReconfigure());
+        c.HoldWeaponDepth(Controller::WeaponHold::Projection, rrweapondepth::changes);
+        assert(c.WeaponDepthState() == State::Unsupported);
+        rrweapondepth::enabled = false;
+        ++rrweapondepth::changes;
+        assert(!c.NeedsReconfigure() && c.WeaponDepthState() == State::Off);
+        c.weapon_linear = true; // Turned off while RR has linear depth: back to hardware depth.
+        assert(c.NeedsReconfigure() && c.WeaponDepthState() == State::Restarting);
+        c.weapon_linear = false;
+        c.feature = nullptr;
+        // While the weapon test runs, its linear depth carries the sky guide test's floor.
+        c.feature = created;
+        c.weapon_linear = c.weapon_test.active = true;
+        rrguidetest::mode = rrguidetest::SkySurface;
+        assert(c.DepthFloorTest() == Controller::TestState::Active);
+        c.weapon_linear = c.weapon_test.active = false;
+        assert(c.DepthFloorTest() == Controller::TestState::Idle);
+        rrguidetest::mode = 0;
+        c.feature = nullptr;
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
         StatsReaders();
+        WeaponDepth();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);

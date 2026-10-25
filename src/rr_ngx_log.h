@@ -264,15 +264,16 @@ inline bool CapabilityLine(const rreval::Api &api, char *out, size_t size) {
     return true;
 }
 // "RR created: preset F, quality 1, flags 75 -> 11, render 2224x1248, output 3840x2160": the
-// game's flags, then the ones RR got.
-inline void DescribeCreation(const rreval::Options &o, unsigned preset, char *out, size_t size) {
+// game's flags, then the ones RR got (linear_depth: created for the weapon depth test).
+inline void DescribeCreation(const rreval::Options &o, unsigned preset, bool linear_depth,
+                             char *out, size_t size) {
     const char *name = "unknown";
     for (size_t i = 0; i < std::size(rrpreset::values); ++i)
         if (rrpreset::values[i] == preset)
             name = rrpreset::names[i];
     snprintf(out, size,
              "RR created: preset %s, quality %d, flags %d -> %d, render %ux%u, output %ux%u", name,
-             o.quality, o.flags, rreval::CreationFlags(o.flags), o.width, o.height, o.out_width,
-             o.out_height);
+             o.quality, o.flags, rreval::CreationFlags(o.flags, linear_depth), o.width, o.height,
+             o.out_width, o.out_height);
 }
 } // namespace rrngxlog

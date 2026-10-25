@@ -339,6 +339,75 @@ class SyntheticCaptureTests(unittest.TestCase):
     def setUpClass(cls):
         cls.clean = run()
 
+    def test_weapon_depth_capture_refused(self):
+        manifest, frames = make_capture(None, False)
+        manifest['settings']['weapon_depth'] = True
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            ase.analyze(manifest, frames, tmp)
+
+    def test_tree_tests_undone(self):
+        # Color brightness test (on all frames or every other one) and the sky depth floor on all,
+        # written the way the GPU writes them: the color copy is RGBA32F with alpha 1, only RGB is
+        # scaled, and only depth == 0 is lifted to the floor. The analysis undoes both, so every
+        # verdict matches the clean capture.
+        for s, step in ((0.0625, 1), (0.25, 1), (4.0, 1), (0.0625, 2)):
+            with self.subTest(scale=s, step=step):
+                manifest, frames = make_capture_with_output()
+                for i, (meta, frame) in enumerate(zip(manifest['frames'], frames)):
+                    if i % step == step - 1:
+                        meta['color_scale'] = s
+                        rgb = frame['color'] * np.float32(s)
+                        frame['color'] = np.concatenate([rgb, np.ones(rgb.shape[:2] + (1,), np.float32)], -1)
+                        out = frame['rr_output'].copy()
+                        out[..., :3] *= np.float32(s)
+                        frame['rr_output'] = out
+                    meta['depth_floor'] = 1e-7
+                    meta['responsivity_source'] = 'sky_edge'
+                    frame['depth'] = np.where(frame['depth'] == 0, np.float32(1e-7), frame['depth'])
+                reference, original = make_capture_with_output()
+                with tempfile.TemporaryDirectory() as tmp:
+                    expected = ase.analyze(reference, original, tmp)
+                    m = ase.analyze(manifest, frames, tmp)
+                    report = (Path(tmp) / 'report.md').read_text()
+                self.assertEqual({k: verdict(m, k) for k in m['verdicts']},
+                                 {k: verdict(expected, k) for k in expected['verdicts']})
+                scaled = list(range(step - 1, len(frames), step))
+                self.assertTrue(any(f'frames {scaled}:' in n for n in m['capture']['tests']))
+                self.assertIn('depth == depth_floor put back to sky', report)
+                self.assertIn('responsivity mask from: sky_edge', report)
+                self.assertEqual(expected['capture']['tests'], [])
+                # The caller's arrays are left alone.
+                self.assertTrue((frames[0]['depth'] > 0).all())
+                self.assertEqual(frames[1]['color'].shape[-1], 4)
+
+    def test_tree_tests_undo_exact(self):
+        # The floor replaced only depth == 0, so a game's negative or tiny depth stays as RR got
+        # it; the scaled color copy loses its constant alpha and rr_output keeps its own.
+        depth = np.array([[1e-7, -0.5, 5e-8, 0.3]], np.float32)
+        color = np.concatenate([np.full((1, 4, 3), 0.5, np.float32), np.ones((1, 4, 1), np.float32)], -1)
+        output = np.full((1, 4, 4), 0.25, np.float32)
+        manifest = {'frames': [{'color_scale': 0.25, 'depth_floor': 1e-7, 'responsivity_source': 'none'}]}
+        (frame,), notes = ase.undo_tests(manifest, [{'depth': depth, 'color': color, 'rr_output': output}])
+        np.testing.assert_array_equal(frame['depth'], np.array([[0, -0.5, 5e-8, 0.3]], np.float32))
+        np.testing.assert_array_equal(frame['color'], np.full((1, 4, 3), 2.0, np.float32))
+        np.testing.assert_array_equal(frame['rr_output'][..., :3], np.full((1, 4, 3), 1.0, np.float32))
+        np.testing.assert_array_equal(frame['rr_output'][..., 3], np.full((1, 4), 0.25, np.float32))
+        self.assertEqual(depth[0, 0], np.float32(1e-7))   # The caller's arrays are left alone.
+        self.assertEqual(len(notes), 2)
+
+    def test_no_test_notes_without_tests(self):
+        # A new-format capture with no tree-noise test on (mask from SSS or none) gets no note.
+        for source in ('none', 'sss'):
+            with self.subTest(source=source):
+                manifest, frames = make_capture_with_output()
+                for meta in manifest['frames']:
+                    meta.update(color_scale=1.0, depth_floor=0.0, guide_test=0, responsivity_source=source)
+                out, notes = ase.undo_tests(manifest, frames)
+                self.assertEqual(notes, [])
+                self.assertTrue(all(a is b for a, b in zip(out, frames)))
+        manifest['frames'][3]['responsivity_source'] = 'water'
+        self.assertEqual(ase.undo_tests(manifest, frames)[1], ['responsivity mask from: sss, water'])
+
     def test_a_consistent_inputs(self):
         m = self.clean
         self.assertEqual(verdict(m, 'H1'), 'supports')

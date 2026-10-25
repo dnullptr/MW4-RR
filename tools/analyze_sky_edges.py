@@ -1908,8 +1908,10 @@ def report_text(m):
     out = ['# Sky-edge analysis of RR inputs', '',
            f"Capture: {c['frames']} frames, render {c['width']}x{c['height']}{output}, preset {c['preset']}, "
            f"quality {c['quality']}, band radius {c['radius']} px. Camera "
-           f"{'still' if m['camera']['still'] else 'moving or unknown'}: {camera_note(m)}.", '',
-           '## Summary', '']
+           f"{'still' if m['camera']['still'] else 'moving or unknown'}: {camera_note(m)}.", '']
+    if c.get('tests'):
+        out += ['Tests in the capture: ' + '; '.join(c['tests']) + '.', '']
+    out += ['## Summary', '']
     out += [f"- **{k} {h['title']}: {h['verdict']}.** {h['text']}" for k, h in v.items()]
     out += ['', '"supports" means the capture shows the problem the hypothesis describes.', '']
 
@@ -2064,6 +2066,46 @@ def jsonable(value):
 
 # ---- entry points --------------------------------------------------------------------------
 
+def undo_tests(manifest, frames):
+    """Frames captured with a tree-noise test on, brought back to the game's values: color and
+    rr_output RGB divided by the frame's color_scale (the color copy's constant alpha dropped), and
+    sky depth lifted to exactly depth_floor put back to 0. Returns (frames, notes); unchanged
+    frames are the same objects."""
+    entries = manifest.get('frames') or []
+    out, scaled, floored, sources = [], [], [], set()
+    for i, frame in enumerate(frames):
+        meta = entries[i] if i < len(entries) else {}
+        scale = meta.get('color_scale') or 1.0
+        floor = meta.get('depth_floor') or 0.0
+        sources.add(meta.get('responsivity_source') or 'unknown')
+        if scale != 1.0 or floor > 0:
+            frame = dict(frame)
+        if scale != 1.0:
+            scaled.append(i)
+            for name in ('color', 'rr_output'):
+                if name in frame:
+                    a = frame[name].astype(np.float32, copy=True)
+                    a[..., :3] /= np.float32(scale)
+                    # The scaled copy is RGBA32F with alpha 1; the game's color has no alpha.
+                    frame[name] = a[..., :3] if name == 'color' else a
+        if floor > 0:
+            floored.append(i)
+            depth = frame['depth'].astype(np.float32, copy=True)
+            depth[depth == np.float32(floor)] = 0   # The floor replaced only depth == 0.
+            frame['depth'] = depth
+        out.append(frame)
+    notes = []
+    if scaled:
+        notes.append(f'color brightness test on in frames {scaled}: color and rr_output divided by '
+                     'their color_scale (the SSS and transparency guides were withheld)')
+    if floored:
+        notes.append(f'sky depth floor on in frames {floored}: depth == depth_floor put back to sky (0)')
+    shown = sources - {'unknown'}
+    if shown & {'sky_edge', 'water'}:   # Only a test mask is worth a note.
+        notes.append('responsivity mask from: ' + ', '.join(sorted(shown)))
+    return out, notes
+
+
 def capture_info(manifest, frames, radius):
     entries = manifest.get('frames', [])
     h, w = frames[0]['depth'].shape
@@ -2085,12 +2127,16 @@ def analyze(manifest, frames, out_dir, radius=2, crop=None):
         raise ValueError('every frame needs color and depth')
     if radius < 1:
         raise ValueError('radius must be >= 1')
+    if (manifest.get('settings') or {}).get('weapon_depth'):
+        raise ValueError('depth is linear view depth (weapon depth test on), so sky is not '
+                         'depth == 0: take the capture with the test off')
+    frames, test_notes = undo_tests(manifest, frames)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     shape = frames[0]['depth'].shape
     regions = [compute_regions(f['depth'], f.get('status'), radius) for f in frames]
     region_metrics, unions = region_summary(regions)
-    m = {'capture': capture_info(manifest, frames, radius),
+    m = {'capture': dict(capture_info(manifest, frames, radius), tests=test_notes),
          'camera': camera_motion(manifest, shape[1]),
          'regions': region_metrics,
          'sky_vs_status': sky_status_agreement(frames, regions)}
