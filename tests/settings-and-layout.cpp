@@ -22,6 +22,10 @@ static_assert(rrlighting::NativeLobe1 == 1 && rrlighting::NativeLobe2 == 2);
 static_assert(rrlighting::Valid(rrlighting::FillBoth) == rrlighting::FillBoth);
 static_assert(rrlighting::Valid(rrlighting::Count) == rrlighting::Raw);
 static_assert(std::string_view(rrlighting::labels[rrlighting::FillLobe2]) == "Lobe 2 fill gaps");
+static_assert(rrlighting::CapGentle == 5 && rrlighting::CapStrong == 6);
+static_assert(rrlighting::Valid(rrlighting::CapStrong) == rrlighting::CapStrong);
+static_assert(std::string_view(rrlighting::labels[rrlighting::CapStrong]) ==
+              "Raw, cap bright samples (4x)");
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");

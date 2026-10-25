@@ -173,13 +173,17 @@ inline constexpr std::array<GUID, rrlighting::Count - 1> NativeLobeScaleId = {
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x03}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x04}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x05}},
-    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x06}}};
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x06}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x07}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x08}}};
 // Native-root bytecode per non-raw lighting source, indexed by source - 1.
 inline constexpr std::array<D3D12_SHADER_BYTECODE, rrlighting::Count - 1> NativeLobeScaleCode = {
     D3D12_SHADER_BYTECODE{RRVrrtScaleNative1, sizeof(RRVrrtScaleNative1)},
     D3D12_SHADER_BYTECODE{RRVrrtScaleNative2, sizeof(RRVrrtScaleNative2)},
     D3D12_SHADER_BYTECODE{RRVrrtScaleFill2, sizeof(RRVrrtScaleFill2)},
-    D3D12_SHADER_BYTECODE{RRVrrtScaleFill3, sizeof(RRVrrtScaleFill3)}};
+    D3D12_SHADER_BYTECODE{RRVrrtScaleFill3, sizeof(RRVrrtScaleFill3)},
+    D3D12_SHADER_BYTECODE{RRVrrtScaleCap8, sizeof(RRVrrtScaleCap8)},
+    D3D12_SHADER_BYTECODE{RRVrrtScaleCap4, sizeof(RRVrrtScaleCap4)}};
 // The native PSO retains each alternate, so the game's PSO lifetime covers it.
 inline ID3D12PipelineState *MakeScaleVariant(reshade::api::device *d,
                                              reshade::api::pipeline_layout root,

@@ -114,14 +114,17 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
                        "history; they are counted in ReShade.log instead. Off: previous behavior.");
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
-    if (ImGui::Combo("Native lighting lobe", &lobe, rrlighting::labels, rrlighting::Count)) {
+    if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
         changed = true;
     }
     ImGui::TextWrapped("Native temporal replaces a lobe with the game's own accumulation across the "
                        "whole frame (lobe 2 behaves as diffuse): clean but soft. Fill gaps keeps "
                        "each fresh ray sample unboosted and uses native accumulation only where no "
-                       "ray landed this frame.");
+                       "ray landed this frame. Cap bright samples keeps raw lighting but limits "
+                       "each ray sample to 8x or 4x the game's own accumulated brightness before "
+                       "it is boosted, so the SSS blur cannot spread it into blotches; rare "
+                       "highlights get slightly darker.");
     changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
     if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
         LiveRR().SetResponsivity(requested_responsivity, requested_strength);

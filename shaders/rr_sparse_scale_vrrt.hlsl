@@ -35,10 +35,30 @@ uint PixelCode(uint2 p){
 #ifndef RR_NATIVE_FILL
 #define RR_NATIVE_FILL 0
 #endif
-uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
- float4 v=float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
+// RR_CAP_RATIO caps a raw sample's luminance, before the inverse-probability
+// boost, at that many times the native temporal luminance of its lobe, so a rare
+// bright sample cannot be boosted into a splat the SSS blur spreads. Pixels with
+// no native history for that lobe are left uncapped.
+#ifndef RR_CAP_RATIO
+#define RR_CAP_RATIO 0
+#endif
+float4 UnpackLobe(uint2 packed){
+ return float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
+}
+float4 CapSample(float4 v,uint2 native,bool history){
+#if RR_CAP_RATIO
+ float3 luma=float3(0.2126,0.7152,0.0722);
+ float limit=RR_CAP_RATIO*dot(UnpackLobe(native).rgb,luma),l=dot(v.rgb,luma);
+ // NaN or infinite native estimates fail these comparisons and leave v uncapped.
+ if(history&&limit>0&&limit<65504&&l>limit){float s=limit/l;v*=float4(s,s,s,s*s);}
+#endif
+ return v;
+}
+uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,uint2 native,bool history,out bool valid){
+ float4 v=UnpackLobe(packed);
  valid=sampled&&inverse!=0&&all(v>=0)&&all(v<=65504);
  if(!valid)return 0;
+ v=CapSample(v,native,history);
  float f=float(inverse);v=min(v*float4(f,f,f,f*f),65504);
  uint4 h=f32tof16(v);return uint2(h.x|(h.y<<16),h.z|(h.w<<16));
 }
@@ -64,14 +84,14 @@ void main(uint3 id:SV_DispatchThreadID){
 #else
  uint4 c=color[p];uint wt=weights[p];
 #endif
- bool a,b;
- uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,a);
- uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,b);
 #ifdef RR_PACKED_FLOAT
  uint4 nc=asuint(nativeLighting.Load(int3(p,0)));uint nw=asuint(nativeWeights.Load(int3(p,0)));
 #else
  uint4 nc=nativeLighting.Load(int3(p,0));uint nw=nativeWeights.Load(int3(p,0));
 #endif
+ bool a,b;
+ uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,nc.xy,(nw>>20)!=0,a);
+ uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,nc.zw,((nw>>8)&4095)!=0,b);
  uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
 #if RR_NATIVE_LOBE&1
  bool fa;ca=SelectLobe(c.xy,(wt>>20)!=0,nc.xy,fa);

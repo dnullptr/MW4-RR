@@ -58,12 +58,13 @@ def main():
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
-        # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill.
+        # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio.
         *[(f'RRVrrtScale{name}{suffix}',
            compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
                         flags=('-Ges', '-D', f'RR_NATIVE_LOBE={mask}', '-D', f'RR_NATIVE_FILL={fill}',
-                               *extra)), False)
-          for name, mask, fill in (('Native1', 1, 0), ('Native2', 2, 0), ('Fill2', 2, 1), ('Fill3', 3, 1))
+                               '-D', f'RR_CAP_RATIO={cap}', *extra)), False)
+          for name, mask, fill, cap in (('Native1', 1, 0, 0), ('Native2', 2, 0, 0), ('Fill2', 2, 1, 0),
+                                        ('Fill3', 3, 1, 0), ('Cap8', 0, 0, 8), ('Cap4', 0, 0, 4))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
 
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
