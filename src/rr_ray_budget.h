@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <type_traits>
 namespace rrraybudget {
@@ -221,6 +222,22 @@ inline constexpr unsigned LogWords = 32;
 inline constexpr unsigned LogResolveTarget = 1, LogExecuted = 2, LogResolveScene = 4,
                           LogApplyTarget = 8, LogApplySettings36 = 16, LogApplyScene251 = 32,
                           LogResolveStats = 64, LogApplyScene253 = 128;
+// The Log bits of each half: the resolve's copies (with the executed copy of its patch) and the
+// apply's. Each half copies the recording's serial first (LogWordResolveSerial,
+// LogWordApplySerial).
+inline constexpr unsigned LogResolveHalf =
+                              LogResolveTarget | LogExecuted | LogResolveScene | LogResolveStats,
+                          LogApplyHalf = LogApplyTarget | LogApplySettings36 | LogApplyScene251 |
+                                         LogApplyScene253;
+static_assert((LogResolveHalf | LogApplyHalf) == 0xFF && !(LogResolveHalf & LogApplyHalf),
+              "two halves, every bit");
+// The words of the layout above that are read (rr_ray_copies.h asserts each copy lands there): a
+// register's .x, its .y one word later.
+inline constexpr unsigned LogWordResolveTarget = 0, LogWordExecuted = 4, LogWordResolveScene = 8,
+                          LogWordApplyTarget = 12, LogWordSettings36W = 19, LogWordScene251 = 20,
+                          LogWordResolveSerial = 24, LogWordStats = 25, LogWordApplySerial = 27,
+                          LogWordScene253 = 28;
+static_assert(LogWordScene253 < LogWords, "the read words are in the gate's part of the log");
 // What a plan armed, for checking the frames it raised: the extent, each list's capacity (both
 // lobes), the margin of each raised lobe, and the u3 and u2 bytes Decide checked.
 struct Armed {
@@ -272,12 +289,12 @@ inline std::uint64_t Scheduled(const rrdensity::Frame &f, unsigned lobe) noexcep
 inline bool Executed(const Completed &c, unsigned lobe) noexcept {
     lobe &= 1;
     return (c.patched >> lobe & 1) && (c.logged & LogExecuted) &&
-           c.log[4 + lobe] == c.written[lobe];
+           c.log[LogWordExecuted + lobe] == c.written[lobe];
 }
 // The controller's x covers the reader's raw rays of the lobe (meaningful with LogResolveStats).
 inline bool StatsCover(const Completed &c, unsigned lobe) noexcept {
     lobe &= 1;
-    return c.log[25 + lobe] >= c.rates[rrdensity::RawRays + lobe];
+    return c.log[LogWordStats + lobe] >= c.rates[rrdensity::RawRays + lobe];
 }
 // The lists a completed frame is measured against: its own apply's proof, else `last`.
 inline const Lists &FrameLists(const Completed &c, const Lists &last) noexcept {
@@ -336,10 +353,10 @@ class Gate {
         if (!armed.w || own.why != Why::None || own.w != armed.w || own.h != armed.h ||
             own.v[3].bytes < armed.counter || ((raised & 1) && own.v[2].bytes < armed.pixels))
             return true;
-        const bool remap = (c.logged & LogApplyScene253) && c.log[28];
+        const bool remap = (c.logged & LogApplyScene253) && c.log[LogWordScene253];
         for (unsigned l = 0; l < 2; ++l)
-            if ((raised >> l & 1) &&
-                (own.Entries(l) < armed.capacity[l] || (remap && c.log[28] < armed.capacity[l])))
+            if ((raised >> l & 1) && (own.Entries(l) < armed.capacity[l] ||
+                                      (remap && c.log[LogWordScene253] < armed.capacity[l])))
                 return true;
         return false;
     }
@@ -432,9 +449,12 @@ class Gate {
     unsigned Streak() const noexcept {
         return streak;
     }
-    // The controller calls this when a raised recording (patched, or its apply read a raised
-    // Budget) retires without reader stats, so no Complete covers it; Complete counts a raised
-    // frame the reader did not count the same way (after its log and lists checks). From
+    // The controller (RayUnverified) calls this once for a raised recording (patched, or its apply
+    // read a raised Budget) that no Complete covers: one retired unreported or at Reconfigure, and
+    // one reported whose rates or log halves are not its own (prepass list not submitted, a stale
+    // apply serial, a mark of an older generation, a patch whose resolve half did not run as
+    // recorded). Complete counts a raised frame the reader did not count the same way (after its
+    // log and lists checks). From
     // UnverifiedLimit in a row Decide waits, until the next measured frame. The UnverifiedStop-th
     // since the last measured raised frame stops the test: returns Why::Unverified when this call
     // newly stops it, else Why::None.
@@ -507,7 +527,8 @@ class Gate {
                 cur.requested[l] = (std::min)(cur.requested[l], double(requested) / double(total));
         }
         if (c.logged & LogResolveTarget) {
-            const std::array<std::uint32_t, 2> bits{c.log[0], c.log[1]};
+            const std::array<std::uint32_t, 2> bits{c.log[LogWordResolveTarget],
+                                                    c.log[LogWordResolveTarget + 1]};
             target_streak = bits == target_bits ? target_streak + 1 : 1;
             target_bits = bits;
         }
@@ -515,8 +536,8 @@ class Gate {
             stats_streak = StatsCover(c, 0) && StatsCover(c, 1) ? stats_streak + 1 : 0;
         if (c.logged & LogApplyScene253) {
             ++remap_frames;
-            if (c.log[28] && (!remap_min || c.log[28] < remap_min))
-                remap_min = c.log[28];
+            if (c.log[LogWordScene253] && (!remap_min || c.log[LogWordScene253] < remap_min))
+                remap_min = c.log[LogWordScene253];
         }
         return Why::None;
     }
@@ -610,6 +631,63 @@ struct Consumer {
 // Resource handles of the u5 and u6 lists (reshade::api::resource::handle, 0 when not a proven
 // table view), published by the VRRT apply for a lock-free check in the ExecuteIndirect hook.
 inline std::atomic<std::uint64_t> published[2]{};
+// The descriptor range flags of the Budget u0 (resolve) and the ray lists u2, u3, u5, u6 (apply),
+// logged through `write` once per distinct combination, at most Lines per session (A5). Never a
+// gate.
+struct RangeFlag {
+    std::uint32_t flags{};
+    bool known{};
+    bool operator==(const RangeFlag &) const = default;
+};
+class RangeLog {
+  public:
+    static constexpr unsigned Lines = 8;
+    explicit RangeLog(void (*write)(const char *)) noexcept : write(write) {}
+    void Resolve(RangeFlag budget) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            u0 = budget;
+        } catch (...) {
+        }
+    }
+    // `lists` in the controller's order: u5, u6, u3, u2.
+    void Apply(const std::array<RangeFlag, 4> &lists) noexcept {
+        try {
+            std::lock_guard lock(mutex);
+            const Combination c{u0, lists[3], lists[2], lists[0], lists[1]};
+            for (unsigned i = 0; i < count; ++i)
+                if (logged[i] == c)
+                    return;
+            if (count >= Lines)
+                return;
+            logged[count++] = c;
+            std::array<char[16], 5> text{};
+            for (unsigned i = 0; i < c.size(); ++i)
+                Put(text[i], c[i]);
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "RR ray budget: descriptor range flags u0=%s u2=%s u3=%s u5=%s u6=%s",
+                          text[0], text[1], text[2], text[3], text[4]);
+            if (write)
+                write(line);
+        } catch (...) {
+        }
+    }
+
+  private:
+    using Combination = std::array<RangeFlag, 5>; // u0, u2, u3, u5, u6
+    void (*write)(const char *);
+    std::mutex mutex;
+    RangeFlag u0;
+    std::array<Combination, Lines> logged{};
+    unsigned count{};
+    static void Put(char (&text)[16], const RangeFlag &f) noexcept {
+        if (f.known)
+            std::snprintf(text, sizeof(text), "0x%x", unsigned(f.flags));
+        else
+            std::snprintf(text, sizeof(text), "unknown");
+    }
+};
 // What the controller is doing, for the settings window and the 10 s line.
 struct Status {
     unsigned mode{};
@@ -906,13 +984,14 @@ class Summary {
     // counts while the target and scene fields are n/a; with real values its tail can be cut.
     static constexpr std::size_t ControllerBytes = 1152, ListsBytes = 1024;
     // A resolve inside the RR guide recording; `after_apply` when this recording's VRRT apply came
-    // first, in which case `same_b1` says whether it read the same constant block.
-    void Resolve(bool after_apply, bool same_b1) noexcept {
+    // first, in which case `same_b1` says whether it read the same constant block (counted only
+    // when both blocks' addresses are known, `compared`).
+    void Resolve(bool after_apply, bool same_b1, bool compared = true) noexcept {
         ++w.in_recording;
-        if (after_apply) {
-            ++w.after_apply;
+        if (after_apply && compared) {
             w.same_b1.Add(same_b1);
         }
+        w.after_apply += after_apply;
     }
     // The apply ran after this recording's resolve: whether it read the same constant block.
     void SameBlock(bool same) noexcept {
@@ -973,35 +1052,37 @@ class Summary {
         const auto &lists = FrameLists(c, last);
         if (c.logged & LogResolveTarget) {
             for (unsigned l = 0; l < 2; ++l) {
-                w.native_last[l] = std::bit_cast<float>(c.log[l]);
+                w.native_last[l] = std::bit_cast<float>(c.log[LogWordResolveTarget + l]);
                 w.native[l].Add(w.native_last[l]);
             }
             w.have_native = true;
         }
         if (c.logged & LogResolveScene) {
-            w.scene = {std::bit_cast<float>(c.log[8]), std::bit_cast<float>(c.log[9])};
+            w.scene = {std::bit_cast<float>(c.log[LogWordResolveScene]),
+                       std::bit_cast<float>(c.log[LogWordResolveScene + 1])};
             w.have_scene = true;
             w.scene_match.Add(Usable(lists) && w.scene[0] == float(lists.w) &&
                               w.scene[1] == float(lists.h));
         }
         if (c.logged & LogApplyTarget) {
-            w.apply = {std::bit_cast<float>(c.log[12]), std::bit_cast<float>(c.log[13])};
+            w.apply = {std::bit_cast<float>(c.log[LogWordApplyTarget]),
+                       std::bit_cast<float>(c.log[LogWordApplyTarget + 1])};
             w.have_apply = true;
         }
         if (c.logged & LogApplySettings36) {
-            w.settings36 = c.log[19];
+            w.settings36 = c.log[LogWordSettings36W];
             w.have_settings36 = true;
         }
         if (c.logged & LogApplyScene251) {
-            w.scene251 = c.log[20];
+            w.scene251 = c.log[LogWordScene251];
             w.have_scene251 = true;
-            const std::uint32_t seed = c.log[21] & 4095;
+            const std::uint32_t seed = c.log[LogWordScene251 + 1] & 4095;
             w.seed_changes += have_last_seed && seed != last_seed;
             w.seed = last_seed = seed;
             w.have_seed = have_last_seed = true;
         }
         if (c.logged & LogApplyScene253) {
-            w.scene253 = c.log[28];
+            w.scene253 = c.log[LogWordScene253];
             w.have_scene253 = true;
         }
         // The rest is measured by the reader.

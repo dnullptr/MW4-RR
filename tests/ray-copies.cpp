@@ -161,13 +161,10 @@ constexpr bool PatchImage(unsigned mask) {
         m.b1[i] = static_cast<unsigned char>(i * 7 + 3);
     for (auto &v : m.values)
         v = 0xEE; // whatever an earlier recording left
-    const auto image = ValuesImage(plan);
-    for (const auto &r : PlanRanges) {
+    for (const auto &r : PlanRanges)
         if (r.at < ValuesSerial + 4 && ValuesSerial < r.at + r.bytes)
             return false; // the plan never overwrites the serial
-        for (std::uint32_t w = r.at / 4; w < (r.at + r.bytes) / 4; ++w)
-            PutWord(m.values, 4 * w, image[w]);
-    }
+    ApplyPlan(plan, [&m](std::uint32_t at, std::uint32_t word) { PutWord(m.values, at, word); });
     PutWord(m.values, ValuesSerial, 77);
     Run(PatchFill(mask), m);
     List executed;

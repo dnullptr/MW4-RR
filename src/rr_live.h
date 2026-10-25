@@ -497,6 +497,9 @@ class Controller {
         selected_view = UINT_MAX;
         key = {};
         RayRestart(); // the ray budget test proves the new generation's lists again
+        for (auto &p : rrraybudget::published)
+            p.store(0, std::memory_order_relaxed);
+        ray_list_offsets = {};
         if (++generation == 0) {
             Failure("RR feature generation overflow");
             return false;
@@ -1848,12 +1851,17 @@ class Controller {
         } catch (...) {
         }
     }
-    // An indirect command that read a published ray list; `c.offset` is the buffer offset and
-    // is made relative to the list's view here.
-    void RayBudgetConsumer(rrraybudget::Consumer c) noexcept {
+    // An indirect command that read the published ray list `handle` of lobe `c.lobe`. The hook
+    // passes the argument buffer's offset through unchanged; it is made relative to the list's
+    // view here, with the view offset of the same apply that published the handle. A handle that
+    // is no longer published (a later apply or Reconfigure replaced it) is ignored.
+    void RayBudgetConsumer(rrraybudget::Consumer c, std::uint64_t handle) noexcept {
         try {
             std::lock_guard lock(mutex);
-            if (c.lobe < 2 && c.offset >= ray_list_offsets[c.lobe])
+            if (c.lobe >= 2 || !handle ||
+                rrraybudget::published[c.lobe].load(std::memory_order_relaxed) != handle)
+                return;
+            if (c.offset >= ray_list_offsets[c.lobe])
                 c.offset -= ray_list_offsets[c.lobe];
             ray_summary.Consumer(c);
         } catch (...) {

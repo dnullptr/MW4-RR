@@ -444,7 +444,11 @@ struct GpuFrame {
     struct RaySite {
         unsigned first, slots;
     };
-    static constexpr RaySite RayResolveSite{0, 3}, RayApplySite{3, 2}, RayPatchSite{5, 1};
+    static constexpr RaySite RayResolveSite{0, rrraycopy::NativeSlots(rrraycopy::ResolveItems)},
+        RayApplySite{RayResolveSite.first + RayResolveSite.slots,
+                     rrraycopy::NativeSlots(rrraycopy::ApplyItems)},
+        RayPatchSite{RayApplySite.first + RayApplySite.slots,
+                     rrraycopy::NativeSlots(rrraycopy::PatchFill(3))};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
                                     D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
@@ -1145,10 +1149,9 @@ struct GpuFrame {
     void WriteRayPlan(const rrraybudget::Plan &plan) noexcept {
         if (!ray_map)
             return;
-        const auto image = rrraycopy::ValuesImage(plan);
-        for (const auto &r : rrraycopy::PlanRanges)
-            memcpy(reinterpret_cast<char *>(ray_map) + r.at,
-                   reinterpret_cast<const char *>(image.data()) + r.at, r.bytes);
+        rrraycopy::ApplyPlan(plan, [this](std::uint32_t at, std::uint32_t word) {
+            memcpy(reinterpret_cast<char *>(ray_map) + at, &word, sizeof(word));
+        });
     }
     // The logging copies at the native resolve and at the native VRRT apply: the recorded Log bits,
     // 0 when nothing was recorded (no ray_log/ray_map, no serial written in this recording, this
@@ -1191,7 +1194,7 @@ struct GpuFrame {
     // dispatches, runs the governor, restores, then calls EndPatch.
     UINT64 PatchResolve(ID3D12GraphicsCommandList *cl, const rrvrrt::RayConstant &b1,
                         const rrraybudget::Plan &plan) noexcept {
-        if (!cl || !ray_cb || !ray_map || !ray_log || !b1.upload ||
+        if (!cl || !ray_cb || !ray_map || !ray_log || !ray_serial || !b1.upload ||
             RayAvail(b1.resource.Get(), b1.offset, b1.avail) < rrraycopy::GameBytes ||
             RaySiteUsed(RayPatchSite))
             return 0;

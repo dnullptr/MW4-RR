@@ -92,7 +92,9 @@ struct CpuResource final : ID3D12Resource {
         return S_OK;
     }
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE *) override {}
+    unsigned descs{}; // GetDesc calls
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
+        ++descs;
         return {};
     }
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
@@ -216,7 +218,8 @@ struct ControllerCpuTest {
         c.rates[rrdensity::Buckets] = pixels;
         c.rates[rrdensity::Settings1] = 1;
         c.rates[rrdensity::Limits] = c.rates[rrdensity::Limits + 2] = 9;
-        c.log[0] = c.log[1] = std::bit_cast<std::uint32_t>(0.4f);
+        c.log[rrraybudget::LogWordResolveTarget] = c.log[rrraybudget::LogWordResolveTarget + 1] =
+            std::bit_cast<std::uint32_t>(0.4f);
         c.logged = rrraybudget::LogResolveTarget | rrraybudget::LogResolveStats |
                    rrraybudget::LogApplyScene253;
         return c;
@@ -354,8 +357,8 @@ struct ControllerCpuTest {
     // with both halves' serials and the executed bits the slot wrote, if any.
     static void RayJudgeOwn(Controller &c, Controller::Slot &s, const rrraybudget::Lists &l) {
         auto m = RayMeasured(l);
-        m.log[4] = s.ray_written[0];
-        m.log[5] = s.ray_written[1];
+        m.log[rrraybudget::LogWordExecuted] = s.ray_written[0];
+        m.log[rrraybudget::LogWordExecuted + 1] = s.ray_written[1];
         m.log[rrraycopy::ResolveSerial.at / 4] = m.log[rrraycopy::ApplySerial.at / 4] =
             s.ray_serial;
         s.ray_logged |= m.logged | rrraybudget::LogApplyTarget;
@@ -618,7 +621,7 @@ struct ControllerCpuTest {
         rrraybudget::Completed f;
         f.lists = RayLists();
         f.armed = RayArmed();
-        f.log[28] = 5;
+        f.log[rrraybudget::LogWordScene253] = 5;
         char details[320];
         Controller::RayStopDetails(Why::ListsAfterArming, f, details, sizeof(details));
         assert(std::string(details).find("scene253") == std::string::npos);
@@ -635,6 +638,149 @@ struct ControllerCpuTest {
                            "would exceed a lobe's headroom, sets that lobe's threshold to 17 (at "
                            "most one ray per pixel with clamp on; the game's own behaviour with "
                            "clamp off)") != std::string::npos);
+    }
+    // The verification and bookkeeping details: M3, M4, S2, S3 and the checks no earlier test
+    // pinned.
+    static void RayChecks() {
+        using rrraybudget::Why;
+        using Log = std::array<std::uint32_t, rrraybudget::LogWords>;
+        // M3: a patch whose resolve half ran as recorded is checked against it although its apply
+        // half is stale (log word 27 = 6): PatchMismatch. With the executed bits it wrote, the
+        // frame is unverified instead (the 8th in a row), and nothing stops.
+        for (const std::uint32_t executed : {0xBADu, 0x3f000000u}) {
+            Controller c;
+            for (unsigned i = 0; i < rrraybudget::UnverifiedLimit - 1; ++i)
+                c.ray_gate.Unverified();
+            auto &s = c.slots[0];
+            s.pre_submitted = true;
+            s.ray_patched = 1;
+            s.ray_written = {0x3f000000u, 0};
+            s.ray_patch_armed = RayArmed();
+            s.ray_lists = RayLists();
+            s.ray_serial = 7;
+            s.ray_logged = rrraybudget::LogResolveTarget | rrraybudget::LogExecuted |
+                           rrraybudget::LogResolveStats | rrraybudget::LogApplyTarget;
+            Log log{};
+            log[rrraybudget::LogWordExecuted] = executed;
+            log[rrraybudget::LogWordResolveSerial] = 7;
+            log[rrraybudget::LogWordApplySerial] = 6;
+            c.RayJudge(s, RayRates(), log, Controller::RayLogState::Read);
+            assert(s.ray_done && !c.failed);
+            if (executed == 0xBADu)
+                assert(c.ray_gate.Stopped() == Why::PatchMismatch);
+            else
+                assert(c.ray_gate.Stopped() == Why::None && RayWaiting(c));
+        }
+        // M4: PatchResolve records nothing, and reads no buffer, without the recording's serial.
+        {
+            GpuFrame f;
+            auto *cb = new CpuResource, *game = new CpuResource;
+            f.ray_cb.Attach(cb);
+            f.ray_log.Attach(new CpuResource);
+            std::array<UINT, 64> map{};
+            f.ray_map = map.data();
+            rrvrrt::RayConstant b1;
+            b1.resource.Attach(game);
+            b1.upload = true;
+            b1.avail = 4096;
+            rrraybudget::Plan plan;
+            plan.mask = 1;
+            auto *cl = reinterpret_cast<ID3D12GraphicsCommandList *>(0x40);
+            assert(!f.PatchResolve(cl, b1, plan) && game->descs == 0);
+            f.ray_serial = 1; // control: the b1 check runs (here the view is no buffer)
+            assert(!f.PatchResolve(cl, b1, plan) && game->descs == 1);
+            f.ray_map = nullptr;
+        }
+        // S2: sameB1AsApply compares two known constant blocks only.
+        {
+            Controller c;
+            rrraybudget::mode = rrraybudget::Times2;
+            RayLine(c);
+            for (const UINT64 address : {UINT64(0), UINT64(0x100)}) {
+                RayNext(c);
+                rrvrrt::RayResolve in;
+                in.why = Why::Shape;
+                in.settings.address = address;
+                bool dispatched = false;
+                assert(!c.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched));
+                rrvrrt::RayApply log;
+                log.settings.address = address;
+                c.RayBudgetApply(nullptr, RayLists(), log);
+                // An apply first, then a resolve, in the next recording.
+                RayNext(c);
+                c.RayBudgetApply(nullptr, RayLists(), log);
+                assert(!c.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched));
+            }
+            const auto line = RayLine(c);
+            assert(line.find(" afterApply=2 ") != std::string::npos &&
+                   line.find(" sameB1AsApply=2/2 ") != std::string::npos);
+        }
+        // S3: a consumer is counted only for the handle still published, with the view offset of
+        // the apply that published it; Reconfigure unpublishes both lists.
+        {
+            Controller c;
+            RayLive(c);
+            auto l = RayLists();
+            l.v[0].offset = 256;
+            c.RayBudgetApply(nullptr, l, {});
+            assert(rrraybudget::published[0].load() == l.v[0].resource &&
+                   rrraybudget::published[1].load() == l.v[1].resource);
+            RayLine(c);
+            c.RayBudgetConsumer({3, 0, 256 + 64, 1, 12}, l.v[0].resource);
+            c.RayBudgetConsumer({5, 1, 0, 1, 12}, 0xDEAD); // not the published handle
+            c.RayBudgetConsumer({5, 1, 0, 1, 12}, 0);
+            auto line = RayLine(c);
+            assert(
+                line.find(" | consumers lobe1=1 lobe2=0 dispatch=1 rays=0 other=0 last=3/12/64") !=
+                std::string::npos);
+            c.slots[0] = {};
+            c.QueueReconfigure();
+            assert(c.Reconfigure());
+            assert(!rrraybudget::published[0].load() && !rrraybudget::published[1].load() &&
+                   !c.ray_list_offsets[0] && !c.ray_list_offsets[1]);
+            c.RayBudgetConsumer({3, 0, 256 + 64, 1, 12}, l.v[0].resource);
+            line = RayLine(c);
+            assert(line.find(" | consumers lobe1=0 lobe2=0 dispatch=0 ") != std::string::npos);
+        }
+        // A resolve whose Budget no proven apply read is refused (BudgetIdentity).
+        {
+            Controller c;
+            RayPrime(c, RayLists());
+            RayLine(c);
+            RayNext(c);
+            RayResolve(c, 0x9000, 0);
+            assert(RayRefused(c) == "budgetIdentity=1");
+        }
+        rrraybudget::mode = rrraybudget::Off;
+        // Serials skip 0 when they wrap.
+        {
+            Controller c;
+            c.ray_next_serial = UINT_MAX - 1;
+            assert(c.RayNextSerial() == UINT_MAX && c.RayNextSerial() == 1);
+        }
+        // Reconfigure counts a raised recording it retires as unverified.
+        {
+            Controller c;
+            for (unsigned i = 0; i < rrraybudget::UnverifiedLimit - 1; ++i)
+                c.ray_gate.Unverified();
+            c.slots[0].ray_patched = 1;
+            c.QueueReconfigure();
+            assert(c.Reconfigure() && RayWaiting(c));
+        }
+        // A resolve outside any recording remembers its list for beforePrepass; one after SR does
+        // not, and Reset forgets it.
+        {
+            Controller c;
+            auto *x = reinterpret_cast<ID3D12GraphicsCommandList *>(0x40);
+            rrvrrt::RayResolve in;
+            bool dispatched = false;
+            RayLive(c);
+            assert(!c.RayBudgetResolve(x, in, 2, 1, 1, dispatched) && c.ray_early == x);
+            c.Reset(x);
+            assert(!c.ray_early);
+            c.slots[0].recorded = true; // slot 0 records on nullptr: after SR there
+            assert(!c.RayBudgetResolve(nullptr, in, 2, 1, 1, dispatched) && !c.ray_early);
+        }
     }
     static void RayBudget() {
         using rrraybudget::Why;
@@ -859,7 +1005,8 @@ struct ControllerCpuTest {
                 s.ray_logged = rrraybudget::LogResolveTarget | rrraybudget::LogExecuted |
                                rrraybudget::LogResolveStats;
                 Log log{};
-                log[4] = 0xBADu; // the executed register 2 differs from the written bits
+                log[rrraybudget::LogWordExecuted] =
+                    0xBADu; // the executed register 2 differs from the written bits
                 log[rrraycopy::ResolveSerial.at / 4] = serial;
                 c.RayJudge(s, RayRates(), log, Controller::RayLogState::Read);
                 return s.ray_done;
@@ -1006,6 +1153,24 @@ struct ControllerCpuTest {
             assert(judged(RayLists(), unproven, Why::ListsUnproven) == Why::ListsAfterArming);
             assert(judged(counter, RayLists(), Why::ListsChanged) == Why::ListsAfterArming);
             assert(judged(RayLists(), counter, Why::ListsChanged) == Why::ListsAfterArming);
+            // Every field the proof compares, larger than the control so that either proof alone
+            // passes the arming check, in both orders: the extent, the grid, both lobes' entries
+            // and the pixel list.
+            for (unsigned field = 0; field < 7; ++field) {
+                auto other = RayLists();
+                if (field < 3)
+                    other.v[field].bytes += 64 * rrraybudget::EntryBytes;
+                else if (field == 3)
+                    other.gx = 2;
+                else if (field == 4)
+                    other.gy = 2;
+                else if (field == 5)
+                    other.w = 9;
+                else
+                    other.h = 9;
+                assert(judged(other, RayLists(), Why::ListsChanged) == Why::ListsAfterArming);
+                assert(judged(RayLists(), other, Why::ListsChanged) == Why::ListsAfterArming);
+            }
             // Control: two applies with the same proof are judged on it, and pass.
             assert(judged(RayLists(), RayLists(), Why::None) == Why::None);
         }
@@ -1070,7 +1235,7 @@ struct ControllerCpuTest {
                 s.pre_submitted = submitted;
                 Log log{};
                 log[rrraycopy::ApplySerial.at / 4] = apply_serial;
-                log[28] = scene253;
+                log[rrraybudget::LogWordScene253] = scene253;
                 c.RayJudge(s, RayRates(), log, Controller::RayLogState::Read);
                 assert(s.ray_done && !c.failed);
             };
@@ -1837,6 +2002,7 @@ struct ControllerCpuTest {
         RayOldMark();
         RayReserve();
         RayStatus();
+        RayChecks();
     }
 };
 } // namespace rrlive

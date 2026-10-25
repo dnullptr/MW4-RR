@@ -262,7 +262,8 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
             if ((c.patched >> l & 1) && !rrraybudget::Executed(c, l)) {
                 if (c.logged & rrraybudget::LogExecuted)
                     std::snprintf(out, size, "lobe%u executed=0x%08x written=0x%08x", l + 1,
-                                  unsigned(c.log[4 + l]), unsigned(c.written[l]));
+                                  unsigned(c.log[rrraybudget::LogWordExecuted + l]),
+                                  unsigned(c.written[l]));
                 else
                     std::snprintf(out, size, "lobe%u executed=n/a written=0x%08x", l + 1,
                                   unsigned(c.written[l]));
@@ -285,7 +286,8 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
                           static_cast<unsigned long long>(c.lists.v[3].bytes),
                           static_cast<unsigned long long>(c.armed.counter));
         if ((c.logged & rrraybudget::LogApplyScene253) && at > 0 && std::size_t(at) < size)
-            std::snprintf(out + at, size - at, " scene253=%u", unsigned(c.log[28]));
+            std::snprintf(out + at, size - at, " scene253=%u",
+                          unsigned(c.log[rrraybudget::LogWordScene253]));
         return;
     }
     case RayWhy::Unsupported:
@@ -294,7 +296,8 @@ static void RayStopDetails(RayWhy why, const rrraybudget::Completed &c, char *ou
     case RayWhy::StatsMismatch:
         for (unsigned l = 0; l < 2; ++l)
             if ((raised >> l & 1) && !rrraybudget::StatsCover(c, l)) {
-                std::snprintf(out, size, "lobe%u x=%u rawRays=%u", l + 1, unsigned(c.log[25 + l]),
+                std::snprintf(out, size, "lobe%u x=%u rawRays=%u", l + 1,
+                              unsigned(c.log[rrraybudget::LogWordStats + l]),
                               unsigned(f[RawRays + l]));
                 return;
             }
@@ -335,14 +338,10 @@ static rrraybudget::Completed RayFrame(const Slot &s, const rrdensity::Frame &ra
 // a stale or zero serial and its bits are dropped.
 static unsigned RaySerialBits(unsigned logged, const RayLogWords &log, UINT serial) noexcept {
     using namespace rrraybudget;
-    constexpr unsigned resolve = LogResolveTarget | LogExecuted | LogResolveScene | LogResolveStats,
-                       apply = LogApplyTarget | LogApplySettings36 | LogApplyScene251 |
-                               LogApplyScene253;
-    static_assert((resolve | apply) == 0xFF && !(resolve & apply), "two halves, every bit");
-    if (!serial || log[rrraycopy::ResolveSerial.at / 4] != serial)
-        logged &= ~resolve;
-    if (!serial || log[rrraycopy::ApplySerial.at / 4] != serial)
-        logged &= ~apply;
+    if (!serial || log[LogWordResolveSerial] != serial)
+        logged &= ~LogResolveHalf;
+    if (!serial || log[LogWordApplySerial] != serial)
+        logged &= ~LogApplyHalf;
     return logged;
 }
 // A raised recording that no Complete covers: counted once (from UnverifiedLimit in a row
@@ -391,24 +390,29 @@ void RayJudge(Slot &s, const rrdensity::Frame &rates, const RayLogWords &log,
             c.log = log;
             c.logged = RaySerialBits(s.ray_logged, log, s.ray_serial);
         }
-        // Rates of a recording whose prepass list was not submitted, or whose apply half did not
-        // run as recorded (a stale apply serial), are not this frame's: a raised frame is
-        // unverified, an unraised one measures nothing (no Complete, no Summary::Completed). So
-        // is a frame that consumed a mark of an older generation: its arming snapshot is of the
-        // lists before the generation change.
-        constexpr unsigned apply_bits =
-            rrraybudget::LogApplyTarget | rrraybudget::LogApplySettings36 |
-            rrraybudget::LogApplyScene251 | rrraybudget::LogApplyScene253;
-        if (!s.pre_submitted || s.ray_old_mark ||
-            (state == RayLogState::Read && (s.ray_logged & apply_bits) &&
-             log[rrraycopy::ApplySerial.at / 4] != s.ray_serial)) {
-            RayUnverified(s);
-            return;
-        }
-        // A patch is verified against its own resolve half. One that was predicated away,
-        // skipped or not read back verifies nothing: unverified, never a PatchMismatch.
-        if (s.ray_patched && (state != RayLogState::Read || !s.ray_serial ||
-                              log[rrraycopy::ResolveSerial.at / 4] != s.ray_serial)) {
+        // Complete runs only for a frame whose reader rates and log halves are its own. Rates of
+        // a recording whose prepass list was not submitted, or whose apply half did not run as
+        // recorded (a stale apply serial), are not this frame's; nor is the arming snapshot of a
+        // frame that consumed a mark of an older generation. A patch is verified against its own
+        // resolve half: one that was predicated away, skipped or not read back verifies nothing.
+        // Such a frame, raised, is unverified (an unraised one measures nothing: no Complete, no
+        // Summary::Completed), after the PatchMismatch check when its resolve half did verify.
+        using rrraybudget::LogApplyHalf;
+        const bool read = state == RayLogState::Read;
+        const bool resolve_own =
+            read && s.ray_serial && log[rrraybudget::LogWordResolveSerial] == s.ray_serial;
+        const bool apply_stale = read && (s.ray_logged & LogApplyHalf) &&
+                                 log[rrraybudget::LogWordApplySerial] != s.ray_serial;
+        if (!s.pre_submitted || s.ray_old_mark || apply_stale || (s.ray_patched && !resolve_own)) {
+            if (s.ray_patched && resolve_own)
+                for (unsigned l = 0; l < 2; ++l)
+                    if ((s.ray_patched >> l & 1) && !rrraybudget::Executed(c, l)) {
+                        s.ray_done = true;
+                        char details[128];
+                        RayStopDetails(RayWhy::PatchMismatch, c, details, sizeof(details));
+                        RayStop(RayWhy::PatchMismatch, details);
+                        return;
+                    }
             RayUnverified(s);
             return;
         }
@@ -566,7 +570,9 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
             s.ray_resolve_budget_resource = in.budget_resource;
             s.ray_resolve_budget_offset = in.budget_offset;
         }
-        ray_summary.Resolve(s.ray_applied, s.ray_applied && s.ray_apply_cb == in.settings.address);
+        // sameB1AsApply compares two known constant blocks only.
+        ray_summary.Resolve(s.ray_applied, s.ray_applied && s.ray_apply_cb == in.settings.address,
+                            s.ray_apply_cb && in.settings.address);
         unsigned logged = 0;
         if (in.constants && now >= ray_retry_after && !ray_log_failed)
             logged = RayLogCopies(
@@ -599,7 +605,8 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         // Patch only when this recording's LogResolve copied the governor's input (t0) for
         // this very frame: the gate checks it against the reader only for frames with
         // LogResolveStats. It also guarantees that LogResolve, which alone copies the resolve
-        // serial (log word 24), was recorded before PatchResolve, which does not check it.
+        // serial (LogWordResolveSerial), was recorded before PatchResolve, which requires a
+        // serial too.
         if (!(logged & rrraybudget::LogResolveStats))
             return RayRefuse(RayWhy::StatsUnverified, m, now);
         const auto governor = pipelines.Governor(in.root);
@@ -619,8 +626,10 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
             return RayRefuse(RayWhy::Memory, m, now);
         }
         ray_memory_waiting = false;
-        // Everything that can throw is above this line. Below: noexcept calls and D3D12
-        // recording only; once the native Dispatch is recorded this returns true.
+        // Everything that can throw is above this line, and nothing above it recorded anything
+        // but the self-contained logging copies (each closes its own t0 barrier pair), after which
+        // a refusal still runs the native resolve. Below: noexcept calls and D3D12 recording
+        // only; once the native Dispatch is recorded this returns true.
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
         const UINT64 va = s.gpu.PatchResolve(cl, in.settings, plan);
@@ -639,7 +648,8 @@ bool RayResolveLocked(ID3D12GraphicsCommandList *cl, const rrvrrt::RayResolve &i
         RayPatched(s, plan, in, now, m);
         return true;
     } catch (const rrprivate::AllocationDeferred &) {
-        // Only before anything was recorded (PrepareRayPatch).
+        // Only from PrepareRayPatch: the list holds at most the self-contained logging copies, and
+        // the native resolve still runs.
         ray_retry_after = now + rrraybudget::RetryMs;
         if (!ray_memory_waiting) {
             ray_memory_waiting = true;
@@ -700,7 +710,7 @@ void RayApplyLocked(ID3D12GraphicsCommandList *cl, const rrraybudget::Lists &lis
             s.ray_armed = consumed.armed;
             s.ray_old_mark |= consumed.generation != generation;
         }
-        if (s.ray_resolved)
+        if (s.ray_resolved && s.ray_resolve_cb && s.ray_apply_cb)
             ray_summary.SameBlock(s.ray_resolve_cb == s.ray_apply_cb);
         ray_gate.Apply(lists, now);
         ray_summary.Lists(lists);

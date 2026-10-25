@@ -1,70 +1,18 @@
 #pragma once
-// The ray budget test's hooks (rr_ray_budget.h; the controller is in rr_live.h): the proofs at the
+// The ray budget test's hooks (rr_ray_budget.h; the controller is in rr_live_ray.inl, included
+// in rrlive::Controller in rr_live.h): the proofs at the
 // game's cs_vrrt_resolve and VRRT apply, and the lock-free check of indirect commands that read
 // the ray lists. Included by mw4_rr.cpp after rr_sparse_render.h and before rr_vrrt_render.h.
 // Every function is noexcept and none calls rrbypass::Fail, GlobalFail or SparseFailure: a proof
 // that fails only refuses (the native dispatch runs), an exception stops the test for the session.
 
-// The descriptor range flags of the Budget u0 (resolve) and the ray lists u2, u3, u5, u6 (apply),
-// logged once per distinct combination, at most RayRangeLog::Lines per session (A5). Never a gate.
-struct RayRangeFlag {
-    uint32_t flags{};
-    bool known{};
-    bool operator==(const RayRangeFlag &) const = default;
-};
-class RayRangeLog {
-  public:
-    static constexpr unsigned Lines = 8;
-
-  private:
-    using Combination = std::array<RayRangeFlag, 5>; // u0, u2, u3, u5, u6
-    std::mutex mutex;
-    RayRangeFlag u0;
-    std::array<Combination, Lines> logged{};
-    unsigned count{};
-    static RayRangeFlag Flag(const rrbindings::Location &l) noexcept {
-        return l.known && l.flags_known ? RayRangeFlag{l.range_flags, true} : RayRangeFlag{};
-    }
-    static void Put(char (&text)[16], const RayRangeFlag &f) noexcept {
-        if (f.known)
-            std::snprintf(text, sizeof(text), "0x%x", unsigned(f.flags));
-        else
-            std::snprintf(text, sizeof(text), "unknown");
-    }
-
-  public:
-    void Resolve(const rrbindings::Location &budget) noexcept {
-        try {
-            std::lock_guard lock(mutex);
-            u0 = Flag(budget);
-        } catch (...) {
-        }
-    }
-    // `lists` in the controller's order: u5, u6, u3, u2.
-    void Apply(const std::array<rrbindings::Location, 4> &lists) noexcept {
-        try {
-            std::lock_guard lock(mutex);
-            const Combination c{u0, Flag(lists[3]), Flag(lists[2]), Flag(lists[0]), Flag(lists[1])};
-            for (unsigned i = 0; i < count; ++i)
-                if (logged[i] == c)
-                    return;
-            if (count >= Lines)
-                return;
-            logged[count++] = c;
-            std::array<char[16], 5> text{};
-            for (unsigned i = 0; i < c.size(); ++i)
-                Put(text[i], c[i]);
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "RR ray budget: descriptor range flags u0=%s u2=%s u3=%s u5=%s u6=%s",
-                          text[0], text[1], text[2], text[3], text[4]);
-            WriteLog(line);
-        } catch (...) {
-        }
-    }
-};
-static RayRangeLog &RayRanges() {
-    static RayRangeLog log;
+// The descriptor range flags of the Budget u0 and the ray lists (rrraybudget::RangeLog, A5).
+static rrraybudget::RangeFlag RayRangeFlag(const rrbindings::Location &l) noexcept {
+    return l.known && l.flags_known ? rrraybudget::RangeFlag{l.range_flags, true}
+                                    : rrraybudget::RangeFlag{};
+}
+static rrraybudget::RangeLog &RayRanges() {
+    static rrraybudget::RangeLog log(&WriteLog);
     return log;
 }
 // One native root constant buffer at the resolve: register `reg` is the root CBV `parameter`
@@ -216,7 +164,7 @@ static rrvrrt::RayResolve ProveRayResolve(reshade::api::command_list *list,
         // Proven whatever the refusal: its identity clears the Budget's mark (A4).
         rrbindings::Location u0;
         const bool budget = RayBudgetProof(device, state, native, l, pipeline, root, in, u0);
-        RayRanges().Resolve(u0);
+        RayRanges().Resolve(RayRangeFlag(u0));
         if (why == Why::None && !budget)
             why = Why::BudgetBinding;
         in.why = why;
@@ -330,7 +278,8 @@ static void ObserveVrrtApply(reshade::api::command_list *list, reshade::api::dev
         rrvrrt::RayApply log;
         RayApplyConstant(input.resources[2], input.cbv[0], log.settings);
         RayApplyConstant(input.resources[3], input.cbv[1], log.scene);
-        RayRanges().Apply(where);
+        RayRanges().Apply({RayRangeFlag(where[0]), RayRangeFlag(where[1]), RayRangeFlag(where[2]),
+                           RayRangeFlag(where[3])});
         LiveRR().RayBudgetApply(native, lists, log);
     } catch (...) {
         try {
@@ -377,7 +326,9 @@ static bool PreserveRayBudget(reshade::api::command_list *list, uint32_t x, uint
         if ((b.shader != rrraybudget::Resolve && b.shader != rrraybudget::Clear) || !b.pipeline)
             return false;
         if (b.shader == rrraybudget::Resolve) {
-            LiveRR().RayBudgetResolveSeen(); // every resolve ages the Budget marks, RR on or off
+            // Every resolve ages the Budget marks, RR on or off, before the Enabled check below
+            // (controller-lifecycle: RayBudget "Marks age by resolves", RayOldMark, RayRestart).
+            LiveRR().RayBudgetResolveSeen();
             static std::atomic<bool> seen{};
             if (!seen.exchange(true)) { // Addition 7: shows the resolve's build is recognised
                 char line[96];
@@ -420,7 +371,10 @@ static void ObserveRayListConsumer(reshade::api::command_list *,
     for (unsigned lobe = 0; lobe < 2; ++lobe)
         if (rrraybudget::published[lobe].load(std::memory_order_relaxed) == buffer.handle) {
             try {
-                LiveRR().RayBudgetConsumer({unsigned(type), lobe, offset, count, stride});
+                // The buffer offset as given; the controller makes it relative to the list's view
+                // and drops the call unless this handle is still the published one.
+                LiveRR().RayBudgetConsumer({unsigned(type), lobe, offset, count, stride},
+                                           buffer.handle);
             } catch (...) {
             }
             return;

@@ -893,7 +893,10 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         if (!native || !LiveRR().CanRaw(native.Get()))
             return false;
         if (rrbypass::Health(device).failed) {
-            if (b.shader == rrbypass::Vrrt) // A3: the ray budget gate still sees this apply
+            // A3: the ray budget gate still sees this apply, unproven, so a raised Budget it
+            // consumes is counted (controller-lifecycle: RayBudget, "An apply that OnDispatch
+            // reports while rrbypass Health has failed").
+            if (b.shader == rrbypass::Vrrt)
                 LiveRR().RayBudgetApply(native.Get(), rrraybudget::Lists{}, rrvrrt::RayApply{});
             return false;
         }

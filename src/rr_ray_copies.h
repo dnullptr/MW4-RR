@@ -89,6 +89,52 @@ inline constexpr std::array<Item, 4> ApplyItems{{
     {rrraybudget::LogApplyScene251, {Target::Log, 80, Source::B3, 4016, 16}},  // b3 register 251
     {rrraybudget::LogApplyScene253, {Target::Log, 112, Source::B3, 4048, 16}}, // b3 register 253
 }};
+// Each copy lands on the log words the gate reads (rr_ray_budget.h); register 36's is its .w.
+static_assert(ResolveSerial.at == 4 * rrraybudget::LogWordResolveSerial &&
+                  ApplySerial.at == 4 * rrraybudget::LogWordApplySerial &&
+                  ResolveItems[0].copy.at == 4 * rrraybudget::LogWordResolveTarget &&
+                  ResolveItems[1].copy.at == 4 * rrraybudget::LogWordResolveScene &&
+                  ResolveItems[2].copy.at == 4 * rrraybudget::LogWordStats &&
+                  ResolveItems[3].copy.at == 4 * (rrraybudget::LogWordStats + 1) &&
+                  ApplyItems[0].copy.at == 4 * rrraybudget::LogWordApplyTarget &&
+                  ApplyItems[1].copy.at + 12 == 4 * rrraybudget::LogWordSettings36W &&
+                  ApplyItems[2].copy.at == 4 * rrraybudget::LogWordScene251 &&
+                  ApplyItems[3].copy.at == 4 * rrraybudget::LogWordScene253,
+              "every item at its log word");
+// The halves' bits are the items' (the resolve half also holds the patch's LogExecuted).
+template <std::size_t N> constexpr unsigned Bits(const std::array<Item, N> &items) noexcept {
+    unsigned bits{};
+    for (const auto &i : items)
+        bits |= i.bit;
+    return bits;
+}
+static_assert(Bits(ResolveItems) == (rrraybudget::LogResolveHalf & ~rrraybudget::LogExecuted) &&
+                  Bits(ApplyItems) == rrraybudget::LogApplyHalf,
+              "the halves are the items' bits");
+// GpuFrame's retained source slots for a site: one per native Source up to the last it reads, in
+// Source order.
+constexpr unsigned NativeSlotsOf(unsigned used) noexcept {
+    unsigned slots{};
+    for (unsigned s = 0; s < NativeSources; ++s)
+        if (used >> s & 1)
+            slots = s + 1;
+    return slots;
+}
+template <std::size_t N> constexpr unsigned NativeSlots(const std::array<Item, N> &items) noexcept {
+    unsigned used{};
+    for (const auto &i : items)
+        if (Native(i.copy.source))
+            used |= 1u << unsigned(i.copy.source);
+    return NativeSlotsOf(used);
+}
+// Writes the words of ray_values a plan owns (ValuesImage over PlanRanges) through
+// put(byte offset, word), leaving the serial word and everything else as it was.
+template <class Put> constexpr void ApplyPlan(const rrraybudget::Plan &plan, Put put) {
+    const auto image = ValuesImage(plan);
+    for (const auto &r : PlanRanges)
+        for (std::uint32_t w = r.at / 4; w < (r.at + r.bytes) / 4; ++w)
+            put(4 * w, image[w]);
+}
 constexpr bool Fits(const Copy &c, std::uint64_t avail) noexcept {
     return avail >= c.from && avail - c.from >= c.bytes;
 }
@@ -160,8 +206,20 @@ constexpr List PatchFill(unsigned mask) noexcept {
             return {};
     return l;
 }
+// The patch's slots: those of every native source a fill reads (the same for every valid mask).
+constexpr unsigned NativeSlots(const List &l) noexcept {
+    unsigned used{};
+    for (unsigned i = 0; i < l.count; ++i)
+        if (Native(l.copies[i].source))
+            used |= 1u << unsigned(l.copies[i].source);
+    return NativeSlotsOf(used);
+}
+static_assert(NativeSlots(PatchFill(1)) == NativeSlots(PatchFill(3)) &&
+                  NativeSlots(PatchFill(2)) == NativeSlots(PatchFill(3)),
+              "one patch site for every mask");
 // After the barrier: register 2 as the patched resolve executes it, from ray_cb into the log.
 inline constexpr Copy Executed{Target::Log, 16, Source::Cb, 32, 16};
+static_assert(Executed.at == 4 * rrraybudget::LogWordExecuted, "the executed words");
 // The pool ceiling to reserve before allocating `needed` new ray bytes: on top of the current
 // limit, never out of the headroom below it that an earlier pool projection kept for mandatory
 // allocations. Every later projection counts ray bytes once in its persistent term

@@ -27,9 +27,12 @@ uint PixelInverse(uint2 p,uint2 size,out bool supported,out uint unsupported,out
  }
  return packed;
 }
-// Diagnostic only: per lobe, how many pixels got each inverse rate (bucket 0 =
-// not requested, 16 = 16 or more), plus the budget limits and rate settings.
-// The caller zeroes RateStats before this dispatch; nothing native reads it.
+// Per lobe, how many pixels got each inverse rate (bucket 0 = not requested,
+// 16 = 16 or more), plus the budget limits and rate settings. Diagnostic, and
+// also read by the ray budget gate (rr_ray_budget.h): the histograms (Counted,
+// Requested, Scheduled), Limits (Governor stop), Settings1 (VrrtOff), Extra
+// (Overflow), RawRays (margin, StatsMismatch) and Unsupported. The caller
+// zeroes RateStats before this dispatch; nothing native reads it.
 RWByteAddressBuffer RateStats:register(u2);
 static const uint RateBuckets=17,RateBase=64,RateLimits=RateBase+2*RateBuckets*4,RateExtra=RateLimits+28;
 groupshared uint rateCounts[2*RateBuckets];
