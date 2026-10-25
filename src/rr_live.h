@@ -535,7 +535,7 @@ class Controller {
                 else if (s.gate_recorded && s.hit_used && s.hit_test_on)
                     hit_pixels.Raw();
                 if (s.gate_recorded && s.water_used && v[0] == 0 && v[1] != 0)
-                    water_stats.Add(s.gpu.ReadWaterPixels(),
+                    water_stats.Add(s.gpu.ReadWaterCounts(),
                                     UINT64((std::min)(s.options.width, s.gpu.w)) *
                                         (std::min)(s.options.height, s.gpu.h));
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
@@ -1027,6 +1027,8 @@ class Controller {
         v.discard = v.discard && v.ready && water.discard;
         v.animated = v.animated && v.ready && water.animated;
         v.coverage = v.ready ? float(water_stats.Last()) : -1.0f;
+        for (unsigned i = 0; i < rrwater::PrepassCount; ++i)
+            v.prepass[i] = v.ready ? float(water_stats.LastPrepass(i)) : -1.0f;
         return v;
     }
     void SetSssEnabled(bool value) {

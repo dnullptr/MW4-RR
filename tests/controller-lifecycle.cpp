@@ -661,6 +661,12 @@ struct ControllerCpuTest {
         water.preset.Created();
         wet_status = water.WaterStatus();
         assert(wet_status.ready && wet_status.responsivity && !wet_status.discard);
+        // The panel's game flags follow the latest delivered frame's counts.
+        assert(wet_status.prepass[rrwater::Special] < 0);
+        water.water_stats.Add({2, {8, 4, 2, 1, 3, 0}}, 16);
+        wet_status = water.WaterStatus();
+        assert(wet_status.coverage == 0.125f && wet_status.prepass[rrwater::Special] == 0.25f &&
+               wet_status.prepass[rrwater::Override] == 0.0625f);
         wet.discard = true;
         water.SetWater(wet);
         assert(water.WaterStatus().discard);

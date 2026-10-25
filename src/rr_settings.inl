@@ -388,6 +388,14 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                         100.0f * water_status.coverage);
         else
             ImGui::TextUnformatted("Water in the latest frame: measuring");
+        // What the game's prepass marks, to tell whether a surface is flagged at all.
+        const auto &flags = water_status.prepass;
+        if (flags[rrwater::Converted] >= 0)
+            ImGui::Text("Game flags: special %.1f%%, water %.1f%%, override %.1f%%, "
+                        "marker %.1f%%, rejected water %.1f%%",
+                        100.0f * flags[rrwater::Special], 100.0f * flags[rrwater::Marked],
+                        100.0f * flags[rrwater::Override], 100.0f * flags[rrwater::Bit31],
+                        100.0f * flags[rrwater::MarkedRejected]);
         if (water.responsivity)
             ImGui::Text("Water responsivity mask: %s",
                         water_status.responsivity               ? "active"
@@ -410,7 +418,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         "guides on water only: the game mirror is what RR gets today, smoothed normal averages "
         "the wave normal over 7x7 pixels, water material uses the game's own reflectance and "
         "diffuse arrays, and physical uses water's 0.02 reflectance with a smoothed normal. "
-        "Water coverage and these settings are logged to ReShade.log every 10 seconds.");
+        "Water coverage and these settings are logged to ReShade.log every 10 seconds. Game "
+        "flags shows how much of the frame the game's prepass marks as special surfaces, as "
+        "water, as overridden surfaces and with the water lighting marker: if water stays near "
+        "0% while you look at water, the game does not mark it.");
     ImGui::Separator();
     // Session-only: not saved, so a test mode never sticks across restarts.
     ImGui::TextUnformatted("Ray selection test (which pixels get the game's rays)");
