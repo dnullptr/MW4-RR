@@ -141,6 +141,7 @@ inline void Record(ID3D12GraphicsCommandList *cl, const Capture &frame, const So
 struct Outcome {
     std::mutex mutex;
     bool done{}, ok{};
+    bool tainted{}; // A replayed SR recording copied into a frame again: no manifest.
     std::string text;
 };
 inline std::string Utf8(const std::filesystem::path &path) {
@@ -213,9 +214,10 @@ inline void WriteImages(const std::filesystem::path &folder, unsigned index, con
         written += std::uint64_t(r.width) * r.bytes_per_pixel * r.height;
     }
 }
-// Writes every frame, then manifest.json; returns the folder.
+// Writes every frame, then manifest.json (as manifest.json.tmp, renamed when complete) unless
+// outcome is tainted by then; returns the folder.
 inline std::filesystem::path Store(const std::vector<Capture> &frames, Header header,
-                                   std::uint64_t &written) {
+                                   Outcome &outcome, std::uint64_t &written) {
     SYSTEMTIME t{};
     GetLocalTime(&t);
     char text[64];
@@ -227,13 +229,20 @@ inline std::filesystem::path Store(const std::vector<Capture> &frames, Header he
     const auto folder = Folder(text);
     for (size_t i = 0; i < frames.size(); ++i)
         WriteImages(folder, unsigned(i), frames[i], written);
-    const auto path = folder / L"manifest.json";
+    const auto path = folder / L"manifest.json", tmp = folder / L"manifest.json.tmp";
     const std::string manifest = Manifest(header, frames);
-    std::ofstream out(path, std::ios::binary);
+    {
+        std::lock_guard lock(outcome.mutex);
+        if (outcome.tainted)
+            throw std::runtime_error("an SR recording was replayed while writing");
+    }
+    std::ofstream out(tmp, std::ios::binary);
     out.write(manifest.data(), std::streamsize(manifest.size()));
     out.close();
     if (!out)
-        throw std::runtime_error("cannot write " + Utf8(path));
+        throw std::runtime_error("cannot write " + Utf8(tmp));
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        throw std::runtime_error("cannot rename " + Utf8(tmp) + " to manifest.json");
     written += manifest.size();
     return folder;
 }
@@ -245,7 +254,7 @@ inline void Save(std::vector<Capture> &frames, Header header, void (*log)(const 
     char failure[1024]{};
     try {
         std::uint64_t written = 0;
-        text = Utf8(Store(frames, std::move(header), written));
+        text = Utf8(Store(frames, std::move(header), outcome, written));
         line = "RR capture: saved " + std::to_string(frames.size()) + " frames (" +
                std::to_string((written + (1u << 19)) >> 20) + " MB) to " + text;
         ok = true;
@@ -285,8 +294,8 @@ inline DWORD WINAPI Writer(void *p) {
     }
     FreeLibraryAndExitThread(module, 0);
 }
-// Writes frames on a background thread (on this one if it cannot start). The outcome is done
-// when the files are complete or have failed; log may be null.
+// Writes frames on a background thread. The outcome is done when the files are complete or have
+// failed, or at once when the thread cannot start (nothing is written then); log may be null.
 inline std::shared_ptr<Outcome> Write(std::vector<Capture> frames, Header header,
                                       void (*log)(const char *)) {
     auto outcome = std::make_shared<Outcome>();
@@ -303,11 +312,19 @@ inline std::shared_ptr<Outcome> Write(std::vector<Capture> frames, Header header
         job.reset(owned);
         FreeLibrary(job->module);
     }
-    if (job) {
-        frames = std::move(job->frames);
-        header = std::move(job->header);
+    // Never written on the calling (render) thread: the capture fails instead.
+    job.reset();
+    frames.clear();
+    {
+        std::lock_guard lock(outcome->mutex);
+        outcome->text = "could not start the writer thread";
+        outcome->done = true;
     }
-    Save(frames, std::move(header), log, *outcome);
+    try {
+        if (log)
+            log("RR capture failed: could not start the writer thread");
+    } catch (...) {
+    }
     return outcome;
 }
 } // namespace rrcapture

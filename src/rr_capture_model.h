@@ -102,11 +102,12 @@ struct Meta {
     float world_to_view[16]{}, view_to_clip[16]{};
     Camera camera;
     double cpu_time_ms{};
+    unsigned lighting_input{}; // The Lighting input (rr_lighting_source.h) applied this frame.
 };
 struct Header {
     std::string created;
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
-        guide_test{}, lighting_input{};
+        guide_test{}, lighting_input{}, create_flags{};
     int quality{};
     bool sss_enabled{}, transparency_enabled{}, specular_hit_enabled{}, tolerate_isolated{},
         responsivity_enabled{}, sky_depth_test{}, weapon_depth{};
@@ -306,6 +307,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonUint(cf.Key("motion_vectors_jittered"), c.motion_jittered);
     o += "\n      }";
     JsonFixed(f.Key("cpu_time_ms"), m.cpu_time_ms);
+    JsonUint(f.Key("lighting_input"), m.lighting_input);
     f.Key("inputs");
     o += "{\n        ";
     JsonFields in(o, ",\n        ");
@@ -327,6 +329,7 @@ std::string Manifest(const Header &h, const std::vector<Frame<Buffer>> &frames) 
     JsonUint(top.Key("output_height"), h.output_height);
     top.Key("quality") += std::to_string(h.quality);
     JsonUint(top.Key("preset"), h.preset);
+    JsonUint(top.Key("create_flags"), h.create_flags);
     top.Key("settings");
     o += "{\n    ";
     JsonFields s(o, ",\n    ");
@@ -421,10 +424,11 @@ template <class F> class Sequence {
         if (state == State::Collecting && b)
             pool.push_back(std::move(b));
     }
-    bool Count() {
+    // Counts one attempt; the one past the cap fails the capture with why, if given.
+    bool Count(const char *why = nullptr) {
         if (++attempts <= MaxAttempts)
             return true;
-        Fail("RR did not deliver 8 consecutive frames");
+        Fail(why ? why : "RR did not deliver 8 consecutive frames");
         return false;
     }
     void Complete(F f) {
@@ -445,15 +449,18 @@ template <class F> class Sequence {
                 Recycle(std::move(f.buffer));
                 continue;
             }
-            // A reset frame begins a new RR history, so it can only start a run.
+            // A reset frame begins a new RR history, so it can only start a run. A run also keeps
+            // one lighting input.
             if (!run.empty() && (f.meta.reset || f.meta.serial != run.back().meta.serial + 1 ||
-                                 f.width != run.back().width || f.height != run.back().height))
+                                 f.width != run.back().width || f.height != run.back().height ||
+                                 f.meta.lighting_input != run.back().meta.lighting_input))
                 Restart();
             run.push_back(std::move(f));
             if (run.size() == Frames) {
                 state = State::Writing;
                 done = std::move(run);
                 run.clear();
+                pool.clear(); // Only the run's buffers stay alive.
             }
         }
         return done;

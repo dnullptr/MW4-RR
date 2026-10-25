@@ -44,6 +44,7 @@ static void ApplyEnabled() {
     LiveRR().SetTolerateIsolated(requested_tolerate);
     requested_lobe = rrlighting::Valid(requested_lobe);
     rrbypass::lobe_source = requested_lobe;
+    LiveRR().SetCaptureLighting(requested_lobe);
     requested_strength = rrresponsivity::Clamp(requested_strength);
     LiveRR().SetResponsivity(requested_responsivity, requested_strength);
 }
@@ -101,11 +102,11 @@ static void OnRuntime(reshade::api::effect_runtime *runtime) {
         }
         // Pause/Break, as every F key is taken; not with Ctrl (Ctrl+Pause is Break) or Alt held.
         // Its down and up arrive together, too briefly to poll, so ReShade's key messages are
-        // read; both in one frame show as released. A second request is ignored while active.
-        if (runtime && (runtime->is_key_pressed(VK_PAUSE) || runtime->is_key_released(VK_PAUSE)) &&
-            foreground == GetCurrentProcessId() && !(GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-            !(GetAsyncKeyState(VK_MENU) & 0x8000))
-            LiveRR().RequestCapture(requested_lobe); // Session only: not saved.
+        // read: on release only, as both in one frame show as released and a press whose down
+        // and up arrive apart then still requests once. A request is ignored while active.
+        if (runtime && runtime->is_key_released(VK_PAUSE) && foreground == GetCurrentProcessId() &&
+            !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_MENU) & 0x8000))
+            LiveRR().RequestCapture(); // Session only: not saved.
         if (changed) {
             ApplyEnabled();
             SaveToggles();
@@ -236,7 +237,7 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "output back, so the picture looks the same unless RR treats the levels "
                        "differently. The SSS and transparency guides are left out while on.");
     if (ImGui::Button("Capture RR inputs (Pause)"))
-        LiveRR().RequestCapture(requested_lobe);
+        LiveRR().RequestCapture();
     const auto capture = LiveRR().CaptureStatus();
     switch (capture.state) {
     case rrcapture::State::Armed:

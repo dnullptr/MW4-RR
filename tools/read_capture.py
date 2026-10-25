@@ -74,7 +74,11 @@ def load(folder):
     if not path.is_file():
         raise FileNotFoundError(f'{path}: missing; the capture is incomplete or still being '
                                 'written (manifest.json is written last)')
-    manifest = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError as error:  # JSONDecodeError, UnicodeDecodeError: cut off while written
+        raise ValueError(f'{path}: unreadable ({error}); the capture is incomplete or was cut '
+                         'off while being written (manifest.json is written last)') from None
     if manifest.get('format') != 'mw4-rr-capture':
         raise ValueError(f'{path}: not an mw4-rr capture manifest')
     frames = [{name: read_input(folder, info) for name, info in frame['inputs'].items()
@@ -239,6 +243,18 @@ def self_test():
             expect('incomplete' in str(error) and 'manifest.json' in str(error), 'missing manifest')
         else:
             raise AssertionError('missing manifest must raise FileNotFoundError')
+        # A cut-off manifest (empty, truncated, or broken mid-character) is incomplete too.
+        text = json.dumps(manifest).encode('utf-8')
+        for broken in (b'', text[:len(text) // 2], text[:-1], b'{"format": "\xff'):
+            (folder / 'manifest.json').write_bytes(broken)
+            try:
+                load(folder)
+            except ValueError as error:
+                expect(not isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) and
+                       'incomplete' in str(error) and 'manifest.json' in str(error),
+                       f'unreadable manifest must say incomplete, got {error!r}')
+            else:
+                raise AssertionError('an unreadable manifest must raise ValueError')
     print('self-test passed')
 
 
