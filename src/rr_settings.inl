@@ -48,10 +48,13 @@ static void OnRuntime(reshade::api::effect_runtime *) {
         GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
         static bool down[3]{};
         const int keys[] = {VK_F8, VK_F9, VK_F11};
+        const bool ctrl_or_alt = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+                                 (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         bool changed = false;
         for (unsigned i = 0; i < 3; ++i) {
             const bool pressed = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-            if (pressed && !down[i] && foreground == GetCurrentProcessId()) {
+            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt,
+                                          foreground == GetCurrentProcessId())) {
                 if (i == 0)
                     requested_rr = !requested_rr;
                 else if (i == 1)
