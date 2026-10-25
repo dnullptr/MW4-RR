@@ -130,7 +130,32 @@ struct Meta {
     float world_to_view[16]{}, view_to_clip[16]{};
     Camera camera;
     double cpu_time_ms{};
-    unsigned lighting_input{}; // The Lighting input (rr_lighting_source.h) applied this frame.
+    // The Lighting input (rr_lighting_source.h) this frame's lighting was prepared with, or
+    // MixedLighting. lighting_masked: 1 an SSS-masked input had its SSS guide, 0 it fell back to
+    // raw lighting, -1 neither (another input, not known, or mixed).
+    unsigned lighting_input{};
+    int lighting_masked = -1;
+};
+inline constexpr unsigned MixedLighting = 0xFFFFFFFFu; // The lighting changed within the frame.
+// What a frame's first spatial passes noted they prepared, until the frame is captured.
+struct Lighting {
+    bool noted{}, mixed{};
+    unsigned input{};
+    int masked = -1;
+    void Note(unsigned lobe, int guide) {
+        if (!noted) {
+            noted = true;
+            input = lobe;
+            masked = guide;
+        } else if (lobe != input || guide != masked) {
+            mixed = true;
+        }
+    }
+    // setting: the Lighting input the settings apply, for a frame that noted nothing.
+    void Stamp(Meta &m, unsigned setting) const {
+        m.lighting_input = mixed ? MixedLighting : noted ? input : setting;
+        m.lighting_masked = noted && !mixed ? masked : -1;
+    }
 };
 struct Header {
     std::string created;
@@ -349,6 +374,10 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     o += "\n      }";
     JsonFixed(f.Key("cpu_time_ms"), m.cpu_time_ms);
     JsonUint(f.Key("lighting_input"), m.lighting_input);
+    if (m.lighting_masked < 0)
+        f.Key("lighting_masked") += "null";
+    else
+        JsonBool(f.Key("lighting_masked"), m.lighting_masked != 0);
     f.Key("inputs");
     o += "{\n        ";
     JsonFields in(o, ",\n        ");
@@ -495,10 +524,12 @@ template <class F> class Sequence {
                 continue;
             }
             // A reset frame begins a new RR history, so it can only start a run. A run also keeps
-            // one lighting input.
+            // one lighting input, with or without its SSS guide; a mixed frame joins no run.
             if (!run.empty() && (f.meta.reset || f.meta.serial != run.back().meta.serial + 1 ||
                                  f.width != run.back().width || f.height != run.back().height ||
-                                 f.meta.lighting_input != run.back().meta.lighting_input))
+                                 f.meta.lighting_input == MixedLighting ||
+                                 f.meta.lighting_input != run.back().meta.lighting_input ||
+                                 f.meta.lighting_masked != run.back().meta.lighting_masked))
                 Restart();
             run.push_back(std::move(f));
             if (run.size() == Frames) {
