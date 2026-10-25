@@ -96,6 +96,18 @@ static void OnRuntime(reshade::api::effect_runtime *) {
     }
     SparsePool().Poll();
     LiveRR().Poll();
+    // Idle windows are reported a few times so a missing blur dispatch is visible.
+    static ULONGLONG distance_report{};
+    static unsigned idle_reports{};
+    const auto now = GetTickCount64();
+    if (now - distance_report >= 10000) {
+        distance_report = now;
+        char line[320];
+        const bool active = DistanceStats().Summary(line, sizeof(line));
+        if (LiveRR().Enabled() && LiveRR().SpecularHitEnabled() &&
+            (active || idle_reports++ < 3))
+            WriteLog(line);
+    }
 }
 static void StatusRow(const char *name, rrstatus::State value) {
     ImGui::Text("%s: %s", name, rrstatus::Label(value));

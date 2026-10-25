@@ -343,6 +343,13 @@ class Controller {
             policy.Reject();
         }
     }
+    bool PrepassSurface(ID3D12GraphicsCommandList *cl, ID3D12Resource *surface) {
+        std::lock_guard lock(mutex);
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.gpu.sources[3].Get() == surface)
+                return true;
+        return false;
+    }
     // The native distance blur runs after the prepass on the same recording and
     // reads that prepass's PackedSurface. Only a copy is recorded; the caller has
     // proven the dispatch, tables, views and the source's tracked state.
