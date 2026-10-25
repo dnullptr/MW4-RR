@@ -86,8 +86,22 @@ void main(uint3 id : SV_DispatchThreadID)
     float length2=dot(ray,ray);
     if(!RRFinite(length2) || length2<1e-20)return;
     ray*=rsqrt(length2);
+    // Development guide tests for thin-geometry noise (rr_guide_test.h). 0 = normal guides.
+#ifndef RR_GUIDE_TEST
+#define RR_GUIDE_TEST 0
+#endif
+#if RR_GUIDE_TEST==1
+    if(dot(normal,ray)>0)normal=-normal; // back faces (e.g. foliage undersides) face the camera
+#elif RR_GUIDE_TEST==2
+    normal=-ray;
+#elif RR_GUIDE_TEST==3
+    if(!special)diffuse=0.5;
+#endif
     float3 specular=RRGameSpecularReflectance(materialF0,roughness,dot(normal,ray));
     if(!RRFinite3(specular))return;
+#if RR_GUIDE_TEST==4
+    specular=0;
+#endif
     NormalRoughness[p]=float4(normal,roughness);
     DiffuseAlbedo[p]=float4(diffuse,1);
     SpecularAlbedo[p]=float4(specular,1);

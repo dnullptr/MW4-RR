@@ -3,6 +3,11 @@
 #include "rr_evaluation_params.h"
 #include "feed_fg_identity.h"
 #include "../build/rr_convert_guides.generated.h"
+#include "../build/rr_convert_guides_test1.generated.h"
+#include "../build/rr_convert_guides_test2.generated.h"
+#include "../build/rr_convert_guides_test3.generated.h"
+#include "../build/rr_convert_guides_test4.generated.h"
+#include "rr_guide_test.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
 #include "../build/rr_live_display.generated.h"
@@ -103,6 +108,8 @@ struct Pipelines {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root;
     ComPtr<ID3D12PipelineState> converter, probability;
+    // Guide test variants, indexed by rrguidetest::Mode - 1.
+    std::array<ComPtr<ID3D12PipelineState>, rrguidetest::Count - 1> converter_tests;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
     UINT stride{};
     void Initialize(ID3D12Device *d) {
@@ -121,6 +128,14 @@ struct Pipelines {
         D3D12_ROOT_SIGNATURE_DESC rd{4, p};
         Root(rd, converter_root);
         Pipeline(converter_root.Get(), RRGuideShader, sizeof(RRGuideShader), converter);
+        Pipeline(converter_root.Get(), RRGuideShaderTest1, sizeof(RRGuideShaderTest1),
+                 converter_tests[0]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest2, sizeof(RRGuideShaderTest2),
+                 converter_tests[1]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest3, sizeof(RRGuideShaderTest3),
+                 converter_tests[2]);
+        Pipeline(converter_root.Get(), RRGuideShaderTest4, sizeof(RRGuideShaderTest4),
+                 converter_tests[3]);
         ranges[0].NumDescriptors = 3;
         ranges[1].NumDescriptors = 1;
         D3D12_ROOT_PARAMETER q[5]{};
@@ -360,7 +375,9 @@ struct GpuFrame {
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetComputeRootSignature(p.converter_root.Get());
-        cl->SetPipelineState(p.converter.Get());
+        const auto test = rrguidetest::Valid(rrguidetest::mode.load(std::memory_order_relaxed));
+        cl->SetPipelineState(test == rrguidetest::Off ? p.converter.Get()
+                                                      : p.converter_tests[test - 1].Get());
         cl->SetComputeRootDescriptorTable(0, Gpu(p, 0));
         cl->SetComputeRootDescriptorTable(1, Gpu(p, 4));
         for (unsigned i = 0; i < 2; ++i)

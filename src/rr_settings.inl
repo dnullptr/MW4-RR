@@ -2,6 +2,7 @@
 #include "rr_settings_model.h"
 #include "rr_lighting_source.h"
 #include "rr_responsivity.h"
+#include "rr_guide_test.h"
 // CPU settings and UI only. Rendering threads service preset changes.
 static std::mutex settings_mutex;
 static bool settings_loaded{}, config_allowed{};
@@ -125,6 +126,11 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
     ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
                        "history; they are counted in ReShade.log instead. Off: previous behavior.");
+    // Session-only: not saved, so a test mode never sticks across restarts.
+    int guide_test = static_cast<int>(rrguidetest::Valid(rrguidetest::mode));
+    if (ImGui::Combo("Guide test (thin geometry)", &guide_test, rrguidetest::labels,
+                     rrguidetest::Count))
+        rrguidetest::mode = static_cast<unsigned>(guide_test);
     int lobe = static_cast<int>(rrlighting::Valid(requested_lobe));
     if (ImGui::Combo("Lighting input", &lobe, rrlighting::labels, rrlighting::Count)) {
         requested_lobe = static_cast<unsigned>(lobe);
