@@ -111,7 +111,14 @@ struct CpuResource final : ID3D12Resource {
         return E_NOTIMPL;
     }
 };
-static unsigned releases{}, destroys{};
+static unsigned releases{}, destroys{}, log_lines{};
+static void CountLog(const char *) {
+    ++log_lines;
+}
+static std::string last_log;
+static void KeepLog(const char *s) {
+    last_log = s;
+}
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
     return NVSDK_NGX_Result_Success;
@@ -367,6 +374,122 @@ struct ControllerCpuTest {
         rrhitcond::fill = false;
         weights->Release();
     }
+    static void CaptureLighting() {
+        // A first spatial pass notes the lighting it prepared on its frame's one guide
+        // recording, only while a capture is Armed or Collecting (capture_active).
+        Controller c;
+        c.SetEnabled(true);
+        auto &s = c.slots[0], &other = c.slots[1];
+        s.generation = other.generation = c.generation;
+        s.pre_live = s.native_sampling = true;
+        assert(!c.capture_active);
+        c.NoteLighting(nullptr, 9, 1); // No capture: nothing noted.
+        assert(!s.lighting.noted);
+        c.RequestCapture();
+        assert(c.capture.state == rrcapture::State::Armed && c.capture_active);
+        c.NoteLighting(nullptr, 9, 1);
+        assert(s.lighting.noted && s.lighting.input == 9 && s.lighting.masked == 1 &&
+               !s.lighting.mixed);
+        c.NoteLighting(nullptr, 9, 0); // A later pass of the frame without the SSS guide.
+        assert(s.lighting.mixed);
+        s.lighting = {};
+        other.pre_live = other.native_sampling = true; // Two match: neither is noted.
+        c.NoteLighting(nullptr, 4, -1);
+        assert(!s.lighting.noted && !other.lighting.noted);
+        other.native_sampling = false; // The dispatch's sampling rates are not its.
+        c.NoteLighting(nullptr, 4, -1);
+        assert(s.lighting.noted && s.lighting.input == 4 && !other.lighting.noted);
+        s.pending_sr = true; // Its SR call has begun.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(s.lighting.input == 4 && !s.lighting.mixed);
+        s.pending_sr = false;
+        c.capture_active = false; // Never locks or notes while the flag is off.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = true;
+        c.SetEnabled(false); // Armed waits for RR.
+        assert(c.capture.state == rrcapture::State::Armed && c.capture_active);
+        c.CaptureFailed("test");
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        c.SetEnabled(true);
+        s.generation = c.generation;
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = true; // Stale: the capture's state under the lock decides.
+        c.NoteLighting(nullptr, 5, -1);
+        assert(!s.lighting.mixed);
+        c.capture_active = false;
+        c.RequestCapture();
+        assert(c.capture_active);
+        c.retired = true; // A request while RR is retired fails at once.
+        c.CaptureFailed("test");
+        c.RequestCapture();
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        c.retired = false;
+        c.RequestCapture();
+        c.Failure("test"); // RR failing ends the capture.
+        assert(c.capture.state == rrcapture::State::Failed && !c.capture_active);
+        // A slot's notes go with it (Reconfigure waits for no live recording).
+        s.pre_live = other.pre_live = false;
+        c.QueueReconfigure();
+        assert(c.Reconfigure() && !c.slots[0].lighting.noted);
+    }
+    static void ReplaceSkip() {
+        // Each refusal in TryReplaceSR names itself for this thread's evaluate
+        // (rrtrace::Probe::CurrentSkip), with or without a capture.
+        Controller c;
+        rrsparsecopy::Layouts layouts;
+        rrtrace::SlCall scope{};
+        const auto why = [&](bool safe) {
+            rrtrace::Probe::NoteSkip(rrsr::SkipCount);
+            assert(!c.TryReplaceSR(nullptr, nullptr, scope, nullptr, 0, safe, layouts));
+            return rrtrace::Probe::CurrentSkip();
+        };
+        assert(why(true) == rrsr::Off);
+        c.SetEnabled(true);
+        c.failed = true;
+        assert(why(true) == rrsr::Failed);
+        c.failed = false;
+        c.retired = true;
+        assert(why(true) == rrsr::Failed);
+        c.retired = false;
+        c.layout_pending = true;
+        assert(why(true) == rrsr::Reconfigure);
+        c.layout_pending = false;
+        assert(why(false) == rrsr::Unsafe);
+        assert(why(true) == rrsr::Scope); // No SL call.
+        scope = {true, sl::kFeatureDLSS, 5, 0};
+        assert(why(true) == rrsr::Scope); // No frame of that call.
+        auto &s = c.slots[0];
+        s.pre_live = true;
+        s.frame = 5;
+        s.viewport = 0;
+        assert(why(true) == rrsr::Scope); // Its SR call has not begun.
+        s.pending_sr = true;
+        assert(why(true) == rrsr::List); // Not on the SR call's list.
+        // The route log says why from the slot: a reason, or the failed proof.
+        c.logger = KeepLog;
+        const rrcapture::Sources sources{};
+        const std::array<unsigned, rrcapture::InputCount> from{};
+        s.skip = rrsr::ResetFixed;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log == "RR capture: native SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40; replacement not tried (reset parameter not "
+                           "writable)");
+        c.LogCaptureRoute(s, sources, from, true);
+        assert(last_log == "RR capture: RR replaces SR; input states: color none 0x40, depth none "
+                           "0x40, motion none 0x40");
+        s.proof_failed = true;
+        s.skip = rrsr::Ineligible;
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not eligible: color missing, depth missing, "
+                                  "motion missing, output missing"));
+        s = {}; // Reset with the slot.
+        assert(s.skip == rrsr::NotCalled && !s.proof_failed);
+        c.LogCaptureRoute(s, sources, from, false);
+        assert(last_log.ends_with("; replacement not tried (not called)"));
+        c.logger = nullptr;
+    }
     static void Run() {
         DevTests();
         RetirementFailure();
@@ -374,6 +497,8 @@ struct ControllerCpuTest {
         RuntimeLog();
         WeaponDepth();
         HitDistanceTests();
+        CaptureLighting();
+        ReplaceSkip();
         // Diagnostic route changes must retire existing work, then reset once.
         Controller diagnostic;
         diagnostic.SetEnabled(true);

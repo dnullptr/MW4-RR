@@ -64,4 +64,39 @@ inline void Describe(const StateProof &p, char *out, size_t size) {
         used += size_t(n);
     }
 }
+// Why an SR evaluate kept native SR, for the capture log. rrtrace::Probe notes the reasons up to
+// Declined (replacement ran and gave none); TryReplaceSR notes the rest. Ineligible comes with
+// Describe's reason when a capture kept the proof.
+enum Skip : unsigned {
+    NotCalled,
+    Callback,
+    Creation,
+    ResetFixed,
+    Threw,
+    Declined,
+    Off,
+    Failed,
+    Reconfigure,
+    Unsafe,
+    Scope,
+    List,
+    Ineligible,
+    SkipCount
+};
+inline constexpr const char *skip_texts[SkipCount] = {"not called",
+                                                      "progress callback",
+                                                      "creation not seen",
+                                                      "reset parameter not writable",
+                                                      "error",
+                                                      "declined",
+                                                      "RR off",
+                                                      "RR failed or retired",
+                                                      "reconfigure pending",
+                                                      "unsafe list",
+                                                      "no matching SR call",
+                                                      "other command list",
+                                                      "not eligible"};
+inline const char *SkipText(unsigned why) {
+    return why < SkipCount ? skip_texts[why] : "unknown";
+}
 } // namespace rrsr

@@ -93,13 +93,26 @@ int main() {
                 ++ok, ++at;
             assert((ok == 4) == rrsr::Eligible(q) && ok >= 3);
         }
-    // A short buffer keeps a terminated prefix; an empty one is left alone.
-    char short_text[12];
-    rrsr::Describe(p, short_text, sizeof(short_text));
-    assert(!strcmp(short_text, "color 0x40 "));
-    short_text[0] = 'x';
-    rrsr::Describe(p, short_text, 0);
-    assert(short_text[0] == 'x');
+    // A short buffer keeps a terminated prefix, also when a later clause is cut, and nothing
+    // past its size changes; an empty one is left alone.
+    char guarded[80];
+    for (size_t size : {size_t(12), size_t(20)}) {
+        memset(guarded, '#', sizeof(guarded));
+        rrsr::Describe(p, guarded, size);
+        assert(!strcmp(guarded, size == 12 ? "color 0x40 " : "color 0x40 ok, dept"));
+        for (size_t i = size; i < sizeof(guarded); ++i)
+            assert(guarded[i] == '#');
+    }
+    memset(guarded, '#', sizeof(guarded));
+    rrsr::Describe(p, guarded, 0);
+    assert(guarded[0] == '#');
+    // Why replacement was not tried, for the capture log: one text per reason.
+    assert(!strcmp(rrsr::SkipText(rrsr::NotCalled), "not called"));
+    assert(!strcmp(rrsr::SkipText(rrsr::ResetFixed), "reset parameter not writable"));
+    assert(!strcmp(rrsr::SkipText(rrsr::SkipCount), "unknown"));
+    for (unsigned i = 0; i < rrsr::SkipCount; ++i)
+        for (unsigned j = 0; j <= i; ++j)
+            assert(*rrsr::SkipText(i) && !strcmp(rrsr::SkipText(i), rrsr::SkipText(j)) == (i == j));
     auto a = rrspatial::Coordinate(0, 2, 4);
     assert(a.first == 0 && a.second == 1 && a.fraction == 0);
     a = rrspatial::Coordinate(1, 2, 4);

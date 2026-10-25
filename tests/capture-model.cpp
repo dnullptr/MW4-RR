@@ -251,6 +251,101 @@ static void LightingBreaksRun() {
     Done(t, c);
     assert(t.Settle().empty() && t.run.size() == 2 && t.pool.size() == 9);
 }
+// A frame is stamped with what its first spatial passes noted, else with the setting; a second
+// note that differs in the lobe or in the SSS guide makes the frame mixed for good.
+static void LightingNotes() {
+    static_assert(MixedLighting == 0xFFFFFFFFu);
+    Meta m;
+    assert(m.lighting_masked == -1);
+    m.lighting_input = 1;
+    m.lighting_masked = 1;
+    Lighting().Stamp(m, 7); // The correction path did not run: the setting, nothing masked.
+    assert(m.lighting_input == 7 && m.lighting_masked == -1);
+    Lighting guided;
+    guided.Note(9, 1);
+    guided.Note(9, 1); // The same again is no change.
+    guided.Stamp(m, 7);
+    assert(m.lighting_input == 9 && m.lighting_masked == 1);
+    Lighting raw;
+    raw.Note(10, 0); // An SSS-masked lobe whose guide was not applied: raw lighting.
+    raw.Stamp(m, 7);
+    assert(m.lighting_input == 10 && m.lighting_masked == 0);
+    Lighting plain;
+    plain.Note(3, -1);
+    plain.Stamp(m, 7);
+    assert(m.lighting_input == 3 && m.lighting_masked == -1);
+    for (const auto &[lobe, masked] : {std::pair{4u, 1}, std::pair{9u, 0}, std::pair{9u, -1}}) {
+        Lighting l;
+        l.Note(9, 1);
+        l.Note(lobe, masked);
+        l.Note(9, 1); // Changing back does not undo it.
+        l.Stamp(m, 7);
+        assert(m.lighting_input == MixedLighting && m.lighting_masked == -1);
+    }
+    Lighting three; // Nor does a third, different lobe.
+    three.Note(9, 1);
+    three.Note(4, 1);
+    three.Note(5, 1);
+    three.Stamp(m, 7);
+    assert(m.lighting_input == MixedLighting && m.lighting_masked == -1);
+}
+static void MaskedLightingBreaksRun() {
+    // Same lobe, but its SSS guide goes missing at 43, so 40..42 cannot lead into it.
+    Seq s = Collecting();
+    for (unsigned i = 40; i <= 50; ++i) {
+        Frame<int> f = Make(i, int(i));
+        f.meta.lighting_input = 9;
+        f.meta.lighting_masked = i < 43 ? 1 : 0;
+        Done(s, f);
+    }
+    const auto done = s.Settle();
+    assert(done.size() == Frames && s.state == State::Writing);
+    for (unsigned i = 0; i < Frames; ++i)
+        assert(done[i].meta.serial == 43 + i && done[i].meta.lighting_masked == 0);
+    // Across polls as well: a frame that noted nothing (-1) does not lead into a noted one.
+    Seq t = Collecting();
+    Frame<int> a = Make(1, 21), b = Make(2, 22), c = Make(3, 23);
+    b.meta.lighting_masked = c.meta.lighting_masked = 1;
+    Done(t, a);
+    assert(t.Settle().empty() && t.run.size() == 1);
+    Done(t, b);
+    assert(t.Settle().empty() && t.run.size() == 1 && t.run[0].meta.serial == 2);
+    assert(t.pool.size() == 9 && t.pool.back() == 21);
+    Done(t, c); // Unchanged: the run goes on.
+    assert(t.Settle().empty() && t.run.size() == 2 && t.pool.size() == 9);
+}
+static void MixedLightingStandsAlone() {
+    // The lighting changed within frame 63: it ends 60..62 and 64 does not follow it.
+    Seq s = Collecting();
+    for (unsigned i = 60; i <= 72; ++i) {
+        Frame<int> f = Make(i, int(i));
+        f.meta.lighting_input = i < 63 ? 2 : i == 63 ? MixedLighting : 5;
+        Done(s, f);
+    }
+    const auto done = s.Settle();
+    assert(done.size() == Frames && s.state == State::Writing);
+    for (unsigned i = 0; i < Frames; ++i)
+        assert(done[i].meta.serial == 64 + i && done[i].meta.lighting_input == 5);
+    // Across polls, with the same lobe on both sides of it.
+    Seq t = Collecting();
+    Frame<int> a = Make(1, 21), mixed = Make(2, 22), b = Make(3, 23);
+    a.meta.lighting_input = b.meta.lighting_input = 5;
+    mixed.meta.lighting_input = MixedLighting;
+    Done(t, a);
+    assert(t.Settle().empty() && t.run.size() == 1);
+    Done(t, mixed);
+    assert(t.Settle().empty() && t.run.size() == 1 && t.run[0].meta.serial == 2);
+    Done(t, b);
+    assert(t.Settle().empty() && t.run.size() == 1 && t.run[0].meta.serial == 3);
+    assert(t.pool.size() == 10 && t.pool.back() == 22);
+    // Nor does a mixed frame follow another one: no run is ever made of them.
+    Frame<int> again = Make(4, 24), next = Make(5, 25);
+    again.meta.lighting_input = next.meta.lighting_input = MixedLighting;
+    Done(t, again);
+    Done(t, next);
+    assert(t.Settle().empty() && t.run.size() == 1 && t.run[0].meta.serial == 5);
+    assert(t.pool.size() == 12 && t.pool.back() == 24);
+}
 
 static void StaleSessions() {
     Seq s = Collecting();
@@ -716,16 +811,27 @@ static void ManifestShape() {
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
     frames[1].meta.lighting_input = 3;
+    frames[1].meta.lighting_masked = 1;
     frames[0].meta.hit_distance_test = 2;
     const std::string m = Manifest(h, frames);
     assert(Balanced(m));
     assert(Contains(m, "\"cpu_time_ms\": 100000000.125")); // Fixed, where %.9g would round.
-    // Each frame's lighting input, right after its cpu_time_ms; create_flags right after preset.
+    // Each frame's lighting input and whether its SSS guide was applied, right after its
+    // cpu_time_ms; create_flags right after preset.
     assert(Contains(m, "\"cpu_time_ms\": 123456.789,\n      \"lighting_input\": 0,\n      "
-                       "\"inputs\": {"));
+                       "\"lighting_masked\": null,\n      \"inputs\": {"));
     assert(Contains(m, "\"cpu_time_ms\": 100000000.125,\n      \"lighting_input\": 3,\n      "
-                       "\"inputs\": {"));
+                       "\"lighting_masked\": true,\n      \"inputs\": {"));
     assert(Count(m, "\"lighting_input\": ") == 3); // Two frames and the header's settings.
+    assert(Count(m, "\"lighting_masked\": ") == 2); // Per frame only.
+    {
+        auto raw = frames;
+        raw[1].meta.lighting_masked = 0;
+        raw[1].meta.lighting_input = MixedLighting;
+        const std::string r = Manifest(h, raw);
+        assert(Balanced(r) && Contains(r, "\"lighting_input\": 4294967295,\n      "
+                                          "\"lighting_masked\": false,\n      \"inputs\": {"));
+    }
     assert(Contains(m, "\"preset\": 6,\n  \"create_flags\": 11,\n  \"settings\": {"));
     const char *top[] = {"\"format\": \"mw4-rr-capture\"",
                          "\"version\": 1",
@@ -845,8 +951,8 @@ static void ManifestShape() {
     assert(Contains(m, "\"format\": \"DXGI_87\", \"dxgi_format\": 87"));
     assert(Contains(m, "\"source_size\": [8, 6]"));
     assert(Contains(m, "\"source_offset\": [0, 0]"));
-    // Twelve absent inputs per frame, and "far".
-    assert(Count(m, "\": null") == 2 * (InputCount - 2) + 2);
+    // Twelve absent inputs per frame, "far", and frame 0's lighting_masked.
+    assert(Count(m, "\": null") == 2 * (InputCount - 2) + 2 + 1);
     // No frames at all is still valid.
     const std::string empty = Manifest(h, std::vector<Frame<int>>{});
     assert(Balanced(empty) && Contains(empty, "\"frame_count\": 0"));
@@ -871,14 +977,14 @@ static void ManifestOutputSize() {
                        "\"R16G16B16A16_FLOAT\", \"dxgi_format\": 10, \"width\": 8, \"height\": 6, "
                        "\"bytes_per_pixel\": 8, \"source_offset\": [0, 0], "
                        "\"source_size\": [8, 6], \"state\": \"addon\", \"state_before\": 8}"));
-    // All 14 inputs in table order, and no others: two present, twelve null.
+    // All 14 inputs in table order, and no others: two present, twelve null (and lighting_masked).
     std::size_t at = m.find("\"inputs\": {");
     assert(at != std::string::npos);
     for (unsigned i = 0; i < InputCount; ++i) {
         at = m.find("\"" + std::string(names[i]) + "\": ", at);
         assert(at != std::string::npos);
     }
-    assert(InputCount == 14 && Count(m, "\": null") == 12 && Count(m, "{\"file\": ") == 2);
+    assert(InputCount == 14 && Count(m, "\": null") == 12 + 1 && Count(m, "{\"file\": ") == 2);
 }
 // Each present input says where the state its copy moved it from came from; absent ones are null.
 static void ManifestInputStates() {
@@ -905,7 +1011,7 @@ static void ManifestInputStates() {
     assert(Contains(m, "\"source_size\": [8, 6], \"state\": \"proven\", \"state_before\": 64}"));
     assert(Contains(m, "\"source_size\": [4, 3], \"state\": \"addon\", \"state_before\": 64}"));
     assert(Count(m, "\"state\": ") == 4 && Count(m, "\"state_before\": ") == 4);
-    assert(Count(m, "\": null") == InputCount - 4 && Contains(m, "\"sss_guide\": null") &&
+    assert(Count(m, "\": null") == InputCount - 4 + 1 && Contains(m, "\"sss_guide\": null") &&
            Contains(m, "\"rr_output\": null"));
     // An out-of-range source still writes valid JSON.
     f.regions[Color].state_source = StateSourceCount;
@@ -954,6 +1060,7 @@ static int WriteSample(const char *folder) {
         f.meta.pre_exposure = f.meta.exposure_scale = 1;
         f.meta.cpu_time_ms = 123456.789 + i;
         f.meta.lighting_input = 12;
+        f.meta.lighting_masked = 1; // 12 is SSS-masked; its guide was applied.
         f.meta.world_to_view[0] = f.meta.world_to_view[5] = f.meta.world_to_view[10] = 1;
         f.meta.world_to_view[15] = 1;
         f.meta.view_to_clip[0] = 1.5f;
@@ -994,6 +1101,9 @@ int main(int argc, char **argv) {
     GapAndSizeRestart();
     ResetOnlyStartsRun();
     LightingBreaksRun();
+    LightingNotes();
+    MaskedLightingBreaksRun();
+    MixedLightingStandsAlone();
     StaleSessions();
     FailDropsLater();
     CountOverflow();

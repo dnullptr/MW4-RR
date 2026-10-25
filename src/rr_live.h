@@ -22,6 +22,7 @@
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
 #include "rr_capture.h"
+#include <atomic>
 #include <mutex>
 #include <deque>
 #ifdef RR_FILTER_DIAGNOSTIC
@@ -68,12 +69,14 @@ class Controller {
         std::array<Observed, 4> states{};
         rreval::Options options;
         rrcapture::Capture captured; // The frame recorded on this slot, if any.
+        rrcapture::Lighting lighting; // What its first spatial passes prepared, while capturing.
         // Held until the slot retires: a replayed SR recording must never copy into freed memory.
         ComPtr<ID3D12Resource> capture_hold;
         unsigned capture_session{}; // The capture session capture_hold was recorded in.
         // TryReplaceSR's proof when it was not eligible while a capture was active.
         rrsr::StateProof proof;
         bool proof_failed{};
+        unsigned skip{}; // Why native SR ran (rrsr::Skip), kept by a capture of this frame.
     };
     struct Call {
         bool locked{};
@@ -174,6 +177,8 @@ class Controller {
     rrcapture::Session capture;
     std::shared_ptr<rrcapture::Outcome> capture_outcome;
     unsigned capture_lighting{};
+    // capture.Active(), set under the lock by CaptureChanged; NoteLighting reads it without it.
+    std::atomic<bool> capture_active{};
     unsigned capture_logged{}; // The capture session whose route and input states were logged.
     void Log(const char *s) {
         if (logger)
@@ -583,6 +588,7 @@ class Controller {
             } catch (...) {
                 CaptureFailed("out of memory");
             }
+            CaptureChanged(); // A complete run is Writing.
             if (!done.empty())
                 WriteCaptureLocked(std::move(done));
         }
@@ -616,6 +622,10 @@ class Controller {
         } catch (...) {
         }
     }
+    // Follows every call that can change capture.state, under the lock.
+    void CaptureChanged() {
+        capture_active.store(capture.Active(), std::memory_order_relaxed);
+    }
     // A capture problem ends the capture, never RR. Fail is ignored while Writing, so a writer
     // that could not start (writer = true) ends its session with Finished instead.
     void CaptureFailed(const char *why, bool writer = false) {
@@ -632,6 +642,7 @@ class Controller {
             else
                 capture.Fail({});
         }
+        CaptureChanged();
         LogCaptureFailure();
     }
     // Everything a capture copies this frame: what RR is given, the Status guide and RR's output.
@@ -671,6 +682,8 @@ class Controller {
                      unsigned(sources[k].state));
         if (!replacement && s.proof_failed)
             rrsr::Describe(s.proof, why, sizeof(why));
+        else if (!replacement)
+            snprintf(why, sizeof(why), " (%s)", rrsr::SkipText(s.skip));
         snprintf(line, sizeof(line), "RR capture: %s; input states: %s, %s, %s%s%s",
                  replacement ? "RR replaces SR" : "native SR", inputs[0], inputs[1], inputs[2],
                  replacement      ? ""
@@ -743,6 +756,7 @@ class Controller {
                         return false;
                 }
                 capture.Begin(std::move(buffers));
+                CaptureChanged();
                 snprintf(line, sizeof(line), "RR capture: collecting %u frames, %llu MB each",
                          rrcapture::Frames, mb(frame.bytes));
                 Log(line);
@@ -763,6 +777,8 @@ class Controller {
                     from[k] = rrcapture::Contract;
                 }
             }
+            if (!replacement) // Noted by the probe or TryReplaceSR on this thread's evaluate.
+                s.skip = rrtrace::Probe::CurrentSkip();
             frame.buffer = capture.Take();
             if (frame.buffer && frame.buffer->GetDesc().Width < frame.bytes)
                 frame.buffer.Reset();
@@ -774,6 +790,7 @@ class Controller {
                     return false;
             }
             if (!capture.Count()) {
+                CaptureChanged();
                 LogCaptureFailure();
                 return false;
             }
@@ -783,7 +800,9 @@ class Controller {
             m.viewport = s.viewport;
             m.reset = reset;
             m.reset_reasons = policy.LastReason();
-            m.lighting_input = capture_lighting;
+            // The lighting this frame's first spatial passes prepared (NoteLighting), or the
+            // setting when none noted it.
+            s.lighting.Stamp(m, capture_lighting);
             const auto pair = [](auto *to, auto a, auto b) {
                 to[0] = a;
                 to[1] = b;
@@ -906,6 +925,7 @@ class Controller {
         std::lock_guard lock(capture_outcome->mutex);
         if (capture_outcome->done)
             capture.Finished(capture_outcome->ok, std::move(capture_outcome->text));
+        CaptureChanged();
     }
 #include "rr_live_pool.inl"
   public:
@@ -1546,13 +1566,15 @@ class Controller {
         std::lock_guard lock(mutex);
         CaptureOutcomeLocked(); // A writer that has finished no longer blocks a new request.
         if (capture.Request()) {
+            CaptureChanged();
             capture_outcome.reset();
             Log("RR capture: requested");
             if (failed || retired) // Neither is ever cleared: nothing would be collected.
                 CaptureFailed("RR is not running");
         }
     }
-    // The Lighting input the settings apply; each captured frame records the one it ran with.
+    // The Lighting input the settings apply: only a captured frame whose first spatial pass
+    // noted none (NoteLighting) is stamped with it.
     void SetCaptureLighting(unsigned value) {
         std::lock_guard lock(mutex);
         capture_lighting = value;
@@ -1775,6 +1797,24 @@ class Controller {
     bool SamplingReady(ID3D12GraphicsCommandList *cl) {
         return bool(SamplingData(cl).buffer);
     }
+    // The lighting a first spatial pass on cl prepared, on the slot SamplingData gives it rates
+    // for; masked as in rrcapture::Meta. Without a capture this is one relaxed load.
+    void NoteLighting(ID3D12GraphicsCommandList *cl, unsigned lobe, int masked) {
+        if (!capture_active.load(std::memory_order_relaxed))
+            return;
+        std::lock_guard lock(mutex);
+        if (!capture.Active())
+            return;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return;
+                match = &s;
+            }
+        if (match)
+            match->lighting.Note(lobe, masked);
+    }
     bool RawWasCorrected(ID3D12GraphicsCommandList *cl) {
         std::lock_guard lock(mutex);
         for (auto &s : slots)
@@ -1860,12 +1900,27 @@ class Controller {
                       rrtrace::SlCall scope, HMODULE mod, UINT64 epoch, bool safe,
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired || NeedsReconfigure() || !safe || !scope.valid)
+        // Each refusal names itself for a capture's log (rrtrace::Probe::CurrentSkip).
+        const auto skip = [](unsigned why) {
+            rrtrace::Probe::NoteSkip(why);
             return false;
+        };
+        if (!enabled)
+            return skip(rrsr::Off);
+        if (failed || retired)
+            return skip(rrsr::Failed);
+        if (NeedsReconfigure())
+            return skip(rrsr::Reconfigure);
+        if (!safe)
+            return skip(rrsr::Unsafe);
+        if (!scope.valid)
+            return skip(rrsr::Scope);
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
         auto *s = Match(scope);
-        if (!native || !s || !s->pending_sr || s->sr.Get() != native.Get())
-            return false;
+        if (!s || !s->pending_sr)
+            return skip(rrsr::Scope);
+        if (!native || s->sr.Get() != native.Get())
+            return skip(rrsr::List);
         rrsr::StateProof proof;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
@@ -1873,6 +1928,8 @@ class Controller {
         }
         if (!rrsr::Eligible(proof)) {
             if (capture.Active()) { // CaptureLocked logs why; never fails replacement's caller.
+                s->proof = proof;   // Kept without aliasing when a lookup below throws.
+                s->proof_failed = true;
                 try {
                     for (unsigned i = 0; i < 4; ++i) {
                         D3D12_RESOURCE_STATES unaliased{};
@@ -1880,12 +1937,11 @@ class Controller {
                             proof.known[i] &&
                             !layouts.GetUnaliased(native.Get(), s->gpu.sr[i].Get(), unaliased);
                     }
-                    s->proof = proof;
-                    s->proof_failed = true;
+                    s->proof.aliased = proof.aliased;
                 } catch (...) {
                 }
             }
-            return false;
+            return skip(rrsr::Ineligible);
         }
         for (unsigned i = 0; i < 4; ++i)
             s->states[i] = {proof.states[i], true, true};
