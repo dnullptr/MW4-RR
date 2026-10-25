@@ -178,11 +178,11 @@ inline const char *Label(Report r) {
     case Report::Unavailable:
         return "unavailable (see ReShade.log)";
     case Report::NoSource:
-        return "on, no glass capture this frame (needs the transparency albedo blend on)";
+        return "on, no glass capture this frame (no glass in view, or the transparency albedo blend is off)";
     case Report::NoRefraction:
-        return "on, no refracting glass in view";
+        return "on, no refraction captured this frame";
     case Report::Active:
-        return "active (refracting glass in view)";
+        return "active (refraction captured; the blend's submission check still applies)";
     }
     return "off";
 }

@@ -99,9 +99,9 @@ void DropoutRecord(Slot &s, ID3D12GraphicsCommandList *cl, const rreval::Options
     if (!dropout_report)
         dropout_report = now;
     else if (now - dropout_report >= 10000) {
-        char line[240];
+        char line[280];
         snprintf(line, sizeof(line),
-                 "Refraction dropout (%.1fs): %u evaluations, %u with refraction coverage, %u "
+                 "Refraction dropout (%.1fs): %u evaluations, %u with refraction captured (before the submission check), %u "
                  "also dropped the color before transparency; strength %.2f%s",
                  double(now - dropout_report) / 1000, dropout_frames, dropout_covered_frames,
                  dropout_before_frames, rrdropout::ClampStrength(t.strength),
