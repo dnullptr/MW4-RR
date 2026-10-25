@@ -58,9 +58,7 @@ inline void Order(ID3D12GraphicsCommandList *cl) {
 }
 struct Budget {
     static constexpr UINT64 Minimum = 1024ull * 1024 * 1024;
-    // committed: the largest requirement any Reserve has promised (pool, SSS,
-    // transparency) since the last Reconfigure; room above it is unclaimed.
-    UINT64 limit = Minimum, bytes{}, committed{};
+    UINT64 limit = Minimum, bytes{};
     // A pool projection is not a DXGI reservation. Recheck each actual new
     // allocation; matching retained resources never enter this path.
     template <class Query> bool AdmitAllocation(UINT64 needed, Query query) const {
@@ -97,10 +95,8 @@ struct Budget {
         });
     }
     bool Reserve(ID3D12Device *device, UINT64 required) {
-        if (required <= limit) {
-            committed = (std::max)(committed, required);
+        if (required <= limit)
             return true;
-        }
         if (!device || required < bytes)
             return false;
         ComPtr<IDXGIFactory4> factory;
@@ -111,7 +107,7 @@ struct Budget {
             FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) ||
             info.CurrentUsage > info.Budget || required - bytes > info.Budget - info.CurrentUsage)
             return false;
-        limit = committed = required;
+        limit = required;
         return true;
     }
 };

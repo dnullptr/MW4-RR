@@ -129,10 +129,6 @@ struct ControllerCpuTest {
         t.blocked = false;
         t.active = true;
         assert(c.Test(t, 4, true) == Controller::TestState::Idle); // RR not running
-        // Promises inside the limit are recorded without the device.
-        assert(c.budget.Reserve(nullptr, 100) && c.budget.committed == 100);
-        assert(c.budget.Reserve(nullptr, 50) && c.budget.committed == 100);
-        assert(!c.budget.Reserve(nullptr, Budget::Minimum + 1) && c.budget.committed == 100);
         // Reconfigure gives back only the reserve the test textures added.
         c.budget.limit = Budget::Minimum + 300;
         c.test_reserve = 200;
@@ -140,7 +136,7 @@ struct ControllerCpuTest {
         c.applied_color_scale = 4.0f;
         c.QueueReconfigure();
         assert(c.Reconfigure());
-        assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve && !c.budget.committed);
+        assert(c.budget.limit == Budget::Minimum + 100 && !c.test_reserve);
         assert(!c.color_test.blocked && !c.sky_edge_test.active && !c.wide_output.blocked &&
                c.applied_color_scale == 1.0f);
         c.budget.limit = Budget::Minimum + 50;

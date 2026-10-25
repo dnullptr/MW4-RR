@@ -98,8 +98,8 @@ class Controller {
     // Development tests (sky edge mask, color brightness, sky depth floor): one
     // texture each, shared by every slot, created on first use and released by
     // Reconfigure. They sit in the persistent ledger, so pool projections count
-    // each once. test_reserve is how much they grew the reserve, given back on
-    // release.
+    // each once, and the reserve grows by exactly their size (test_reserve,
+    // given back on release).
     struct DevTest {
         ComPtr<ID3D12Resource> texture;
         bool active{};     // the latest evaluation used it
@@ -140,10 +140,12 @@ class Controller {
     }
 
     // Whether a development test runs in this evaluation; creates its shared
-    // texture on first use. The texture is reserved on top of everything already
-    // promised to the pool and the SSS and transparency guides (the reserve grows
-    // only if that does not fit), so it never takes memory they count on, and a
-    // failure only keeps the test off (RR keeps running) until its setting changes.
+    // texture on first use. The reserve first grows by the texture's size on top
+    // of everything it already holds, so the texture never takes room the pool or
+    // the SSS and transparency guides counted on (Reconfigure gives the growth
+    // back). This needs free VRAM for the whole unused reserve, so a test can stay
+    // off on a tight card; a failure only keeps the test off (RR keeps running)
+    // until its setting changes.
     bool UseTest(DevTest &t, bool wanted, unsigned changes, UINT w, UINT h, DXGI_FORMAT format,
                  const char *name) {
         t.active = false;
@@ -155,21 +157,19 @@ class Controller {
         if (!t.texture) {
             const auto d = TextureDesc(w, h, format);
             const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
-            const UINT64 old = budget.limit, old_committed = budget.committed;
-            bool ok = n && n != UINT64_MAX && ReservePool(slots.size()) &&
-                      budget.committed <= UINT64_MAX - n &&
-                      budget.Reserve(pipelines.device.Get(), budget.committed + n);
+            const UINT64 old = budget.limit;
+            bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
+                      budget.Reserve(pipelines.device.Get(), old + n);
             if (ok) {
                 try {
                     t.texture = persistent.Allocate(pipelines, budget, d);
                     test_reserve += budget.limit - old;
                 } catch (const std::exception &) {
+                    budget.limit = old;
                     ok = false;
                 }
             }
             if (!ok) {
-                budget.limit = old;
-                budget.committed = old_committed;
                 t.blocked = true;
                 t.changes = changes;
                 char line[160];
@@ -312,8 +312,6 @@ class Controller {
         budget.limit = (std::max)({Budget::Minimum, budget.bytes,
                                    budget.limit - (std::min)(test_reserve, budget.limit)});
         test_reserve = 0;
-        // Every slot is gone, and with it what was promised to it.
-        budget.committed = 0;
         applied_color_scale = 1.0f;
         init_list.Reset();
         init_allocator.Reset();

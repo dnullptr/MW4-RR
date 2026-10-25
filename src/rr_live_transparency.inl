@@ -86,9 +86,10 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
     if (!rrtrans::RequiredSlots(slots.size(), base, depth, sss, glass, 0, persistent.bytes,
                                 required))
         return false;
-    // Also records the promise (Budget::committed) when it already fits.
-    if (!budget.Reserve(pipelines.device.Get(), required))
-        return false;
+    if (required > budget.limit) {
+        if (!budget.Reserve(pipelines.device.Get(), required))
+            return false;
+    }
     return rrtrans::FitsSlots(slots.size(), base, depth, sss, glass, 0, persistent.bytes,
                               budget.limit);
 }
