@@ -64,6 +64,9 @@ inline bool Valid(const Options &v) {
 // linear_depth: RR reads view-space depth (the weapon depth test, src/rr_weapon_depth.h)
 // instead of the game's hardware depth. Nearer is then smaller, so the game's inverted-depth
 // flag is cleared for RR.
+inline int CreateFlags(int flags, bool linear_depth) {
+    return linear_depth ? flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : flags;
+}
 inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6,
                              bool linear_depth = false) {
     rrpreset::Set(p, preset);
@@ -74,8 +77,7 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_OutWidth, v.out_width);
     p.Set(NVSDK_NGX_Parameter_OutHeight, v.out_height);
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
-    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-          linear_depth ? v.flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) : v.flags);
+    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, CreateFlags(v.flags, linear_depth));
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));

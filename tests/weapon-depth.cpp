@@ -160,6 +160,11 @@ static void Creation() {
            flags == (NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
     assert(NVSDK_NGX_SUCCEED(linear.Get(NVSDK_NGX_Parameter_Use_HW_Depth, &depth)) &&
            depth == NVSDK_NGX_DLSS_Depth_Type_Linear);
+    // CreateFlags is what RR is created with, and what a capture's manifest reports.
+    assert(rreval::CreateFlags(v.flags, false) == v.flags);
+    assert(rreval::CreateFlags(v.flags, true) == flags);
+    assert(rreval::CreateFlags(NVSDK_NGX_DLSS_Feature_Flags_IsHDR, true) ==
+           NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
     // Nothing else changes.
     assert(hw.values.size() == linear.values.size());
     for (const auto &[key, value] : hw.values)

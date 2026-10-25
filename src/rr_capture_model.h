@@ -106,6 +106,7 @@ struct Meta {
 };
 struct Header {
     std::string created;
+    // create_flags: the flags RR was created with (the weapon depth test clears DepthInverted).
     unsigned render_width{}, render_height{}, output_width{}, output_height{}, preset{},
         guide_test{}, lighting_input{}, create_flags{};
     int quality{};

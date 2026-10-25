@@ -781,7 +781,8 @@ class Controller {
             h.output_height = key.out_height;
             h.quality = key.quality;
             h.preset = preset.has_effective ? preset.effective : preset.desired;
-            h.create_flags = unsigned(key.flags);
+            // As RR was created: one feature per run, so one depth type (CreateParameters).
+            h.create_flags = unsigned(rreval::CreateFlags(key.flags, done[0].meta.linear_depth));
             h.sss_enabled = sss_enabled;
             h.transparency_enabled = transparency_enabled;
             h.specular_hit_enabled = hit_enabled;
