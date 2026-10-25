@@ -107,8 +107,8 @@ static bool CoverageProven(reshade::api::command_list *list, bool indirect,
         CoverageLog(path, CoverageNote::Outputs, "native outputs not proven", snapshot.status);
         return false;
     }
-    if (snapshot.proof.queries_known && !snapshot.proof.query_count) {
-        CoverageLog(path, CoverageNote::Query, "a counting query is active on the list");
+    if (!rrblend::QueriesClear(snapshot.proof)) {
+        CoverageLog(path, CoverageNote::Query, "a counting query is active or unproven on the list");
         return false;
     }
     if (entry->depth == rrblend::DepthClass::KeepDsv && !snapshot.DepthTarget().ptr) {
