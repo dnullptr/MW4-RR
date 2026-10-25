@@ -6,6 +6,7 @@
 #include "../src/rr_guide_health.h"
 #include "../src/rr_ray_density.h"
 #include "../src/rr_lighting_source.h"
+#include "../src/rr_sss_mask.h"
 #include "../src/rr_responsivity.h"
 #include "../src/rr_sky_edge.h"
 #include "../src/rr_color_scale.h"
@@ -33,9 +34,40 @@ static_assert(rrlighting::WFill == 7 && rrlighting::WNative == 8 &&
               rrlighting::Valid(rrlighting::WNative) == rrlighting::WNative);
 static_assert(std::string_view(rrlighting::labels[rrlighting::WNative]) ==
               "Raw, AO fix B (native)");
+// SSS-masked sources are appended; only they read the SSS guide.
+static_assert(rrlighting::SssNative2 == 9 && rrlighting::SssFill2 == 10 &&
+              rrlighting::SssNative3 == 11 && rrlighting::SssFill3 == 12 &&
+              rrlighting::Count == 13);
+static_assert(rrlighting::Valid(rrlighting::SssFill3) == rrlighting::SssFill3);
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssNative2]) ==
+              "SSS pixels: lobe 2 native temporal");
+static_assert(std::string_view(rrlighting::labels[rrlighting::SssFill3]) ==
+              "SSS pixels: both lobes fill gaps");
+static_assert(!rrlighting::SssMasked(rrlighting::Raw) &&
+              !rrlighting::SssMasked(rrlighting::WNative) &&
+              rrlighting::SssMasked(rrlighting::SssNative2) &&
+              rrlighting::SssMasked(rrlighting::SssFill3) &&
+              !rrlighting::SssMasked(rrlighting::Count));
+// A guide serves the next few frames of its generation and extent, across wrap.
+constexpr rrsssmask::Record guide{true, 100, 7, 1280, 720};
+static_assert(rrsssmask::Usable(guide, 101, 7, 1280, 720) &&
+              rrsssmask::Usable(guide, 100 + rrsssmask::MaxAge, 7, 1280, 720));
+static_assert(!rrsssmask::Usable(guide, 100, 7, 1280, 720) &&
+              !rrsssmask::Usable(guide, 101 + rrsssmask::MaxAge, 7, 1280, 720) &&
+              !rrsssmask::Usable(guide, 99, 7, 1280, 720));
+static_assert(!rrsssmask::Usable(guide, 101, 8, 1280, 720) &&
+              !rrsssmask::Usable(guide, 101, 7, 1920, 720) &&
+              !rrsssmask::Usable(guide, 101, 7, 1280, 1080));
+static_assert(!rrsssmask::Usable({}, 1, 0, 0, 0));
+static_assert(rrsssmask::Usable({true, 0xffffffffu, 1, 8, 8}, 1, 1, 8, 8));
 static_assert(std::string_view(rrsettings::QualityLabel(0)) == "Performance");
 static_assert(std::string_view(rrsettings::QualityLabel(5)) == "Native / DLAA");
 static_assert(std::string_view(rrsettings::QualityLabel(-1)) == "Not observed yet");
+static_assert(rrsettings::HotkeyToggles(true, false, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, true, false, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, true, true));
+static_assert(!rrsettings::HotkeyToggles(true, false, false, false));
+static_assert(!rrsettings::HotkeyToggles(false, false, false, true));
 
 int main() {
     // Sky edge mask: preset F only, strength 0 or off sends nothing.
@@ -71,6 +103,31 @@ int main() {
         assert(rrglass::Shape(d, 1));
         assert(!rrglass::Shape(d, 0));
     }
+    // The SSS mask must be the add-on's R16 guide at the lighting extent.
+    D3D12_RESOURCE_DESC lighting{};
+    lighting.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    lighting.Width = 1280;
+    lighting.Height = 720;
+    lighting.DepthOrArraySize = lighting.MipLevels = 1;
+    lighting.SampleDesc.Count = 1;
+    lighting.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    auto mask = lighting;
+    mask.Format = DXGI_FORMAT_R16_FLOAT;
+    assert(rrsssmask::Shape(mask, lighting));
+    assert(!rrsssmask::Shape(lighting, lighting));
+    auto wrong = mask;
+    wrong.Width = 640;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.Height = 360;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.SampleDesc.Count = 4;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    wrong = mask;
+    wrong.DepthOrArraySize = 4;
+    assert(!rrsssmask::Shape(wrong, lighting));
+    assert(std::string_view(rrsssmask::Label(rrsssmask::State::Active)) == "active");
     // Specular hit distance follows the runtime guide extent, not a fixed resolution.
     D3D12_RESOURCE_DESC h{};
     h.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

@@ -48,6 +48,59 @@ struct CpuFence final : ID3D12Fence {
         return E_NOTIMPL;
     }
 };
+// CPU-only resource double: only its reference count is observed.
+struct CpuResource final : ID3D12Resource {
+    ULONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override {
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++refs;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto n = --refs;
+        if (!n)
+            delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT *, void *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void **) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE *, void **) override {
+        return E_NOTIMPL;
+    }
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE *) override {}
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
+        return {};
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        return 0;
+    }
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX *, const void *, UINT,
+                                                 UINT) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void *, UINT, UINT, UINT,
+                                                  const D3D12_BOX *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES *,
+                                                D3D12_HEAP_FLAGS *) override {
+        return E_NOTIMPL;
+    }
+};
 static unsigned releases{}, destroys{};
 static NVSDK_NGX_Result NVSDK_CONV ReleaseFeature(NVSDK_NGX_Handle *) {
     ++releases;
@@ -442,6 +495,65 @@ struct ControllerCpuTest {
         c.QueueReconfigure();
         assert(c.PresetStatus().pending && c.Reconfigure());
         assert(!c.initialized && c.selected_view == UINT_MAX && !c.layout_pending);
+
+        // Only an admitted SR submission hands its SSS guide to masked lighting,
+        // for the next MaxAge frames of the same generation and extent. A rejected
+        // resolve of that guide, an SSS toggle or a rebuild releases it.
+        auto *guide = new CpuResource;
+        {
+            Controller masked;
+            masked.SetEnabled(true);
+            masked.SetSssEnabled(true);
+            auto &producer = masked.slots[1];
+            producer.frame = 10;
+            producer.generation = masked.generation;
+            producer.gpu.sss.guide = guide;
+            auto &ms = masked.slots[0];
+            ms.generation = masked.generation;
+            ms.pre_live = ms.native_sampling = true;
+            ms.frame = 11;
+            assert(!masked.SssMask(nullptr));
+            masked.SealSssMask(producer, false);
+            assert(!masked.SssMask(nullptr));
+            masked.SealSssMask(producer, true);
+            unsigned age{};
+            assert(masked.SssMask(nullptr, &age).Get() == guide && age == 1);
+            ms.frame = 10 + rrsssmask::MaxAge;
+            assert(masked.SssMask(nullptr, &age).Get() == guide && age == rrsssmask::MaxAge);
+            ms.frame = 11 + rrsssmask::MaxAge;
+            assert(!masked.SssMask(nullptr));
+            ms.frame = 10;
+            assert(!masked.SssMask(nullptr));
+            ms.frame = 11;
+            ms.gpu.w = 8;
+            assert(!masked.SssMask(nullptr));
+            ms.gpu.w = 0;
+            ms.pending_sr = true;
+            assert(!masked.SssMask(nullptr));
+            ms.pending_sr = false;
+            ms.native_sampling = false;
+            assert(!masked.SssMask(nullptr));
+            ms.native_sampling = true;
+            assert(masked.SssMask(nullptr));
+            masked.SealSssMask(producer, false);
+            assert(!masked.SssMask(nullptr) && !masked.sss_mask.valid && !masked.sss_mask_guide);
+            masked.SealSssMask(producer, true);
+            masked.SetSssEnabled(false);
+            assert(!masked.SssMask(nullptr) && !masked.sss_mask_guide);
+            masked.SetSssEnabled(true);
+            masked.SealSssMask(producer, true);
+            assert(masked.SssMask(nullptr));
+            masked.SetEnabled(false);
+            masked.SetEnabled(true);
+            ms.generation = masked.generation;
+            assert(!masked.SssMask(nullptr)); // Recorded under the previous generation.
+            ms.pre_live = false;
+            masked.QueueReconfigure();
+            assert(masked.Reconfigure());
+            assert(!masked.sss_mask.valid && !masked.sss_mask_guide);
+        }
+        assert(guide->refs == 1);
+        guide->Release();
     }
 };
 } // namespace rrlive

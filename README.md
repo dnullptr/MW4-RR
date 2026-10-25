@@ -21,6 +21,8 @@ Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering Guide 
 | F11 | Toggle the Subsurface Scattering Guide |
 | ReShade Add-ons panel | Feature toggles, status, and live Default/D/E/F preset selection |
 
+F8, F9, and F11 are ignored while Ctrl or Alt is held, so NVIDIA's development DLL debug hotkeys (Ctrl+Alt+F9 and Ctrl+Alt+F11) do not toggle guides.
+
 DLSS quality is configured through `DLSSPerfModeMP` in the game's configuration and requires a restart. Preset changes are handled separately and can apply during gameplay.
 
 ## Architecture

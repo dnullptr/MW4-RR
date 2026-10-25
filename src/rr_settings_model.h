@@ -13,6 +13,10 @@ struct Preferences {
     bool responsivity = false;            // RR responsivity mask on SSS pixels (preset F)
     float responsivity_strength = -0.5f;  // -1..0, negative = steadier
 };
+// NVIDIA's development RR DLL binds Ctrl+Alt+F9/F11, so modified presses must not toggle guides.
+inline constexpr bool HotkeyToggles(bool pressed, bool was_down, bool ctrl_or_alt, bool focused) {
+    return pressed && !was_down && !ctrl_or_alt && focused;
+}
 inline constexpr const char *QualityLabel(int quality) {
     switch (quality) {
     case 0:

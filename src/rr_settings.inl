@@ -1,6 +1,7 @@
 #pragma once
 #include "rr_settings_model.h"
 #include "rr_lighting_source.h"
+#include "rr_sss_mask.h"
 #include "rr_responsivity.h"
 #include "rr_guide_test.h"
 #include "rr_sky_depth_test.h"
@@ -79,10 +80,13 @@ static void OnRuntime(reshade::api::effect_runtime *) {
         GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
         static bool down[3]{};
         const int keys[] = {VK_F8, VK_F9, VK_F11};
+        const bool ctrl_or_alt = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+                                 (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         bool changed = false;
         for (unsigned i = 0; i < 3; ++i) {
             const bool pressed = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-            if (pressed && !down[i] && foreground == GetCurrentProcessId()) {
+            if (rrsettings::HotkeyToggles(pressed, down[i], ctrl_or_alt,
+                                          foreground == GetCurrentProcessId())) {
                 if (i == 0)
                     requested_rr = !requested_rr;
                 else if (i == 1)
@@ -211,7 +215,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                        "highlights get slightly darker. AO fix keeps raw colour but stops the "
                        "boost from washing out the occlusion value each lighting pixel carries: "
                        "A uses each fresh ray's own value and the game's where no ray landed, B "
-                       "uses the game's everywhere.");
+                       "uses the game's everywhere. SSS pixels options apply native temporal or "
+                       "fill gaps only where the previous frame's Subsurface Scattering guide is "
+                       "nonzero and keep raw lighting everywhere else; they need the SSS guide "
+                       "(F11) and show raw lighting without it.");
+    if (rrlighting::SssMasked(rrlighting::Valid(requested_lobe)))
+        ImGui::Text("SSS pixel mask: %s", rrsssmask::Label(SssMaskState()));
     changed |= ImGui::Checkbox("Responsivity mask on SSS pixels", &requested_responsivity);
     if (ImGui::SliderFloat("Mask strength", &requested_strength, -1.0f, 0.0f, "%.2f"))
         LiveRR().SetResponsivity(requested_responsivity, requested_strength);

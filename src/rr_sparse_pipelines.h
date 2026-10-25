@@ -169,7 +169,10 @@ inline constexpr GUID AlternateId = {
     0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x01}};
 inline constexpr GUID ScaleId = {
     0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x02}};
-inline constexpr std::array<GUID, rrlighting::Count - 1> NativeLobeScaleId = {
+// The native root has no t2 for the SSS guide, so SSS-masked sources get no
+// native-root variant and prepare raw lighting on that path.
+inline constexpr unsigned NativeRootSources = rrlighting::SssNative2 - 1;
+inline constexpr std::array<GUID, NativeRootSources> NativeLobeScaleId = {
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x03}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x04}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x05}},
@@ -178,8 +181,8 @@ inline constexpr std::array<GUID, rrlighting::Count - 1> NativeLobeScaleId = {
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x08}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x09}},
     GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x0a}}};
-// Native-root bytecode per non-raw lighting source, indexed by source - 1.
-inline constexpr std::array<D3D12_SHADER_BYTECODE, rrlighting::Count - 1> NativeLobeScaleCode = {
+// Native-root bytecode per non-raw, unmasked lighting source, indexed by source - 1.
+inline constexpr std::array<D3D12_SHADER_BYTECODE, NativeRootSources> NativeLobeScaleCode = {
     D3D12_SHADER_BYTECODE{RRVrrtScaleNative1, sizeof(RRVrrtScaleNative1)},
     D3D12_SHADER_BYTECODE{RRVrrtScaleNative2, sizeof(RRVrrtScaleNative2)},
     D3D12_SHADER_BYTECODE{RRVrrtScaleFill2, sizeof(RRVrrtScaleFill2)},
@@ -214,7 +217,7 @@ inline std::array<ID3D12PipelineState *, rrlighting::Count - 1>
 MakeNativeLobeScales(reshade::api::device *d, reshade::api::pipeline_layout root,
                      reshade::api::pipeline p) {
     std::array<ID3D12PipelineState *, rrlighting::Count - 1> result{};
-    for (unsigned i = 0; i < result.size(); ++i)
+    for (unsigned i = 0; i < NativeLobeScaleCode.size(); ++i)
         result[i] = MakeScaleVariant(d, root, p, NativeLobeScaleId[i], NativeLobeScaleCode[i]);
     return result;
 }
@@ -299,7 +302,8 @@ inline bool SpatialWriteContract(reshade::api::device *d, uint64_t original, uin
     auto &e = at->second;
     return e.device == d && e.hash == Spatial && e.replacement && e.scale && original == effective;
 }
-// lobe: an rrlighting::Source. A variant that failed creation falls back to raw.
+// lobe: an rrlighting::Source. A variant that failed creation, or an SSS-masked
+// source, which has no native-root variant, falls back to raw.
 inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Scale(reshade::api::device *d,
                                                          uint64_t original, unsigned lobe = 0) {
     std::lock_guard lock(mutex);
