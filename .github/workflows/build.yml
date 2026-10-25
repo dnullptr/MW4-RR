@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - claude/sss-noise-fixes
 
 jobs:
@@ -11,9 +12,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout code with submodules
+      - name: Checkout claude/sss-noise-fixes branch
         uses: actions/checkout@v4
         with:
+          ref: claude/sss-noise-fixes
           submodules: recursive
 
       - name: Setup MSBuild
