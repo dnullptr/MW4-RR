@@ -153,7 +153,10 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         }
         using TestState = rrlive::Controller::TestState;
         const auto hit_test = LiveRR().HitDistanceTest();
-        ImGui::Text("Hit distance tests: %s",
+        // The fill is left out while a guide test replaces the normals it compares.
+        const bool no_fill = fill && rrhitcond::NormalsReplaced(rrguidetest::Valid(
+                                         rrguidetest::mode.load(std::memory_order_relaxed)));
+        ImGui::Text("Hit distance tests: %s%s",
                     !sky_miss && !fill                  ? "off"
                     : !requested_hit                    ? "off (needs Specular hit distance)"
                     : LiveRR().HitDistanceTestFailed()  ? "off: shader setup failed (see log)"
@@ -161,7 +164,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                                           "test to retry)"
                     : hit_test == TestState::Active     ? "active"
                     : !LiveRR().Running()               ? "waiting for RR"
-                                                        : "waiting");
+                                                        : "waiting",
+                    no_fill ? "; fill off while the guide test replaces normals" : "");
         ImGui::TextWrapped("Session-only tests. The game gives RR 0 at sky, where a reflection "
                            "ray missed, and wherever no reflection ray was traced this frame "
                            "(about 60%% of pixels). Sky and misses: RR gets 65504 there, as "

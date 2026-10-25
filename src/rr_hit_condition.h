@@ -1,5 +1,6 @@
 #pragma once
 #include "rr_hit_condition_math.h"
+#include "rr_guide_test.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -19,6 +20,11 @@ inline std::atomic<unsigned> changes{};
 inline unsigned Mode() {
     return (sky_miss.load(std::memory_order_relaxed) ? SkyMiss : 0u) |
            (fill.load(std::memory_order_relaxed) ? FillHoles : 0u);
+}
+// Guide tests that give surfaces the view direction as their normal, which
+// would pass the fill's normal check across creases (rrguidetest::Mode).
+inline bool NormalsReplaced(unsigned guide_test) {
+    return guide_test == rrguidetest::FaceCamera || guide_test == rrguidetest::AllFlat;
 }
 // Why a frame's distance was or was not conditioned at the native temporal pass.
 enum class Outcome : unsigned {

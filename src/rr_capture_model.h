@@ -85,6 +85,9 @@ struct Camera {
 };
 struct Meta {
     unsigned serial{}, sl_frame{}, viewport{}, reset_reasons{};
+    // Specular hit distance tests applied to the sent distance (rrhitcond mode bits:
+    // 1 sky and misses far, 2 fill); 0 when it is the game's raw value.
+    unsigned hit_distance_test{};
     bool delivered{}, reset{}, replaced_sr{};
     std::array<unsigned, 4> stats{}; // Bad frame, copied frame, isolated guide px, sanitized SSS.
     float jitter[2]{}, motion_scale[2]{}, pre_exposure{}, exposure_scale{};
@@ -248,6 +251,7 @@ inline void JsonFrame(std::string &o, unsigned index, const Meta &m,
     JsonBool(f.Key("reset"), m.reset);
     JsonUint(f.Key("reset_reasons"), m.reset_reasons);
     JsonBool(f.Key("replaced_sr"), m.replaced_sr);
+    JsonUint(f.Key("hit_distance_test"), m.hit_distance_test);
     f.Key("stats");
     o += '{';
     JsonFields st(o, ", ");

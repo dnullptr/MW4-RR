@@ -146,8 +146,8 @@ struct ControllerCpuTest {
         assert(c.Reconfigure() && c.budget.limit == Budget::Minimum);
     }
     static void HitDistanceTests() {
-        // The hit distance tests record nothing while off, act once on the single
-        // guide recording of a list, and stop showing active on any skip.
+        // The hit distance tests record nothing while off and act once on the
+        // single guide recording of a list.
         using rrhitcond::Outcome;
         Controller c;
         rrcompute::Snapshot restore;
@@ -159,32 +159,43 @@ struct ControllerCpuTest {
             return c.ConditionSpecularDistance(
                 cl, weights, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, restore, state_of);
         };
-        assert(run(list) == Outcome::Off); // no test on
+        auto pending = [&](Outcome expected) {
+            Outcome why{};
+            return !c.HitDistancePending(list, why) && why == expected;
+        };
+        assert(run(list) == Outcome::Off && pending(Outcome::Off)); // no test on
         rrhitcond::fill = true;
         assert(run(list) == Outcome::Off); // RR off
         c.SetEnabled(true);
         assert(run(list) == Outcome::Off); // hit distance off
         c.SetSpecularHitEnabled(true);
         assert(run(nullptr) == Outcome::Off);
-        assert(run(list) == Outcome::NoSlot);
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot));
         auto &s = c.slots[0], &other = c.slots[1];
         s.generation = other.generation = c.generation;
         s.pre_live = true;
         s.pre.Attach(list);
-        c.hit_scratch.active = true;
-        assert(run(list) == Outcome::NoCopy && !c.hit_scratch.active);
+        Outcome why{};
+        assert(c.HitDistancePending(list, why));
+        assert(run(list) == Outcome::NoCopy);
+        // A guide test that replaces normals leaves the fill out.
+        s.gpu.guide_test = rrguidetest::FaceCamera;
+        assert(run(list) == Outcome::Off);
+        rrhitcond::sky_miss = true;
+        assert(run(list) == Outcome::NoCopy);
+        rrhitcond::sky_miss = false;
+        s.gpu.guide_test = rrguidetest::FlipBackFaces;
+        assert(run(list) == Outcome::NoCopy);
         s.gpu.hit_ready = true;
         s.gpu.specular_hit = weights;
-        c.hit_scratch.active = true;
-        assert(run(list) == Outcome::Weights && !c.hit_scratch.active); // not a 2D texture
+        assert(run(list) == Outcome::Weights); // not a 2D texture
         other.pre_live = true;
         other.pre.Attach(list);
-        assert(run(list) == Outcome::NoSlot); // two guide recordings on one list
+        assert(run(list) == Outcome::NoSlot && pending(Outcome::NoSlot)); // two on one list
         other.pre.Detach();
         other.pre_live = false;
         s.hit_conditioned = true;
-        c.hit_scratch.active = true;
-        assert(run(list) == Outcome::Repeat && c.hit_scratch.active);
+        assert(run(list) == Outcome::Repeat && pending(Outcome::Repeat));
         c.hit_condition_failed = true;
         assert(run(list) == Outcome::Off);
         s.pre.Detach();

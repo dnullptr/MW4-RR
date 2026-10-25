@@ -393,6 +393,7 @@ class Controller {
                     m.stats = v;
                     m.delivered = v[0] == 0 && v[1] != 0;
                     m.replaced_sr = s.replaced_sr;
+                    m.hit_distance_test = s.hit_used && s.hit_conditioned ? s.hit_mode : 0u;
                     try {
                         capture.Complete(std::move(s.captured));
                     } catch (...) {
@@ -839,12 +840,19 @@ class Controller {
         }
     }
 
+    // Whether the hit distance tests would condition cl's guide recording now,
+    // and why not (Off, NoSlot or Repeat), so the caller can skip capturing.
+    bool HitDistancePending(ID3D12GraphicsCommandList *cl, rrhitcond::Outcome &why) {
+        std::lock_guard lock(mutex);
+        return HitSlotLocked(cl, why);
+    }
     // Specular hit distance tests (rrhitcond): conditions this recording's copy of
     // the native distance in place, just before the native temporal pass. Its t5,
     // weights, holds this frame's raw lighting weights, whose lobe-1 bits mark a
     // fresh specular ray. The caller proved that binding and its state and captured
     // restore, the pass's compute state; state_of(resource, state) gives a
     // resource's tracked state on cl. Nothing is recorded unless it conditions.
+    // The fill is left out while a guide test replaces the normals it compares.
     template <class StateOf>
     rrhitcond::Outcome ConditionSpecularDistance(ID3D12GraphicsCommandList *cl,
                                                  ID3D12Resource *weights,
@@ -853,29 +861,20 @@ class Controller {
                                                  StateOf state_of) {
         using rrhitcond::Outcome;
         std::lock_guard lock(mutex);
-        const unsigned mode = rrhitcond::Mode();
-        if (!mode || !enabled || !hit_enabled || failed || retired || hit_condition_failed ||
-            !cl || !weights)
-            return Outcome::Off;
-        Slot *match{};
-        for (auto &s : slots)
-            if (RawSlot(s, cl)) {
-                if (match)
-                    return Outcome::NoSlot;
-                match = &s;
-            }
+        Outcome why{};
+        auto *match = HitSlotLocked(cl, why);
         if (!match)
-            return Outcome::NoSlot;
-        auto &s = *match;
-        if (s.hit_conditioned)
-            return Outcome::Repeat;
-        // The panel shows the tests active only while frames are conditioned.
-        auto skip = [&](Outcome why) {
-            hit_scratch.active = false;
             return why;
-        };
+        auto &s = *match;
+        unsigned mode = rrhitcond::Mode();
+        if (rrhitcond::NormalsReplaced(s.gpu.guide_test))
+            mode &= ~rrhitcond::FillHoles;
+        if (!mode)
+            return Outcome::Off;
         if (!s.gpu.hit_ready || !s.gpu.specular_hit)
-            return skip(Outcome::NoCopy);
+            return Outcome::NoCopy;
+        if (!weights)
+            return Outcome::Weights;
         const auto d = weights->GetDesc();
         if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width != s.gpu.w ||
             d.Height != s.gpu.h || d.DepthOrArraySize != 1 || d.MipLevels != 1 ||
@@ -883,24 +882,26 @@ class Controller {
             (d.Format != DXGI_FORMAT_R32_UINT && d.Format != DXGI_FORMAT_R32_FLOAT) ||
             !rrsparsecopy::Readable(weights_state) ||
             !rrsparsecopy::SameDevice(pipelines.device.Get(), weights))
-            return skip(Outcome::Weights);
+            return Outcome::Weights;
         auto *surface = s.gpu.sources[3].Get();
         D3D12_RESOURCE_STATES surface_state{};
         if (!surface || !state_of(surface, surface_state) ||
             !rrsparsecopy::Readable(surface_state))
-            return skip(Outcome::Surface);
+            return Outcome::Surface;
         if (!restore.valid || !restore.complete || !restore.heap_restore_valid ||
             restore.command != cl)
-            return skip(Outcome::Context);
+            return Outcome::Context;
         try {
             pipelines.HitConditionPipeline();
+        } catch (const rrprivate::AllocationDeferred &) {
+            return Outcome::Memory; // retried on a later frame
         } catch (const std::exception &e) {
             hit_condition_failed = true;
             char line[256];
             snprintf(line, sizeof(line),
                      "Specular hit distance tests off for this session: %s", e.what());
             Log(line);
-            return skip(Outcome::Failed);
+            return Outcome::Failed;
         }
         if (!UseTest(hit_scratch, true, rrhitcond::changes.load(std::memory_order_relaxed),
                      s.gpu.w, s.gpu.h, DXGI_FORMAT_R16_FLOAT, "Specular hit distance tests"))
@@ -1168,6 +1169,27 @@ class Controller {
     }
 #endif
   private:
+    // The one guide recording on cl the hit distance tests have not conditioned
+    // yet, or null with why not.
+    Slot *HitSlotLocked(ID3D12GraphicsCommandList *cl, rrhitcond::Outcome &why) {
+        why = rrhitcond::Outcome::Off;
+        if (!rrhitcond::Mode() || !enabled || !hit_enabled || failed || retired ||
+            hit_condition_failed || !cl)
+            return nullptr;
+        why = rrhitcond::Outcome::NoSlot;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl)) {
+                if (match)
+                    return nullptr;
+                match = &s;
+            }
+        if (match && match->hit_conditioned) {
+            why = rrhitcond::Outcome::Repeat;
+            return nullptr;
+        }
+        return match;
+    }
     bool LightingValid(const Slot &s) const {
 #ifdef RR_FILTER_DIAGNOSTIC
         if (rrfilter::Native(native_filter_effective))
@@ -1673,6 +1695,9 @@ class Controller {
             // radiance/history. Explicit toggles and real frame rejection still Reject.
             s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
                           !o.color_x && !o.color_y;
+            // The panel shows the hit distance tests active only while RR gets the
+            // conditioned copy.
+            hit_scratch.active = s->hit_used && s->hit_conditioned;
 
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);

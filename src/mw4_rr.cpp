@@ -816,12 +816,16 @@ static rrhitcond::Diagnostics &ConditionStats() {
 // whose proven t4/t5 input holds this frame's raw lighting and weights. Its
 // compute state is captured and restored around the private pass, as for the
 // VRRT reader; PackedSurface's state is the one tracked on this recording.
+// Dispatches with nothing to condition skip the capture.
 static void ConditionSpecularDistance(reshade::api::command_list *list,
                                       ID3D12GraphicsCommandList *native, uint64_t effective,
                                       const rrsparsecopy::Pair &input) {
-    if (!rrhitcond::Mode() || !LiveRR().SpecularHitEnabled())
+    if (!rrhitcond::Mode())
         return;
     auto &stats = ConditionStats();
+    rrhitcond::Outcome why{};
+    if (!LiveRR().HitDistancePending(native, why))
+        return stats.Observe(why);
     auto *state = rrbindings::State(list->get_device());
     if (!state || !state->tracker.Healthy())
         return stats.Observe(rrhitcond::Outcome::Context);

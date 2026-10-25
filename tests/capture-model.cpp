@@ -620,6 +620,7 @@ static void ManifestShape() {
     h.responsivity_strength = -0.5f;
     std::vector<Frame<int>> frames{Rich(7), Rich(8)};
     frames[1].meta.cpu_time_ms = 1e8 + 0.125;
+    frames[0].meta.hit_distance_test = 2;
     const std::string m = Manifest(h, frames);
     assert(Balanced(m));
     assert(Contains(m, "\"cpu_time_ms\": 100000000.125")); // Fixed, where %.9g would round.
@@ -668,6 +669,7 @@ static void ManifestShape() {
                                 "\"reset\": false",
                                 "\"reset_reasons\"",
                                 "\"replaced_sr\"",
+                                "\"hit_distance_test\": 2",
                                 "\"stats\"",
                                 "\"bad_frame\": 0",
                                 "\"copied_frame\": 1",
