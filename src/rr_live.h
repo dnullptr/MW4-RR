@@ -490,6 +490,10 @@ class Controller {
                        const std::array<float, 16> &projection) {
         try {
             const bool armed = capture.state == rrcapture::State::Armed;
+            // A frame already past Prepass can still evaluate after RR is turned off or while a
+            // reconfigure is pending; arming then would hold the buffers with nothing to collect.
+            if (armed && (!enabled || NeedsReconfigure()))
+                return false;
             if (!armed) {
                 unsigned in_flight = 0;
                 for (const auto &v : slots)
