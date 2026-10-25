@@ -510,24 +510,26 @@ struct GpuFrame {
         Change(cl, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 8);
+        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 16);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
+    // tolerate: count isolated unusable guide pixels instead of rejecting the frame.
     void Header(UINT serial, bool reset, bool replacement = false, UINT color_x = 0,
-                UINT color_y = 0) {
+                UINT color_y = 0, bool tolerate = false) {
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
-                    color_x, color_y, 0};
+                    color_x, color_y, tolerate ? 1u : 0u};
         memcpy(header_map, c, sizeof(c));
     }
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
     }
-    std::array<UINT, 2> ReadStats() {
-        std::array<UINT, 2> v{};
+    // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
+    std::array<UINT, 4> ReadStats() {
+        std::array<UINT, 4> v{};
         void *m{};
-        D3D12_RANGE r{0, 8};
+        D3D12_RANGE r{0, 16};
         Check(readback->Map(0, &r, &m), "live stats map failed");
-        memcpy(v.data(), m, 8);
+        memcpy(v.data(), m, 16);
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;

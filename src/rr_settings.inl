@@ -7,11 +7,14 @@ static rrsettings::Preferences preferences;
 static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
 static bool &requested_glass = preferences.glass;
+static bool &requested_tolerate = preferences.tolerate_isolated;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::set_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
+    reshade::set_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
+                              requested_tolerate);
 }
 static void ApplyEnabled() {
     config_allowed = VrsConfigAllowsRR();
@@ -19,6 +22,7 @@ static void ApplyEnabled() {
     LiveRR().SetSssEnabled(requested_sss);
     LiveRR().SetTransparencyEnabled(requested_glass);
     AlbedoInspector().observe_transitions = requested_glass;
+    LiveRR().SetTolerateIsolated(requested_tolerate);
 }
 static void LoadSettings() {
     if (settings_loaded)
@@ -28,6 +32,8 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
     reshade::get_config_value(nullptr, SettingsSection, "SSS", requested_sss);
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
+    reshade::get_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
+                              requested_tolerate);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -80,6 +86,12 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
+    ImGui::Separator();
+    ImGui::TextUnformatted("Subsurface Scattering noise experiments");
+    changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
+    ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
+                       "history; they are counted in ReShade.log instead. Off: previous behavior.");
+    ImGui::Separator();
     if (changed) {
         ApplyEnabled();
         SaveToggles();

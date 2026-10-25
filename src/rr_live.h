@@ -1,6 +1,7 @@
 #pragma once
 #include "rr_live_gpu.h"
 #include "rr_live_policy.h"
+#include "rr_guide_health.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
@@ -78,6 +79,8 @@ class Controller {
 #endif
     rreval::Options observed_options;
     HistoryPolicy policy;
+    rrhealth::Tracker health;
+    bool tolerate_isolated = true;
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
@@ -264,8 +267,9 @@ class Controller {
     void PollLocked() {
         for (auto &s : slots) {
             if (s.recorded && s.sealed && !s.reported && Complete(s)) {
-                auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 2>{1, 0};
+                auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
                 s.reported = true;
+                health.Frame(v);
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
                                  s.sss_used && s.sss.admission.accepted,
                                  s.transparency_used && s.transparency_accepted, s.replaced_sr);
@@ -282,6 +286,9 @@ class Controller {
                 s.busy = false;
             }
         }
+        std::string report;
+        if (health.Report(GetTickCount64(), report))
+            Log(report.c_str());
     }
 #include "rr_live_pool.inl"
   public:
@@ -291,6 +298,11 @@ class Controller {
     bool SssEnabled() {
         std::lock_guard lock(mutex);
         return sss_enabled;
+    }
+    // Isolated unusable guide pixels are counted instead of rejecting the frame.
+    void SetTolerateIsolated(bool value) {
+        std::lock_guard lock(mutex);
+        tolerate_isolated = value;
     }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -1031,7 +1043,9 @@ class Controller {
             // radiance/history. Explicit toggles and real frame rejection still Reject.
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
-            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y);
+            if (reset)
+                health.Reset(policy.LastReason());
+            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y, tolerate_isolated);
             rrinternal::Scope copy_guard;
             rrcompute::Tracker::Internal state_guard;
             s->recorded = true;

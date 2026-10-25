@@ -1,13 +1,19 @@
 #include "../src/rr_spatial_fallback.h"
 // Private full-frame presentation gate. Persistent state is initialized once
 // outside replayable game recordings. A replayed reset must never clear it.
-cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Padding;}
+cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;}
 Texture2D<uint> Status:register(t0);
 Texture2D<float4> Reconstructed:register(t1);
 Texture2D<float4> CurrentColor:register(t2);
 RWTexture2D<float4> GameOutput:register(u0);
-RWByteAddressBuffer Stats:register(u1); // bad frame, copied frame
+RWByteAddressBuffer Stats:register(u1); // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
+// Flags bit0: tolerate isolated unusable guide pixels. Each such pixel keeps
+// its empty guides (as sky does) and is counted; the frame is rejected only
+// when they are widespread, which is how a whole-frame layout failure shows.
+static const uint TolerateIsolated=1;
+uint IsolatedLimit(){return max(1u,(RenderW*RenderH)/64);}
+bool Widespread(){return Stats.Load(8)>IsolatedLimit()||Stats.Load(12)>IsolatedLimit();}
 [numthreads(1,1,1)]void BeginFrame(uint3 id:SV_DispatchThreadID){
  uint last=History.Load(4);
  bool fresh=Serial!=0&&Serial>last;
@@ -19,16 +25,21 @@ RWByteAddressBuffer History:register(u2); // blocked history, latest serial
  History.Store(0,blocked);
  // One unconditional write also avoids FXC dropping an initial zero store
  // when later branches conditionally overwrite the same raw buffer address.
- Stats.Store2(0,uint2(bad,0));
+ Stats.Store4(0,uint4(bad,0,0,0));
 }
 [numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){
  if(id.x>=RenderW||id.y>=RenderH)return;
  uint status=Status.Load(int3(id.xy,0));
- if(status<1||status>3){uint old;Stats.InterlockedOr(0,1,old);History.InterlockedOr(0,1,old);}
+ if(status>=1&&status<=3)return;
+ uint old;
+ if(status==4&&(Flags&TolerateIsolated)!=0){Stats.InterlockedAdd(8,1,old);return;}
+ Stats.InterlockedOr(0,1,old);History.InterlockedOr(0,1,old);
 }
 [numthreads(8,8,1)]void Display(uint3 id:SV_DispatchThreadID){
  if(id.x>=OutputW||id.y>=OutputH)return;
- bool rejected=Stats.Load(0)!=0,blocked=History.Load(0)!=0;
+ bool widespread=Widespread();
+ bool rejected=Stats.Load(0)!=0||widespread,blocked=History.Load(0)!=0;
+ if(widespread&&id.x==0&&id.y==0){uint old;History.InterlockedOr(0,1,old);}
  if(rejected||blocked){
   if(!rrspatial::UseFallback(Replacement!=0,rejected,blocked))return;
   rrspatial::Axis x=rrspatial::Coordinate(id.x,RenderW,OutputW);

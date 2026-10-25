@@ -6,6 +6,8 @@ struct Preferences {
     bool sss = true;
     bool glass = true;
     unsigned preset = 6;
+    // SSS noise experiments.
+    bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
 };
 inline constexpr const char *QualityLabel(int quality) {
     switch (quality) {
