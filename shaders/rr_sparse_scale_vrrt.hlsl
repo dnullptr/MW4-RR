@@ -44,47 +44,15 @@ uint PixelCode(uint2 p){
 #if RR_SSS_MASK
 Texture2D<float> sssGuide:register(t2);
 #endif
-// RR_CAP_RATIO caps a raw sample's luminance, before the inverse-probability
-// boost, at that many times the native temporal luminance of its lobe, so a rare
-// bright sample cannot be boosted into a splat the SSS blur spreads. Pixels with
-// no native history for that lobe are left uncapped.
-#ifndef RR_CAP_RATIO
-#define RR_CAP_RATIO 0
-#endif
 float4 UnpackLobe(uint2 packed){
  return float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
 }
-float4 CapSample(float4 v,uint2 native,bool history){
-#if RR_CAP_RATIO
- float3 luma=float3(0.2126,0.7152,0.0722);
- float limit=RR_CAP_RATIO*dot(UnpackLobe(native).rgb,luma),l=dot(v.rgb,luma);
- // NaN or infinite native estimates fail these comparisons and leave v uncapped.
- if(history&&limit>0&&limit<65504&&l>limit){float s=limit/l;v*=float4(s,s,s,s*s);}
-#endif
- return v;
-}
-uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,uint2 native,bool history,out bool valid){
+uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
  float4 v=UnpackLobe(packed);
  valid=sampled&&inverse!=0&&all(v>=0)&&all(v<=65504);
  if(!valid)return 0;
- v=CapSample(v,native,history);
  float f=float(inverse);v=min(v*float4(f,f,f,f*f),65504);
  uint4 h=f32tof16(v);return uint2(h.x|(h.y<<16),h.z|(h.w<<16));
-}
-// RR_W_SOURCE leaves a lobe's colour raw and boosted but replaces its 4th half,
-// which the game appears to use as an occlusion term after this pass, so the
-// boost cannot wash it out: 1 = the fresh unboosted value where a ray landed and
-// native temporal elsewhere, 2 = native temporal everywhere.
-#ifndef RR_W_SOURCE
-#define RR_W_SOURCE 0
-#endif
-uint2 KeepW(uint2 scaled,uint2 raw,bool fresh,uint2 native){
-#if RR_W_SOURCE
- uint w=RR_W_SOURCE==1&&fresh?raw.y>>16:native.y>>16;
- return uint2(scaled.x,(scaled.y&65535)|(w<<16));
-#else
- return scaled;
-#endif
 }
 uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if RR_NATIVE_FILL
@@ -113,23 +81,14 @@ uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
 #if !RR_FILL_SPATIAL&&RR_FILL_HISTORY
 #error RR_FILL_HISTORY needs RR_FILL_SPATIAL
 #endif
-// RR_FILL_DEBUG (test view): as RR_FILL_SPATIAL, but each SSS pixel shows which source lobe 2
-// took, in lobe 2's colour with lobe 1 black: blue = fresh ray, green = native history,
-// yellow = spatial mean, red = spatial mean with no fresh sample within reach (0).
-#ifndef RR_FILL_DEBUG
-#define RR_FILL_DEBUG 0
-#endif
-#if RR_FILL_DEBUG&&!RR_FILL_SPATIAL
-#error RR_FILL_DEBUG needs RR_FILL_SPATIAL
-#endif
 // RR_FILL_PREFER_NATIVE (as RR_FILL_SPATIAL): a pixel whose native lobe-2 field is at least
 // RR_FILL_HISTORY takes native temporal even where a fresh ray landed, so a settled pixel never
 // shows a single noisy sample; fresh unboosted samples are used only where there is no history.
 #ifndef RR_FILL_PREFER_NATIVE
 #define RR_FILL_PREFER_NATIVE 0
 #endif
-#if RR_FILL_PREFER_NATIVE&&(!RR_FILL_SPATIAL||RR_FILL_DEBUG)
-#error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL and not RR_FILL_DEBUG
+#if RR_FILL_PREFER_NATIVE&&!RR_FILL_SPATIAL
+#error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL
 #endif
 #if RR_FILL_SPATIAL
 groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
@@ -188,9 +147,8 @@ void main(uint3 id:SV_DispatchThreadID){
  uint4 nc=nativeLighting.Load(int3(p,0));uint nw=nativeWeights.Load(int3(p,0));
 #endif
  bool a,b;
- uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,nc.xy,(nw>>20)!=0,a);
- uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,nc.zw,((nw>>8)&4095)!=0,b);
- ca=KeepW(ca,c.xy,a,nc.xy);cb=KeepW(cb,c.zw,b,nc.zw);
+ uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,a);
+ uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,b);
  uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
 #if RR_SSS_MASK
  uint2 rawA=ca,rawB=cb;uint rawWeights=outWeights;
@@ -208,12 +166,6 @@ void main(uint3 id:SV_DispatchThreadID){
 #if RR_FILL_PREFER_NATIVE
  if(fb&&((nw>>8)&4095)>=RR_FILL_HISTORY){
   cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);}
-#endif
-#if RR_FILL_DEBUG
- {const float3 shade=fb?float3(0,0,1):((nw>>8)&4095)>=RR_FILL_HISTORY?float3(0,1,0):
-                     found!=0?float3(1,1,0):float3(1,0,0);
-  const uint3 hv=f32tof16(shade);
-  cb=uint2(hv.x|(hv.y<<16),hv.z|(cb.y&0xffff0000u));ca=uint2(0,ca.y&0xffff0000u);}
 #endif
 #endif
 #endif

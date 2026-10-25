@@ -1,102 +1,26 @@
 #pragma once
 #include <d3d12.h>
 #include <array>
-#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 namespace rrsr {
 struct StateProof {
     std::array<bool, 4> known{};
     std::array<D3D12_RESOURCE_STATES, 4> states{};
     std::array<uintptr_t, 4> resources{};
-    std::array<bool, 4> aliased{}; // Known, but past an aliasing barrier (only Describe reads it).
 };
-// Whether SR resource i (color, depth, motion, output) is in a state replacement takes.
-inline bool Accepts(unsigned i, D3D12_RESOURCE_STATES s) {
+inline bool Eligible(const StateProof &p) {
     constexpr auto reads =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    if (i == 3)
-        return s == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    return (s & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) && !(s & ~reads);
-}
-inline bool Eligible(const StateProof &p) {
     for (unsigned i = 0; i < 4; ++i) {
         if (!p.known[i] || !p.resources[i])
             return false;
         for (unsigned j = 0; j < i; ++j)
             if (p.resources[i] == p.resources[j])
                 return false;
-        if (!Accepts(i, p.states[i]))
+        if (i < 3 && (!(p.states[i] & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+                      (p.states[i] & ~reads)))
             return false;
     }
-    return true;
-}
-// One clause per SR resource, in Eligible's order of checks, e.g. "color 0x80 (wants NPSR, reads
-// only), depth unknown, motion same as color, output 0x8 ok". Truncated to fit size.
-inline void Describe(const StateProof &p, char *out, size_t size) {
-    static constexpr const char *names[4] = {"color", "depth", "motion", "output"};
-    if (!out || !size)
-        return;
-    out[0] = '\0';
-    size_t used = 0;
-    for (unsigned i = 0; i < 4 && used < size; ++i) {
-        unsigned same = i;
-        for (unsigned j = i; j-- > 0;)
-            if (p.resources[j] == p.resources[i])
-                same = j;
-        char text[64];
-        if (!p.resources[i])
-            std::snprintf(text, sizeof(text), "missing");
-        else if (!p.known[i])
-            std::snprintf(text, sizeof(text), "unknown");
-        else if (same != i)
-            std::snprintf(text, sizeof(text), "same as %s", names[same]);
-        else
-            std::snprintf(text, sizeof(text), "%s0x%x %s", p.aliased[i] ? "aliased " : "",
-                          unsigned(p.states[i]),
-                          Accepts(i, p.states[i]) ? "ok"
-                          : i < 3                 ? "(wants NPSR, reads only)"
-                                                  : "(wants UAV)");
-        const int n =
-            std::snprintf(out + used, size - used, "%s%s %s", i ? ", " : "", names[i], text);
-        if (n < 0)
-            return;
-        used += size_t(n);
-    }
-}
-// Why an SR evaluate kept native SR, for the capture log. rrtrace::Probe notes the reasons up to
-// Declined (replacement ran and gave none); TryReplaceSR notes the rest. Ineligible comes with
-// Describe's reason when a capture kept the proof.
-enum Skip : unsigned {
-    NotCalled,
-    Callback,
-    Creation,
-    ResetFixed,
-    Threw,
-    Declined,
-    Off,
-    Failed,
-    Reconfigure,
-    Unsafe,
-    Scope,
-    List,
-    Ineligible,
-    SkipCount
-};
-inline constexpr const char *skip_texts[SkipCount] = {"not called",
-                                                      "progress callback",
-                                                      "creation not seen",
-                                                      "reset parameter not writable",
-                                                      "error",
-                                                      "declined",
-                                                      "RR off",
-                                                      "RR failed or retired",
-                                                      "reconfigure pending",
-                                                      "unsafe list",
-                                                      "no matching SR call",
-                                                      "other command list",
-                                                      "not eligible"};
-inline const char *SkipText(unsigned why) {
-    return why < SkipCount ? skip_texts[why] : "unknown";
+    return p.states[3] == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
 } // namespace rrsr

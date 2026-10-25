@@ -257,99 +257,18 @@ class Pool {
         cl->ResourceBarrier(2, after.data());
     }
     static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe) {
-        using rrlighting::Source;
-        switch (rrlighting::Valid(lobe)) {
-        case Source::NativeLobe1:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1Float,
-                                                        sizeof(RRVrrtScaleNative1Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleNative1,
-                                                        sizeof(RRVrrtScaleNative1)};
-        case Source::NativeLobe2:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2Float,
-                                                        sizeof(RRVrrtScaleNative2Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleNative2,
-                                                        sizeof(RRVrrtScaleNative2)};
-        case Source::FillLobe2:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFill2Float, sizeof(RRVrrtScaleFill2Float)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScaleFill2, sizeof(RRVrrtScaleFill2)};
-        case Source::FillBoth:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFill3Float, sizeof(RRVrrtScaleFill3Float)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScaleFill3, sizeof(RRVrrtScaleFill3)};
-        case Source::CapGentle:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleCap8Float, sizeof(RRVrrtScaleCap8Float)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScaleCap8, sizeof(RRVrrtScaleCap8)};
-        case Source::CapStrong:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleCap4Float, sizeof(RRVrrtScaleCap4Float)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScaleCap4, sizeof(RRVrrtScaleCap4)};
-        case Source::WFill:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleWFillFloat, sizeof(RRVrrtScaleWFillFloat)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScaleWFill, sizeof(RRVrrtScaleWFill)};
-        case Source::WNative:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleWNativeFloat,
-                                                        sizeof(RRVrrtScaleWNativeFloat)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleWNative,
-                                                        sizeof(RRVrrtScaleWNative)};
-        case Source::SssNative2:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssNative2Float,
-                                                        sizeof(RRVrrtScaleSssNative2Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssNative2,
-                                                        sizeof(RRVrrtScaleSssNative2)};
-        case Source::SssFill2:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Float,
-                                                        sizeof(RRVrrtScaleSssFill2Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2,
-                                                        sizeof(RRVrrtScaleSssFill2)};
-        case Source::SssNative3:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssNative3Float,
-                                                        sizeof(RRVrrtScaleSssNative3Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssNative3,
-                                                        sizeof(RRVrrtScaleSssNative3)};
-        case Source::SssFill3:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill3Float,
-                                                        sizeof(RRVrrtScaleSssFill3Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill3,
-                                                        sizeof(RRVrrtScaleSssFill3)};
-        case Source::SssFill2Spatial:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SpatialFloat,
-                                                        sizeof(RRVrrtScaleSssFill2SpatialFloat)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Spatial,
-                                                        sizeof(RRVrrtScaleSssFill2Spatial)};
-        case Source::SssSpatial2:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2Float,
-                                                        sizeof(RRVrrtScaleSssSpatial2Float)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssSpatial2,
-                                                        sizeof(RRVrrtScaleSssSpatial2)};
-        case Source::SssFill2Settled:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2SettledFloat,
-                                                        sizeof(RRVrrtScaleSssFill2SettledFloat)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFill2Settled,
-                                                        sizeof(RRVrrtScaleSssFill2Settled)};
-        case Source::SssHistory2:
+        if (lobe == rrlighting::SssHistory2)
             return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Float,
                                                         sizeof(RRVrrtScaleSssHistory2Float)}
                                 : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2,
                                                         sizeof(RRVrrtScaleSssHistory2)};
-        case Source::SssFillDebug:
-            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssFillDebugFloat,
-                                                        sizeof(RRVrrtScaleSssFillDebugFloat)}
-                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssFillDebug,
-                                                        sizeof(RRVrrtScaleSssFillDebug)};
-        default:
-            return packed_float
-                       ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
-                       : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
-        }
+        return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
+                            : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
     }
     // mask: a proven SSS guide for an SSS-masked lobe; without one it prepares raw.
     static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output,
                                     unsigned lobe = 0, ID3D12Resource *mask = nullptr) {
-        lobe = rrlighting::Valid(lobe);
-        if (rrlighting::SssMasked(lobe) && !mask)
+        if (lobe >= rrlighting::Count || (rrlighting::SssMasked(lobe) && !mask))
             lobe = 0;
         // The mask root is the same layout plus parameter 4, a t2 table.
         auto makeRoot = [&](bool masked, ComPtr<ID3D12RootSignature> &result) {

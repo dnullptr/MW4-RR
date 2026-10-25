@@ -11,22 +11,12 @@ and the full path to the pinned DXC DLL to `build/tests/runtime-shader.exe`.
 This also checks concurrent cache reuse, altered-input rejection, and compiler
 failure handling. These private fixture files are not distributed.
 
-The vrrt-apply-shader test always checks the ray selection edits on a
-synthetic listing. It runs the instructions each edit adds, so it checks the
-draw each lobe gets at every reachable ray rate on the 8-bit noise, the
-128-pixel tile offsets, the overlay and capture bookkeeping, and rejection of
-unsupported input. For an optional CPU-only check on the game's own bytes,
-pass the full path to the pinned DXC DLL and one or more native cs_vrrt_apply
-shaders to `build/tests/vrrt-apply-shader.exe`. Every variant must assemble,
-validate and round-trip; the test prints each one's size and SHA-256, or why
-it was refused (a missing line, the compiler's first error, or the first
-differing line of a round trip).
-
 Coverage includes default settings, variable resource extents, configuration
 validation, preset selection and retirement, unfinished command recordings,
 fence completion, exactly-once hook forwarding, private transition lock
 ordering, native Super Resolution replacement and history recovery, and
-spatial fallback coordinates. The private-transition test includes an optional
+spatial fallback coordinates, weapon depth, the water responsivity mask and the
+transparency albedo blend. The private-transition test includes an optional
 `RR_RELEASE_NEGATIVE_CONTROL` compile definition that deliberately bypasses
 the internal-call guard and is expected to fail. Never use that definition
 for an addon build.

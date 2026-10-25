@@ -21,7 +21,6 @@ static bool PreserveNativeSampling(reshade::api::command_list *list, UINT x, UIN
     const auto binding = ShaderDispatches().Get(list->get_native());
     if (binding.shader != rrbypass::Vrrt)
         return false;
-    RayApplyReporter unproven(list); // every return below reports this apply unproven (A3)
     auto *device = list->get_device();
     auto *state = rrbindings::State(device);
     if (!state || !state->tracker.Healthy())
@@ -111,7 +110,5 @@ static bool PreserveNativeSampling(reshade::api::command_list *list, UINT x, UIN
     }
     if (!LiveRR().NativeSampling(native.Get(), input, restore))
         return false;
-    unproven.Done();
-    ObserveVrrtApply(list, device, state, native.Get(), restore, input, x, y);
     return true;
 }

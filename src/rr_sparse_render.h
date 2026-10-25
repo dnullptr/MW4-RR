@@ -100,13 +100,6 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                            "RR current/native-history bindings or layouts unproven; RR blocked");
             return false;
         }
-        ConditionSpecularDistance(list, native.Get(), effective, input);
-#ifdef RR_FILTER_DIAGNOSTIC
-        if (LiveRR().NativeFiltering()) {
-            LiveRR().NativeTemporalObserved(native.Get(), output);
-            return false; // Preserve native accumulation; no snapshot or replacement.
-        }
-#endif
         rrinternal::Scope ignoreCopies;
         rrcompute::Tracker::Internal ignoreState;
         if (!SparsePool().Snapshot(native.Get(), input, output))
@@ -118,83 +111,22 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         rrbypass::Fail(device, "RR spatial input proof failed; RR blocked");
         return false;
     }
-#ifdef RR_FILTER_DIAGNOSTIC
-    // The first spatial pass is still replaced by current-frame preparation.
-    // In this diagnostic only the later passes run native, with exact linkage
-    // to that prepared output. No temporal history resource is overwritten.
-    if (LiveRR().SpatialOnlyFiltering() && LiveRR().RawWasCorrected(native.Get())) {
-        bool valid = SparsePair(list, native.Get(), effective, true, 0, output, true);
-        if (valid) {
-            std::array<rrfilter::Surface,2> source{}, destination{};
-            for (unsigned i = 0; i < 2; ++i) {
-                source[i] = {UINT64(input.r[i].Get()), input.r[i]->GetDesc(), input.state[i]};
-                destination[i] = {UINT64(output.r[i].Get()), output.r[i]->GetDesc(), output.state[i]};
-            }
-            valid = rrfilter::SpatialPassValid(source, destination, x, y, z, false);
-        }
-        LiveRR().ObserveSpatialOnly(native.Get(), input, output, valid);
-        return false; // Execute native filtering; never bind raw passthrough here.
-    }
-    const bool native_filter = LiveRR().NativeFiltering();
-    const bool native_first = native_filter && LiveRR().NativeSpatialCandidate(native.Get(), input);
-    const std::array<UINT64,2> input_ids{UINT64(input.r[0].Get()), UINT64(input.r[1].Get())};
-    const bool temporal_bypass = native_filter && LiveRR().NativeSpatialBypass(native.Get(), input_ids);
-    if (native_filter ? !(native_first || temporal_bypass)
-                      : !SparsePool().Pending(native.Get(), input)) {
-        if (native_filter) LiveRR().RejectNativeSpatial(native.Get());
-        return false;
-    }
-#else
     if (!SparsePool().Pending(native.Get(), input))
         return false;
-#endif
     if (!SparsePair(list, native.Get(), effective, true, 0, output, true)) {
         rrbypass::Fail(device, "RR first spatial output proof failed; RR blocked");
         return false;
     }
-#ifdef RR_FILTER_DIAGNOSTIC
-    if (native_filter) {
-        // The wrapper restored the native pipeline. Temporal + spatial leaves it
-        // intact; temporal-only uses the existing packed-lighting passthrough.
-        // Check EVERY bypassed spatial dispatch, including subsequent passes.
-        std::array<rrfilter::Surface,2> source{}, destination{};
-        for (unsigned i = 0; i < 2; ++i) {
-            source[i] = {UINT64(input.r[i].Get()), input.r[i]->GetDesc(), input.state[i]};
-            destination[i] = {UINT64(output.r[i].Get()), output.r[i]->GetDesc(), output.state[i]};
-        }
-        const bool temporal_only = LiveRR().NativeFilterStatus().effective == rrfilter::Mode::TemporalOnly;
-        if (!rrfilter::SpatialPassValid(source, destination, x, y, z, temporal_only)) {
-            rrbypass::Fail(device, "Diagnostic spatial format/state/extent/alias unproven; RR blocked");
-            return false;
-        }
-        const auto health = rrbypass::Health(device);
-        if (native_first)
-            LiveRR().NativeSpatialObserved(native.Get(), input, UINT64(device), health.revision);
-        if (LiveRR().NativeSpatialBypass(native.Get(), input_ids)) {
-            auto selected = rrbypass::Bind(list, reshade::api::pipeline_stage::all_compute,
-                                          {binding.pipeline});
-            if (!selected.handle || selected.handle == binding.pipeline) {
-                rrbypass::Fail(device, "Diagnostic spatial passthrough unavailable; RR blocked");
-            } else if (!LiveRR().AdvanceNativeSpatial(native.Get(), input, output)) {
-                // Binding alone is not a valid temporal-only comparison.
-                native->SetPipelineState((ID3D12PipelineState *)binding.pipeline);
-                rrbypass::Fail(device, "Diagnostic spatial chain changed; RR blocked");
-            }
-        }
-        return false; // Dispatch the selected native or passthrough pipeline normally.
-    }
-#endif
-    // One read per dispatch keeps the native-root and private paths on the same lobe source.
-    const unsigned lobe = rrbypass::lobe_source.load(std::memory_order_relaxed);
-    auto scale = rrbypass::Scale(device, binding.pipeline, lobe);
+    // SSS pixels take lobe 2 history first + spatial; the native-root path prepares raw.
+    constexpr unsigned lobe = rrlighting::SssHistory2;
+    auto scale = rrbypass::Scale(device, binding.pipeline);
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;
     const auto rates = LiveRR().SamplingData(native.Get());
     // SSS-masked sources read an earlier frame's SSS guide, which only the private
     // root binds; without the guide or that path they prepare raw lighting.
-    const bool sss_masked = rrlighting::SssMasked(lobe);
     unsigned mask_age{};
-    const auto mask = sss_masked ? LiveRR().SssMask(native.Get(), &mask_age) : nullptr;
+    const auto mask = LiveRR().SssMask(native.Get(), &mask_age);
     const auto cbvs = ComputeState().RateCBVs(
         native.Get(), (ID3D12PipelineState *)effective,
         (ID3D12RootSignature *)rrbindings::State(device)->tracker.CurrentLayout(
@@ -226,7 +158,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                       (ID3D12PipelineState *)effective, x, y, z, &rates,
                                       cbvs.valid ? &cbvs : nullptr,
                                       cbvs.valid ? nullptr : &privateRestore, lobe);
-    if (sss_masked && replaced) {
+    if (replaced && LiveRR().SssEnabled()) {
         char why[64]{};
         if (masked)
             snprintf(why, sizeof(why), "guide %u frame(s) old", mask_age);
@@ -242,11 +174,6 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                                       : "masked preparation rejected (guide, format or shader)");
     }
     if (replaced) {
-        // What this frame's lighting was prepared with, for a capture (one relaxed load if none).
-        LiveRR().NoteLighting(native.Get(), lobe, sss_masked ? int(masked) : -1);
-#ifdef RR_FILTER_DIAGNOSTIC
-        LiveRR().SeedSpatialOnly(native.Get(), output);
-#endif
         rrbypass::Corrected(device);
     }
     else

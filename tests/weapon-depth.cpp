@@ -32,8 +32,8 @@ static void GameProjection() {
     using namespace rrweapondepth;
     const Matrix game = Infinite(1);
     Mapping m;
-    assert(Map(game, game, 0, m));
-    assert(m.scale == 1 && m.offset == 0 && m.sky == rrskydepth::FarScale);
+    assert(Map(game, m));
+    assert(m.scale == 1 && m.offset == 0 && m.sky == FarScale);
     // World depth is exactly near / depth, what RR's projection says.
     for (float d : {Slice, 0.5f, 0.1f, 1e-3f, 1e-5f, 2e-6f})
         assert(Linear(d, m) == 1 / d);
@@ -58,55 +58,19 @@ static void GameProjection() {
     // Other near planes scale every depth.
     const Matrix close = Infinite(0.1f);
     Mapping c;
-    assert(Map(close, close, 0, c) && c.scale == 0.1f && c.offset == 0);
+    assert(Map(close, c) && c.scale == 0.1f && c.offset == 0);
     assert(Near(Linear(0.5f, c), 0.2, 1e-6) && Near(Linear(1, c), 0.1 / 2049, 1e-6));
     // Column-vector projections are the transpose (jitter moves to m2 and m6).
     Matrix column{};
     for (unsigned row = 0; row < 4; ++row)
         for (unsigned col = 0; col < 4; ++col)
             column[col * 4 + row] = close[row * 4 + col];
-    assert(rrskydepth::Detect(column) == rrskydepth::Layout::ColumnVector);
-    assert(Map(column, column, 0, c) && c.scale == 0.1f && c.offset == 0);
-    assert(Linear(0.5f, c) == Linear(0.5f, Mapping{0.1f, 0, 0.1f * rrskydepth::FarScale}));
-    Matrix column_sky = column;
-    assert(rrskydepth::Apply(column_sky) && Map(column, column_sky, 0, c));
-    assert(Near(c.sky, 0.1 * rrskydepth::FarScale, 1e-5) && Near(c.scale / (1 + c.offset), 0.1, 1e-6));
+    assert(Detect(column) == Layout::ColumnVector);
+    assert(Map(column, c) && c.scale == 0.1f && c.offset == 0);
+    assert(Linear(0.5f, c) == Linear(0.5f, Mapping{0.1f, 0, 0.1f * FarScale}));
     Matrix column_jitter = column;
     column_jitter[8] = 0.01f; // A planar term in the column layout: refused.
-    assert(!Map(column_jitter, column_jitter, 0, c));
-}
-
-static void SkyDepthTest() {
-    // The sky depth test gives RR a finite far plane; linear depth follows that projection
-    // (what RR computes from the game's depth with it), and sky is the far plane.
-    using namespace rrweapondepth;
-    const Matrix game = Infinite(1);
-    Matrix passed = game;
-    assert(rrskydepth::Apply(passed));
-    Mapping m;
-    assert(Map(game, passed, 0, m));
-    assert(Near(m.sky, rrskydepth::FarScale, 1e-5));
-    for (float d : {Slice, 0.5f, 0.01f, 1e-4f, 1e-6f}) {
-        const double z = double(passed[14]) / (double(d) - double(passed[10]));
-        assert(Near(Linear(d, m), z, 1e-6));
-    }
-    assert(Linear(0, m) == m.sky);
-    // The weapon is still in front of the near plane.
-    assert(Near(m.scale / (1 + m.offset), 1, 1e-6) && Linear(Weapon(1e-5f), m) < 1);
-}
-
-static void SkySurfaceGuideTest() {
-    // The sky guide test lifts sky depth to its floor; sky is then that depth's distance.
-    using namespace rrweapondepth;
-    const Matrix game = Infinite(1);
-    Mapping m;
-    assert(Map(game, game, 1e-7f, m));
-    assert(Near(m.sky, 1e7, 1e-6) && Linear(0, m) == m.sky && Linear(5e-8f, m) == m.sky);
-    assert(Linear(0.5f, m) == 2);
-    Matrix passed = game;
-    rrskydepth::Apply(passed);
-    assert(Map(game, passed, 1e-7f, m));
-    assert(Near(m.sky, double(passed[14]) / (1e-7 - double(passed[10])), 1e-6));
+    assert(!Map(column_jitter, c));
 }
 
 static void Unsupported() {
@@ -114,26 +78,17 @@ static void Unsupported() {
     Mapping m;
     const Matrix game = Infinite(1);
     Matrix finite = game;
-    rrskydepth::Apply(finite);
-    assert(!Map(finite, finite, 0, m)); // The game's own projection must be infinite.
+    finite[10] = -0.001f;
+    assert(!Map(finite, m)); // The game's own projection must be infinite.
     Matrix ortho = game;
     ortho[15] = 1;
-    assert(!Map(ortho, ortho, 0, m));
+    assert(!Map(ortho, m));
     Matrix oblique = game;
     oblique[2] = 0.01f; // Depth that varies across the screen is not near / z.
-    assert(!Map(oblique, oblique, 0, m));
+    assert(!Map(oblique, m));
     Matrix skewed = game;
     skewed[7] = 0.01f;
-    assert(!Map(skewed, skewed, 0, m));
-    Matrix other = game;
-    other[0] = 0.5f; // RR must be given the game's projection apart from depth.
-    assert(!Map(game, other, 0, m));
-    assert(!Map(game, game, -1e-7f, m));
-    assert(!Map(game, game, std::numeric_limits<float>::infinity(), m));
-    assert(!Map(game, game, std::numeric_limits<float>::quiet_NaN(), m));
-    Matrix negative = game;
-    negative[10] = 0.5f; // Depth offset below zero: not a projection RR could be given.
-    assert(!Map(game, negative, 0, m));
+    assert(!Map(skewed, m));
 }
 
 static void Choice() {
@@ -182,73 +137,6 @@ static void Choice() {
     }
 }
 
-static bool Close(float a, float b, double absolute) {
-    return std::abs(double(a) - double(b)) <= absolute;
-}
-
-static void Inverse() {
-    // Hardware undoes Linear, so a capture's linear depth reads as the game's depth again.
-    using namespace rrweapondepth;
-    const Matrix game = Infinite(1);
-    Mapping m;
-    assert(Map(game, game, 0, m));
-    for (float d : {Slice, 0.75f, 0.5f, 0.1f, 1e-3f, 1e-5f, 2e-6f})
-        assert(Near(Hardware(Linear(d, m), m, 0), d, 1e-6));
-    // The weapon stays the weapon, at its own depth.
-    for (float t : {1e-5f, 1e-4f, 0.001f, 0.004f, 0.01f, 0.03f, 0.25f, 0.5f, 1.0f}) {
-        const float d = Weapon(t), back = Hardware(Linear(d, m), m, 0);
-        assert(back > Slice && Close(back, d, 3e-7));
-    }
-    assert(Hardware(Linear(1, m), m, 0) == 1);
-    // A weapon depth on the near plane or between it and the nearest world depth is the
-    // slice's back; nearer than the weapon's front is its front.
-    const float near_plane = m.scale / (1 + m.offset);
-    assert(Hardware(near_plane, m, 0) == Slice);
-    assert(Hardware(std::nextafter(Linear(Slice, m), 0.0f), m, 0) == Slice);
-    assert(Hardware(near_plane / 4096, m, 0) == 1);
-    // Sky, and what was clamped to it, is the sky's depth; nothing is NaN.
-    assert(Hardware(Linear(0, m), m, 0) == 0 && Hardware(Linear(1e-7f, m), m, 0) == 0);
-    // Depth Linear never gives stays as it is.
-    const float inf = std::numeric_limits<float>::infinity();
-    assert(Hardware(inf, m, 0) == inf && Hardware(-inf, m, 0) == -inf);
-    assert(std::isnan(Hardware(std::numeric_limits<float>::quiet_NaN(), m, 0)));
-    assert(Hardware(0, m, 0) == 0 && Hardware(-1, m, 0) == -1);
-    // World depth never comes back as the weapon, whatever the near plane.
-    for (float near_plane = 1e-3f; near_plane < 100; near_plane *= 1.37f) {
-        const Matrix p = Infinite(near_plane);
-        Matrix sky_test = p;
-        Mapping w;
-        assert(Map(p, p, 0, w) && Hardware(Linear(Slice, w), w, 0) <= Slice);
-        assert(rrskydepth::Apply(sky_test) && Map(p, sky_test, 0, w));
-        assert(Hardware(Linear(Slice, w), w, 0) <= Slice);
-    }
-    // Other near planes and the column layout.
-    const Matrix close = Infinite(0.1f);
-    Matrix column{};
-    for (unsigned row = 0; row < 4; ++row)
-        for (unsigned col = 0; col < 4; ++col)
-            column[col * 4 + row] = close[row * 4 + col];
-    for (const Matrix &p : {close, column}) {
-        Mapping c;
-        assert(Map(p, p, 0, c));
-        assert(Near(Hardware(Linear(0.5f, c), c, 0), 0.5, 1e-6));
-        assert(Close(Hardware(Linear(Weapon(0.01f), c), c, 0), Weapon(0.01f), 3e-7));
-    }
-    // The sky depth test's finite far plane: nothing is farther than sky, so all world depth
-    // comes back.
-    Matrix passed = game;
-    assert(rrskydepth::Apply(passed) && Map(game, passed, 0, m) && m.offset > 0);
-    for (float d : {Slice, 0.5f, 0.01f, 1e-4f, 1e-6f, 1e-7f})
-        assert(Near(Hardware(Linear(d, m), m, 0), d, 1e-5));
-    assert(Close(Hardware(Linear(Weapon(0.01f), m), m, 0), Weapon(0.01f), 3e-7));
-    assert(Hardware(Linear(0, m), m, 0) == 0);
-    // The sky guide test: sky is the floor's depth.
-    const float floor = 1e-7f;
-    assert(Map(game, game, floor, m));
-    assert(Hardware(Linear(0, m), m, floor) == floor);
-    assert(Near(Hardware(Linear(0.5f, m), m, floor), 0.5, 1e-6));
-}
-
 static void Creation() {
     // RR is told the depth type at creation; linear depth is not inverted, so the game's
     // flag is cleared and every other flag kept.
@@ -294,11 +182,8 @@ int main() {
     // Off until the settings are applied (rr_settings.inl ApplyEnabled).
     assert(!rrweapondepth::enabled && !rrweapondepth::changes);
     GameProjection();
-    SkyDepthTest();
-    SkySurfaceGuideTest();
     Unsupported();
     Choice();
-    Inverse();
     Creation();
     std::puts("weapon depth tests passed");
 }

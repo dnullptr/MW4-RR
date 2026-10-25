@@ -2,16 +2,14 @@
 #include "../src/rr_gate_stats.h"
 // Private full-frame presentation gate. Persistent state is initialized once
 // outside replayable game recordings. A replayed reset must never clear it.
-cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength,OutputScale;uint2 Unused;uint4 ZeroTail[12];float ContrastKnee;uint3 Reserved2;}
+cbuffer Control:register(b0){uint RenderW,RenderH,OutputW,OutputH;uint Serial,ResetHistory,Accepted,Reserved;uint Replacement,ColorX,ColorY,Flags;float ResponsivityStrength;uint3 Unused;}
 Texture2D<uint> Status:register(t0);
 Texture2D<float4> Reconstructed:register(t1);
 Texture2D<float4> CurrentColor:register(t2);
 RWTexture2D<float4> GameOutput:register(u0);
 // Stats bytes: 0 bad frame, 4 copied frame, 8 isolated guide pixels, 12 sanitized SSS samples,
-// 16 water pixels (rr_water_masks.hlsl), 20..63 hit distance statistics (rr_hit_condition.hlsl),
-// 64..255 ray density (rr_vrrt_probability.hlsl), then rr_gate_stats.h: 256 non-finite color
-// pixels RR receives, 260 non-finite pixels of the RR output Display shows (none on a frame
-// it rejects or blocks), 264..283 water prepass flags (rr_water_masks.hlsl). The buffer is
+// then rr_gate_stats.h: 256 non-finite color pixels RR receives, 260 non-finite pixels of the
+// RR output Display shows (none on a frame it rejects or blocks). The buffer is
 // rrgatestats::StatsBytes (512) long.
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2); // blocked history, latest serial
@@ -35,8 +33,7 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  // One unconditional write also avoids FXC dropping an initial zero store
  // when later branches conditionally overwrite the same raw buffer address.
  Stats.Store4(0,uint4(bad,0,0,0));
- // Not 16..255: the water, hit distance and density passes zero those. Nothing else zeroes
- // the non-finite counts, which follow the density words.
+ // Nothing else zeroes the non-finite counts.
  Stats.Store2(RR_STATS_NON_FINITE_COLOR,uint2(0,0));
 }
 [numthreads(8,8,1)]void Validate(uint3 id:SV_DispatchThreadID){
@@ -68,13 +65,6 @@ bool Finite3(float3 c){return all((asuint(c)&0x7f800000u)!=0x7f800000u);}
  }
  float3 color=Reconstructed.Load(int3(id.xy,0)).rgb;
  if(!Finite3(color)){uint old;Stats.InterlockedAdd(RR_STATS_NON_FINITE_OUTPUT,1,old);}
- // Contrast test (rr_contrast_test.h ExpandFactor, SeriesLimit 0.01, MaxExponent 18): undo
- // the compression of RR's input, before the color scale test's factor. 0 = off.
- float t=max(max(color.r,color.g),color.b);
- if(ContrastKnee>0&&t>0){float e=min(t/ContrastKnee,18.0);color*=e<0.01?1+e*(0.5+e/6):(exp(e)-1)/e;}
- // Color scale test (rr_color_scale.h): undo the scale on RR's input. 0 = off.
- if(OutputScale>0)color*=OutputScale;
- if(ContrastKnee>0)color=min(color,65504.0);
  GameOutput[id.xy]=float4(color,1);
  if(id.x==0&&id.y==0)Stats.Store(4,1);
 }

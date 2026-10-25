@@ -2,7 +2,6 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include "rr_sky_depth_test.h"
 namespace rrweapondepth {
 // Weapon depth (a saved setting, rrsettings::Preferences::weapon_depth): real depth on the
 // first-person weapon. The game draws the weapon and arms with their own camera into the
@@ -29,33 +28,39 @@ inline constexpr float Knee = 1.0f / 2048;
 struct Mapping {
     float scale{}, offset{}, sky{};
 };
-// game: the game's projection, which must be infinite reverse-Z (rrskydepth::Detect).
-// passed: the projection RR is given, the game's or the sky depth test's (finite far
-// plane), so linear depth matches it. sky_depth: the hardware depth sky stands for (0, or
-// the guide test's floor). False when the depth cannot be expressed this way.
-inline bool Map(const std::array<float, 16> &game, const std::array<float, 16> &passed,
-                float sky_depth, Mapping &m) {
-    const auto layout = rrskydepth::Detect(game);
-    if (layout == rrskydepth::Layout::Unknown)
+// The game's projection is infinite reverse-Z (depth = near / z, sky at depth 0).
+// Row-vector (pos * M): [11] = 1, [14] = near. Column-vector (M * pos): transposed.
+enum class Layout { Unknown, RowVector, ColumnVector };
+inline Layout Detect(const std::array<float, 16> &m) {
+    if (std::abs(m[10]) > 1e-6f || m[15] != 0)
+        return Layout::Unknown;
+    if (m[11] == 1 && m[14] > 0)
+        return Layout::RowVector;
+    if (m[14] == 1 && m[11] > 0)
+        return Layout::ColumnVector;
+    return Layout::Unknown;
+}
+// Linear depth of sky, in near planes: very far instead of infinitely far.
+inline constexpr float FarScale = 1e6f;
+// projection: the game's, which RR is also given, so linear depth matches it. False when
+// the depth cannot be expressed this way.
+inline bool Map(const std::array<float, 16> &projection, Mapping &m) {
+    const auto layout = Detect(projection);
+    if (layout == Layout::Unknown)
         return false;
     // Row-vector: clip z = x m2 + y m6 + z m10 + m14, clip w = x m3 + y m7 + z (m11 = 1).
-    // Column-vector is the transpose. Only m10 and the near term may differ in passed.
-    const bool row = layout == rrskydepth::Layout::RowVector;
+    // Column-vector is the transpose.
+    const bool row = layout == Layout::RowVector;
     const unsigned near_term = row ? 14 : 11;
     const unsigned planar[] = {row ? 2u : 8u, row ? 6u : 9u, row ? 3u : 12u, row ? 7u : 13u};
     for (unsigned i : planar)
-        if (std::abs(game[i]) > 1e-6f)
+        if (std::abs(projection[i]) > 1e-6f)
             return false;
-    for (unsigned i = 0; i < 16; ++i)
-        if (i != 10 && i != near_term && passed[i] != game[i])
-            return false;
-    const double scale = passed[near_term], offset = 0.0 - double(passed[10]); // Never -0.
-    if (!std::isfinite(scale) || !std::isfinite(offset) || !(scale > 0) || !(offset >= 0) ||
-        !(sky_depth >= 0) || !std::isfinite(sky_depth))
+    const double scale = projection[near_term],
+                 offset = 0.0 - double(projection[10]); // Never -0.
+    if (!std::isfinite(scale) || !std::isfinite(offset) || !(scale > 0) || !(offset >= 0))
         return false;
-    const double sky = sky_depth > 0 ? scale / (sky_depth + offset)
-                       : offset > 0  ? scale / offset
-                                     : scale * rrskydepth::FarScale;
+    const double sky = offset > 0 ? scale / offset : scale * FarScale;
     m = {float(scale), float(offset), float(sky)};
     return std::isfinite(m.sky) && m.sky > 0;
 }
@@ -87,25 +92,6 @@ inline constexpr FrameDepth Choose(bool feature, bool feature_linear, bool wante
     else
         f.linear = false;
     return f;
-}
-// Hardware depth (the game's, before Linear) for a linear depth z: Linear's inverse, so a
-// capture's linear depth reads as the game's again (tools/analyze_sky_edges.py hardware_depth
-// does the same).
-// sky_depth: the hardware depth sky stands for (Map's). Exact up to float rounding, except
-// world depth farther than sky, which Linear already clamped to sky. Depth Linear never gives
-// (NaN, infinite, zero or below) is returned as it is, so it still shows as bad.
-inline float Hardware(float z, const Mapping &m, float sky_depth) {
-    if (!(z > 0) || std::isinf(z))
-        return z;
-    if (!(z < m.sky))
-        return sky_depth;
-    // In front of the nearest world depth (Linear at Slice): the weapon. A weapon depth that
-    // rounded to the near plane or behind it reads as t = 0, the slice's back.
-    if (z < m.scale / (Slice + m.offset)) {
-        const float t = Knee * (m.scale / (1 + m.offset) / z - 1);
-        return Slice + (1 - Slice) * std::fmin(std::fmax(t, 0.0f), 1.0f);
-    }
-    return std::fmin(m.scale / z - m.offset, Slice); // Rounding never makes world the weapon.
 }
 // CPU reference of shaders/rr_weapon_depth.hlsl, same operations in the same order.
 inline float Linear(float depth, const Mapping &m) {

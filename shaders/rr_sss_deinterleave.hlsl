@@ -1,10 +1,7 @@
 // Owned MRT sample parity, not a conventional averaged MSAA resolve.
-cbuffer Control:register(b0){uint Width,Height,OutputW,OutputH;uint Serial,ResetHistory,Accepted,SssAccepted;uint Replacement,ColorX,ColorY,Flags;float Responsivity;uint3 Reserved;}
+cbuffer Control:register(b0){uint Width,Height,OutputW,OutputH;uint Serial,ResetHistory,Accepted,SssAccepted;uint Replacement,ColorX,ColorY,Flags;}
 Texture2DMS<float,4> Producer:register(t0);
 RWTexture2D<float> Guide:register(u0);
-// RR responsivity mask: Responsivity (negative = steadier, -1..0) on pixels
-// with a nonzero SSS guide, 0 elsewhere. The guide is signed, so test != 0.
-RWTexture2D<float> Mask:register(u3);
 RWByteAddressBuffer Stats:register(u1);
 RWByteAddressBuffer History:register(u2);
 [numthreads(8,8,1)]void main(uint3 id:SV_DispatchThreadID){
@@ -22,5 +19,4 @@ RWByteAddressBuffer History:register(u2);
   }
  }
  Guide[id.xy]=value;
- Mask[id.xy]=value!=0?clamp(Responsivity,-1.0f,1.0f):0;
 }

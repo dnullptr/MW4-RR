@@ -58,51 +58,23 @@ def main():
         ('RRTransparencyBlend', compile_hlsl('rr_transparency_blend.hlsl', 'rr_transparency_blend'), False)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
-        ('RRVrrtGovernor', compile_hlsl('rr_vrrt_governor.hlsl', 'rr_vrrt_governor', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
         ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
-        # Lighting source variants (src/rr_lighting_source.h): lobe mask, fill, cap ratio,
-        # 4th-half source, SSS guide mask.
-        *[(f'RRVrrtScale{name}{suffix}',
-           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
-                        flags=('-Ges', '-D', f'RR_NATIVE_LOBE={mask}', '-D', f'RR_NATIVE_FILL={fill}',
-                               '-D', f'RR_CAP_RATIO={cap}', '-D', f'RR_W_SOURCE={w}',
-                               '-D', f'RR_SSS_MASK={sss}', *extra)), False)
-          for name, mask, fill, cap, w, sss in (('Native1', 1, 0, 0, 0, 0), ('Native2', 2, 0, 0, 0, 0),
-                                                ('Fill2', 2, 1, 0, 0, 0), ('Fill3', 3, 1, 0, 0, 0),
-                                                ('Cap8', 0, 0, 8, 0, 0), ('Cap4', 0, 0, 4, 0, 0),
-                                                ('WFill', 0, 0, 0, 1, 0), ('WNative', 0, 0, 0, 2, 0),
-                                                ('SssNative2', 2, 0, 0, 0, 1), ('SssFill2', 2, 1, 0, 0, 1),
-                                                ('SssNative3', 3, 0, 0, 0, 1), ('SssFill3', 3, 1, 0, 0, 1))
-          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))],
-        # Lobe 2 fill gaps on SSS pixels with history gate and this frame's spatial fallback.
-        *[(f'RRVrrtScale{name}{suffix}',
-           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_{name.lower()}',
+        # SSS lighting (src/rr_lighting_source.h SssHistory2): on SSS pixels lobe 2 from native
+        # temporal wherever it has history, else fresh unboosted, else this frame's spatial mean.
+        *[(f'RRVrrtScaleSssHistory2{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2',
                         flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
-                               '-D', 'RR_CAP_RATIO=0', '-D', 'RR_W_SOURCE=0', '-D', 'RR_SSS_MASK=1',
-                               '-D', f'RR_FILL_HISTORY={history}', '-D', 'RR_FILL_SPATIAL=1', *debug,
+                               '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
+                               '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
                                *extra)), False)
-          for name, history, debug in (('SssFill2Spatial', 1, ()), ('SssSpatial2', 4096, ()),
-                                       ('SssFill2Settled', 4, ()),
-                                       ('SssFillDebug', 1, ('-D', 'RR_FILL_DEBUG=1')),
-                                       ('SssHistory2', 1, ('-D', 'RR_FILL_PREFER_NATIVE=1')))
           for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
-
-    # Specular hit distance conditioning (src/rr_hit_condition.h), for R32_UINT and
-    # R32_FLOAT lighting weights.
-    header(out / 'rr_hit_condition.generated.h', [
-        ('RRHitCondition', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition'), False),
-        ('RRHitConditionFloat', compile_hlsl('rr_hit_condition.hlsl', 'rr_hit_condition_float',
-                                             flags=('-D', 'RR_FLOAT_WEIGHTS=1')), False)])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
-    # Refraction dropout test (src/rr_refraction_dropout.h); includes rr_blue_noise.inc.
-    header(out / 'rr_refraction_dropout.generated.h', [
-        ('RRRefractionDropout', compile_hlsl('rr_refraction_dropout.hlsl', 'rr_refraction_dropout'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
-    # Running water test masks (src/rr_water.h).
+    # Water responsivity mask (src/rr_water.h).
     header(out / 'rr_water_masks.generated.h', [
         ('RRWaterMasks', compile_hlsl('rr_water_masks.hlsl', 'rr_water_masks'), False)])
     for source, entry, symbol, leaf in [
@@ -110,19 +82,10 @@ def main():
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
         ('rr_live_gate.hlsl', 'Validate', 'RRLiveValidate', 'rr_live_validate'),
         ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
-        ('rr_sky_edge_mask.hlsl', 'main', 'RRSkyEdgeMask', 'rr_sky_edge_mask'),
-        ('rr_sky_depth_floor.hlsl', 'main', 'RRSkyDepthFloor', 'rr_sky_depth_floor'),
-        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth'),
-        ('rr_color_scale.hlsl', 'main', 'RRColorScale', 'rr_color_scale')]:
+        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)
-    # Guide test variants (src/rr_guide_test.h).
-    for test in range(1, 10):
-        subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', 'main', '/D', f'RR_GUIDE_TEST={test}',
-                        '/Fh', str(out / f'rr_convert_guides_test{test}.generated.h'),
-                        '/Vn', f'RRGuideShaderTest{test}',
-                        str(ROOT / 'shaders' / 'rr_convert_guides.hlsl')], check=True)
     (out / 'shader-build.json').write_text(json.dumps({'outputs': results}, indent=2) + '\n')
     print('Project-owned shaders compiled; runtime guide preparation uses the game-supplied shader.')
 

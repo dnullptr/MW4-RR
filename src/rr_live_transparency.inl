@@ -51,22 +51,19 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
     const UINT64 glass = rrtrans::RequiredBytes(pipelines.device.Get(), source, w, h);
     if (!glass)
         return false;
-    UINT64 base{}, depth{}, sss{}, water{}, kept{};
+    UINT64 base{}, depth{}, sss{}, water{};
     for (const auto &s : slots) {
         UINT64 b{}, d{};
         if (!SlotReservationParts(pipelines.device.Get(), s.gpu, budget.limit, b, d) ||
             b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes ||
-            b - s.gpu.sss.bytes - s.gpu.transparency.bytes < s.gpu.water.bytes ||
-            b - s.gpu.sss.bytes - s.gpu.transparency.bytes - s.gpu.water.bytes < s.gpu.ray_bytes)
+            b - s.gpu.sss.bytes - s.gpu.transparency.bytes < s.gpu.water.bytes)
             return false;
-        base = (std::max)(base, b - s.gpu.sss.bytes - s.gpu.transparency.bytes - s.gpu.water.bytes -
-                                    s.gpu.ray_bytes);
+        base = (std::max)(base, b - s.gpu.sss.bytes - s.gpu.transparency.bytes - s.gpu.water.bytes);
         depth = (std::max)(depth, d);
         sss = (std::max)(sss, s.gpu.sss.bytes);
         water = (std::max)(water, s.gpu.water.bytes);
     }
-    if (!PersistentBytes(kept))
-        return false;
+    const UINT64 kept = persistent.bytes;
     // Protect mandatory depth conversion and enabled SSS even while some slots
     // have not yet needed those resources. Exact device allocation sizes only.
     auto depth_desc = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
@@ -89,7 +86,7 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
         sss = (std::max)(sss, n);
     }
     uint64_t required{};
-    // Water test storage (rr_water.h) takes the otherwise unused hit term.
+    // Water storage (rr_water.h) takes the otherwise unused hit term.
     if (!rrtrans::RequiredSlots(slots.size(), base, depth, sss, glass, water, kept, required))
         return false;
     if (required > budget.limit) {
