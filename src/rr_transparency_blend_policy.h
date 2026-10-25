@@ -110,13 +110,18 @@ inline bool Extent(const D3D12_RESOURCE_DESC &coverage, uint32_t render_w, uint3
             coverage.SampleDesc.Quality == D3D12_STANDARD_MULTISAMPLE_PATTERN);
 }
 
-// The variant keeps only the native dest factor, so it must depend on the
-// source alone: dest = dest * f(src) is then the composite's transmittance.
+// The variant keeps only the native dest factor. The composite is then
+// dest' = src * g + dest * f(src), and dest * f(src) is its transmittance only
+// when f reads the source alone and the source term g never reads dest.
 enum class BlendClass { Accept, NoBlend, Factor, Op, Logic, Mask, Targets };
 inline bool SourceFactor(D3D12_BLEND factor) {
     switch (factor) {
     case D3D12_BLEND_SRC1_COLOR:
     case D3D12_BLEND_INV_SRC1_COLOR:
+    // The UNORM variant target clamps the source to [0, 1] before blending, so
+    // with HDR source colour these two record a different factor than the
+    // native float-target blend. a36d (SRC1 = 1 - T) and b723 (saturated
+    // alpha) are unaffected.
     case D3D12_BLEND_SRC_COLOR:
     case D3D12_BLEND_INV_SRC_COLOR:
     case D3D12_BLEND_SRC_ALPHA:
@@ -127,6 +132,12 @@ inline bool SourceFactor(D3D12_BLEND factor) {
     default:
         return false;
     }
+}
+// SRC_ALPHA_SAT is min(As, 1 - Ad).
+inline bool ReadsDest(D3D12_BLEND factor) {
+    return factor == D3D12_BLEND_DEST_COLOR || factor == D3D12_BLEND_INV_DEST_COLOR ||
+           factor == D3D12_BLEND_DEST_ALPHA || factor == D3D12_BLEND_INV_DEST_ALPHA ||
+           factor == D3D12_BLEND_SRC_ALPHA_SAT;
 }
 inline BlendClass Classify(const D3D12_BLEND_DESC &blend, UINT num_render_targets) {
     const auto &rt = blend.RenderTarget[0];
@@ -141,8 +152,10 @@ inline BlendClass Classify(const D3D12_BLEND_DESC &blend, UINT num_render_target
     // Alpha to coverage changes which samples are written.
     if (blend.AlphaToCoverageEnable || !(rt.RenderTargetWriteMask & 7))
         return BlendClass::Mask;
-    return SourceFactor(rt.DestBlend) ? BlendClass::Accept : BlendClass::Factor;
+    return SourceFactor(rt.DestBlend) && !ReadsDest(rt.SrcBlend) ? BlendClass::Accept
+                                                                 : BlendClass::Factor;
 }
+// Valid only for a native blend that Classify returned Accept for.
 inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native) {
     D3D12_BLEND_DESC d{};
     d.AlphaToCoverageEnable = FALSE;
@@ -168,18 +181,37 @@ inline D3D12_BLEND_DESC PatchBlend(const D3D12_BLEND_DESC &native) {
 
 // The replay may test against the mirrored DSV but must never write it.
 enum class DepthClass { NoDsv, KeepDsv, Refuse };
-inline bool KeepsStencil(const D3D12_DEPTH_STENCILOP_DESC &face) {
-    return face.StencilFailOp == D3D12_STENCIL_OP_KEEP &&
-           face.StencilDepthFailOp == D3D12_STENCIL_OP_KEEP &&
-           face.StencilPassOp == D3D12_STENCIL_OP_KEEP;
+// A face never changes stencil when it can write no bit or every op keeps.
+inline bool KeepsStencil(const D3D12_DEPTH_STENCILOP_DESC1 &face) {
+    return face.StencilWriteMask == 0 || (face.StencilFailOp == D3D12_STENCIL_OP_KEEP &&
+                                          face.StencilDepthFailOp == D3D12_STENCIL_OP_KEEP &&
+                                          face.StencilPassOp == D3D12_STENCIL_OP_KEEP);
 }
-inline DepthClass DepthStencilReplayable(const D3D12_DEPTH_STENCIL_DESC &d) {
+// DESC2 is the repo's normalized form (rrsss::NormalizeDepthStencil), with a
+// write mask per face as ReShade reports it.
+inline DepthClass DepthStencilReplayable(const D3D12_DEPTH_STENCIL_DESC2 &d) {
     if (!d.DepthEnable && !d.StencilEnable)
         return DepthClass::NoDsv;
-    const bool stencil_kept = !d.StencilEnable || d.StencilWriteMask == 0 ||
-                              (KeepsStencil(d.FrontFace) && KeepsStencil(d.BackFace));
-    return d.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO && stencil_kept ? DepthClass::KeepDsv
-                                                                           : DepthClass::Refuse;
+    // D3D never writes depth while the depth test is disabled.
+    const bool depth_kept = !d.DepthEnable || d.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO;
+    const bool stencil_kept =
+        !d.StencilEnable || (KeepsStencil(d.FrontFace) && KeepsStencil(d.BackFace));
+    return depth_kept && stencil_kept ? DepthClass::KeepDsv : DepthClass::Refuse;
+}
+inline DepthClass DepthStencilReplayable(const D3D12_DEPTH_STENCIL_DESC &d) {
+    auto face = [&d](const D3D12_DEPTH_STENCILOP_DESC &f) {
+        return D3D12_DEPTH_STENCILOP_DESC1{f.StencilFailOp,   f.StencilDepthFailOp,
+                                           f.StencilPassOp,   f.StencilFunc,
+                                           d.StencilReadMask, d.StencilWriteMask};
+    };
+    D3D12_DEPTH_STENCIL_DESC2 n{};
+    n.DepthEnable = d.DepthEnable;
+    n.DepthWriteMask = d.DepthWriteMask;
+    n.DepthFunc = d.DepthFunc;
+    n.StencilEnable = d.StencilEnable;
+    n.FrontFace = face(d.FrontFace);
+    n.BackFace = face(d.BackFace);
+    return DepthStencilReplayable(n);
 }
 
 // ExecuteIndirect resets every binding its signature sets, so a replay is only
@@ -245,7 +277,8 @@ inline float Luma(const float (&c)[3]) {
     return c[0] * 0.299f + c[1] * 0.587f + c[2] * 0.114f;
 }
 // transmittance[dy + 1][dx + 1] is t(q) for q = (x + dx, y + dy), the coverage
-// sample that maps to render pixel q. Taps outside width x height are ignored.
+// sample that maps to render pixel q. Taps outside width x height are ignored;
+// each tap's opacity is saturated, so NaN counts as clear.
 inline void Reference(const Control &control, uint32_t x, uint32_t y, uint32_t status,
                       const float (&transmittance)[3][3][3], Guides &inout) {
     if (control.admitted != 1 || x >= control.width || y >= control.height)
@@ -264,14 +297,14 @@ inline void Reference(const Control &control, uint32_t x, uint32_t y, uint32_t s
                     continue;
                 const float w = float((dx ? 1 : 2) * (dy ? 1 : 2)); // 1-2-1 x 1-2-1
                 for (int ch = 0; ch < 3; ++ch)
-                    o[ch] += w * (1.f - transmittance[dy + 1][dx + 1][ch]);
+                    o[ch] += w * Saturate(1.f - transmittance[dy + 1][dx + 1][ch]);
                 total += w;
             }
         for (auto &value : o)
             value /= total;
     } else {
         for (int ch = 0; ch < 3; ++ch)
-            o[ch] = 1.f - transmittance[1][1][ch];
+            o[ch] = Saturate(1.f - transmittance[1][1][ch]);
     }
     const float noise = control.params[3], strength = control.params[2];
     float c[3];

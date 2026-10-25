@@ -79,6 +79,27 @@ static void TestClassify() {
         assert(Classify(Native(dest), 1) == BlendClass::Accept);
     // Observed b723 state (programs.json): ONE / INV_SRC_ALPHA, write mask 15.
     assert(Classify(Native(D3D12_BLEND_INV_SRC_ALPHA), 1) == BlendClass::Accept);
+    // Source factors that do not read dest keep dest * f(src) the transmittance.
+    for (auto src :
+         {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR,
+          D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_BLEND_FACTOR,
+          D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR,
+          D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA}) {
+        auto source = Native(D3D12_BLEND_INV_SRC1_COLOR);
+        source.RenderTarget[0].SrcBlend = src;
+        assert(Classify(source, 1) == BlendClass::Accept);
+    }
+    // A source term that reads dest (e.g. modulate 2x: DEST_COLOR / SRC_COLOR) makes
+    // the composite non-linear in dest, so f(src) alone is not its transmittance.
+    for (auto src : {D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_DEST_ALPHA,
+                     D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_SRC_ALPHA_SAT}) {
+        auto modulate = Native(D3D12_BLEND_SRC_COLOR);
+        modulate.RenderTarget[0].SrcBlend = src;
+        assert(Classify(modulate, 1) == BlendClass::Factor);
+        auto dual = Native(D3D12_BLEND_INV_SRC1_COLOR);
+        dual.RenderTarget[0].SrcBlend = src;
+        assert(Classify(dual, 1) == BlendClass::Factor);
+    }
     auto rgb_only = Native(D3D12_BLEND_INV_SRC1_COLOR);
     rgb_only.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
     assert(Classify(rgb_only, 1) == BlendClass::Accept);
@@ -190,9 +211,49 @@ static void TestDepthStencil() {
     // Stencil test only (no depth test) that never writes keeps the DSV.
     d.DepthEnable = FALSE;
     assert(DepthStencilReplayable(d) == DepthClass::KeepDsv);
-    d.DepthEnable = TRUE;
+    // D3D never writes depth while the depth test is off, whatever the mask.
     d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    assert(DepthStencilReplayable(d) == DepthClass::KeepDsv);
+    d.DepthEnable = TRUE;
     assert(DepthStencilReplayable(d) == DepthClass::Refuse);
+
+    // DESC2 carries a write mask per face: each face must be safe on its own.
+    D3D12_DEPTH_STENCIL_DESC2 e{};
+    e.DepthEnable = TRUE;
+    e.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    e.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    e.StencilEnable = TRUE;
+    const D3D12_DEPTH_STENCILOP_DESC1 kept{D3D12_STENCIL_OP_KEEP,
+                                           D3D12_STENCIL_OP_KEEP,
+                                           D3D12_STENCIL_OP_KEEP,
+                                           D3D12_COMPARISON_FUNC_EQUAL,
+                                           0xff,
+                                           0xff};
+    auto replace = kept;
+    replace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+    auto masked = replace;
+    masked.StencilWriteMask = 0;
+    e.FrontFace = e.BackFace = kept;
+    assert(DepthStencilReplayable(e) == DepthClass::KeepDsv);
+    e.FrontFace = masked;
+    e.BackFace = replace; // back face writes, front does not
+    assert(DepthStencilReplayable(e) == DepthClass::Refuse);
+    e.FrontFace = replace;
+    e.BackFace = masked; // front face writes, back does not
+    assert(DepthStencilReplayable(e) == DepthClass::Refuse);
+    e.FrontFace = masked;
+    e.BackFace = kept; // neither face can change stencil
+    assert(DepthStencilReplayable(e) == DepthClass::KeepDsv);
+    e.BackFace = masked;
+    assert(DepthStencilReplayable(e) == DepthClass::KeepDsv);
+    e.BackFace = replace;
+    e.StencilEnable = FALSE;
+    assert(DepthStencilReplayable(e) == DepthClass::KeepDsv);
+    e.DepthEnable = FALSE;
+    assert(DepthStencilReplayable(e) == DepthClass::NoDsv);
+    e.DepthEnable = TRUE;
+    e.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    assert(DepthStencilReplayable(e) == DepthClass::Refuse);
 }
 
 static D3D12_INDIRECT_ARGUMENT_DESC Arg(D3D12_INDIRECT_ARGUMENT_TYPE type) {
@@ -618,6 +679,23 @@ static void TestReference() {
         g = Sample();
         Reference(Admitted(filtered, 1, 1), 0, 0, 1, t, g);
         assert(Near(g.diffuse[0], 0.5f));
+        // Each tap's opacity is saturated: a NaN tap counts as clear and taps
+        // outside [0, 1] clamp, instead of poisoning or skewing the average.
+        Fill(t, 1.f);
+        t[1][1][0] = t[1][1][1] = t[1][1][2] = 0.f;           // centre o = 1, w 4
+        t[0][0][0] = t[0][0][1] = t[0][0][2] = std::nanf(""); // o = 0, w 1
+        t[0][2][0] = t[0][2][1] = t[0][2][2] = -0.5f;         // o = 1, w 1
+        t[2][1][0] = t[2][1][1] = t[2][1][2] = 2.f;           // o = 0, w 2
+        g = Sample();
+        Reference(Admitted(filtered), 3, 3, 1, t, g);
+        c = (5.f / 16.f - OpacityFloor) / (1.f - OpacityFloor);
+        assert(Near(g.diffuse[0], 0.9f + c * (0.5f - 0.9f)));
+        assert(Near(g.specular[2], 0.06f + c * (0.f - 0.06f)));
+        // Unfiltered, an out-of-range centre clamps to full coverage.
+        Fill(t, -0.5f);
+        g = Sample();
+        Reference(Admitted(plain), 3, 3, 1, t, g);
+        assert(Near(g.diffuse[0], 0.5f) && Near(g.specular[0], 0.f));
     }
 
     // Debug: eligible pixels show c in diffuse and zero specular.
