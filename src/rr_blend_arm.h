@@ -3,6 +3,12 @@
 #include <utility>
 
 namespace rrblend {
+// A replayed draw must not add samples to a game counting query: the query
+// hooks must be proven (stencil_tracking: Reset marks queries known even when
+// they never installed) and no query may be open.
+template <class Proof> bool QueriesClear(const Proof &p) noexcept {
+    return p.stencil_tracking && p.queries_known && !p.query_count;
+}
 // One ExecuteIndirect's arm for the coverage capture: the ReShade pre-event
 // proves the bound state and arms it; the native detour's observer, which runs
 // next on the same recording thread inside the same call, takes it. Take

@@ -84,12 +84,26 @@ static void TakeOverwrites() {
     assert(!latch.Take(&a, refused) && !refused.held && refused.value == 0);
 }
 
+// The real proof's Reset state (queries known, none open) must pass; an open
+// query, unknown query state or unproven query hooks must refuse.
+static void QueriesClearPolarity() {
+    struct Proof {
+        bool stencil_tracking{}, queries_known{};
+        unsigned query_count{};
+    };
+    assert(rrblend::QueriesClear(Proof{true, true, 0}));
+    assert(!rrblend::QueriesClear(Proof{true, true, 1}));
+    assert(!rrblend::QueriesClear(Proof{true, false, 0}));
+    assert(!rrblend::QueriesClear(Proof{false, true, 0}));
+}
+
 int main() {
     TakeOnce();
     OtherListDisarms();
     NullList();
     ReplaceAndClear();
     TakeOverwrites();
+    QueriesClearPolarity();
     printf("transparency-blend-arm: all tests passed\n");
     return 0;
 }
