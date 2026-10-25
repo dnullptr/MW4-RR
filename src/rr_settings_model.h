@@ -8,6 +8,7 @@ struct Preferences {
     unsigned preset = 6;
     // SSS noise experiments.
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
+    unsigned native_lobe = 0;      // 0 raw lighting, 1 or 2 that lobe from native temporal
 };
 inline constexpr const char *QualityLabel(int quality) {
     switch (quality) {

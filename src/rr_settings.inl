@@ -8,6 +8,7 @@ static bool &requested_rr = preferences.rr;
 static bool &requested_sss = preferences.sss;
 static bool &requested_glass = preferences.glass;
 static bool &requested_tolerate = preferences.tolerate_isolated;
+static unsigned &requested_lobe = preferences.native_lobe;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -15,6 +16,7 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::set_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
                               requested_tolerate);
+    reshade::set_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
 }
 static void ApplyEnabled() {
     config_allowed = VrsConfigAllowsRR();
@@ -23,6 +25,9 @@ static void ApplyEnabled() {
     LiveRR().SetTransparencyEnabled(requested_glass);
     AlbedoInspector().observe_transitions = requested_glass;
     LiveRR().SetTolerateIsolated(requested_tolerate);
+    if (requested_lobe > 2)
+        requested_lobe = 0;
+    rrbypass::lobe_source = requested_lobe;
 }
 static void LoadSettings() {
     if (settings_loaded)
@@ -34,6 +39,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "Transparency", requested_glass);
     reshade::get_config_value(nullptr, SettingsSection, "TolerateIsolatedGuidePixels",
                               requested_tolerate);
+    reshade::get_config_value(nullptr, SettingsSection, "NativeLobe", requested_lobe);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -91,6 +97,16 @@ static void DrawSettings(reshade::api::effect_runtime *) {
     changed |= ImGui::Checkbox("Tolerate isolated bad guide pixels", &requested_tolerate);
     ImGui::TextWrapped("On: a few unusable guide pixels no longer reject the frame and reset RR "
                        "history; they are counted in ReShade.log instead. Off: previous behavior.");
+    const char *lobe_names[] = {"Off (raw lighting)", "Lobe 1 from native temporal",
+                                "Lobe 2 from native temporal"};
+    int lobe = static_cast<int>(requested_lobe);
+    if (ImGui::Combo("Native lighting lobe", &lobe, lobe_names, 3)) {
+        requested_lobe = static_cast<unsigned>(lobe);
+        changed = true;
+    }
+    ImGui::TextWrapped("Feeds one lighting lobe from the game's own temporal accumulation instead "
+                       "of raw samples, across the whole frame. One lobe is diffuse and one is "
+                       "specular: the diffuse one should remove blotches on skin. Compare both.");
     ImGui::Separator();
     if (changed) {
         ApplyEnabled();

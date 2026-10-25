@@ -29,7 +29,11 @@ struct Entry {
     reshade::api::pipeline alternate{};
     bool bound{};
     ID3D12PipelineState *scale{};
+    // Same preparation taking lobe 1 or 2 from native temporal output.
+    std::array<ID3D12PipelineState *, 2> native_lobe{};
 };
+// 0 = raw lighting in both lobes; 1 or 2 = that lobe from native temporal output.
+inline std::atomic<unsigned> lobe_source{};
 inline std::mutex mutex, preparation;
 inline std::atomic<bool> global_failed{};
 inline void GlobalFail(const char *why) {
@@ -82,7 +86,8 @@ inline void Corrected(reshade::api::device *d) {
             "RR fresh lighting copied and importance weighted; native temporal history retained");
 }
 inline void Created(reshade::api::device *d, reshade::api::pipeline p, uint64_t actual,
-                    reshade::api::pipeline alternate = {}, ID3D12PipelineState *scale = nullptr) {
+                    reshade::api::pipeline alternate = {}, ID3D12PipelineState *scale = nullptr,
+                    std::array<ID3D12PipelineState *, 2> lobes = {}) {
     std::lock_guard lock(mutex);
     pipelines.erase(p.handle);
     auto h = OriginalHash(actual);
@@ -96,7 +101,7 @@ inline void Created(reshade::api::device *d, reshade::api::pipeline p, uint64_t 
     bool valid = rrversion::NativeTemporal(actual) ||
                  (h == Vrrt && rrversion::SourceBytes(actual) != 0) ||
                  (actual == RRSpatialPassthroughHash && scale);
-    pipelines[p.handle] = {d, h, valid, false, alternate, false, scale};
+    pipelines[p.handle] = {d, h, valid, false, alternate, false, scale, lobes};
     if (!valid)
         ++unsafe_revision[d];
 }
@@ -163,19 +168,38 @@ inline constexpr GUID AlternateId = {
     0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x01}};
 inline constexpr GUID ScaleId = {
     0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x02}};
-inline ID3D12PipelineState *MakeScale(reshade::api::device *d, reshade::api::pipeline_layout root,
-                                      reshade::api::pipeline p) {
+inline constexpr std::array<GUID, 2> NativeLobeScaleId = {
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x03}},
+    GUID{0xf1406a29, 0xcadc, 0x4ec7, {0x94, 0xfa, 0xf9, 0xee, 0x49, 0xc2, 0x17, 0x04}}};
+// The native PSO retains each alternate, so the game's PSO lifetime covers it.
+inline ID3D12PipelineState *MakeScaleVariant(reshade::api::device *d,
+                                             reshade::api::pipeline_layout root,
+                                             reshade::api::pipeline p, const GUID &id,
+                                             D3D12_SHADER_BYTECODE code) {
     auto native = fg::NativeObject<ID3D12Device>((ID3D12Device *)d->get_native());
     if (!native || !root.handle || !p.handle)
         return nullptr;
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = (ID3D12RootSignature *)root.handle;
-    desc.CS = {RRVrrtScale, sizeof(RRVrrtScale)};
+    desc.CS = code;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> scale;
     if (FAILED(native->CreateComputePipelineState(&desc, IID_PPV_ARGS(&scale))) ||
-        FAILED(((ID3D12PipelineState *)p.handle)->SetPrivateDataInterface(ScaleId, scale.Get())))
+        FAILED(((ID3D12PipelineState *)p.handle)->SetPrivateDataInterface(id, scale.Get())))
         return nullptr;
     return scale.Get();
+}
+inline ID3D12PipelineState *MakeScale(reshade::api::device *d, reshade::api::pipeline_layout root,
+                                      reshade::api::pipeline p) {
+    return MakeScaleVariant(d, root, p, ScaleId, {RRVrrtScale, sizeof(RRVrrtScale)});
+}
+// Optional: a missing variant falls back to raw lighting for that lobe.
+inline std::array<ID3D12PipelineState *, 2>
+MakeNativeLobeScales(reshade::api::device *d, reshade::api::pipeline_layout root,
+                     reshade::api::pipeline p) {
+    return {MakeScaleVariant(d, root, p, NativeLobeScaleId[0],
+                             {RRVrrtScaleNative1, sizeof(RRVrrtScaleNative1)}),
+            MakeScaleVariant(d, root, p, NativeLobeScaleId[1],
+                             {RRVrrtScaleNative2, sizeof(RRVrrtScaleNative2)})};
 }
 inline void Initialize(reshade::api::device *d, reshade::api::pipeline_layout root, uint32_t count,
                        const reshade::api::pipeline_subobject *objects, reshade::api::pipeline p,
@@ -208,7 +232,8 @@ inline void Initialize(reshade::api::device *d, reshade::api::pipeline_layout ro
     }
     if (actual == RRSpatialPassthroughHash) {
         auto *scale = h == Spatial ? MakeScale(d, root, p) : nullptr;
-        Created(d, p, actual, {}, scale);
+        Created(d, p, actual, {}, scale,
+                scale ? MakeNativeLobeScales(d, root, p) : std::array<ID3D12PipelineState *, 2>{});
         return;
     }
     std::lock_guard prepare(preparation);
@@ -237,10 +262,13 @@ inline void Initialize(reshade::api::device *d, reshade::api::pipeline_layout ro
         valid = false;
         ((ID3D12PipelineState *)p.handle)->SetPrivateDataInterface(AlternateId, nullptr);
     }
+    std::array<ID3D12PipelineState *, 2> lobes{};
+    if (valid && scale)
+        lobes = MakeNativeLobeScales(d, root, p);
     if (alt.handle)
         d->destroy_pipeline(alt);
     Created(d, p, valid ? RRSpatialPassthroughHash : actual, valid ? alt : reshade::api::pipeline{},
-            scale);
+            scale, lobes);
 }
 inline uint64_t Effective(reshade::api::device *, uint64_t original) {
     return original;
@@ -253,13 +281,20 @@ inline bool SpatialWriteContract(reshade::api::device *d, uint64_t original, uin
     auto &e = at->second;
     return e.device == d && e.hash == Spatial && e.replacement && e.scale && original == effective;
 }
+// lobe: 0 = raw preparation, 1 or 2 = that lobe from native temporal output.
+// A lobe variant that failed creation falls back to the raw preparation.
 inline Microsoft::WRL::ComPtr<ID3D12PipelineState> Scale(reshade::api::device *d,
-                                                         uint64_t original) {
+                                                         uint64_t original, unsigned lobe = 0) {
     std::lock_guard lock(mutex);
     auto at = pipelines.find(original);
     Microsoft::WRL::ComPtr<ID3D12PipelineState> result;
-    if (at != pipelines.end() && at->second.device == d)
+    if (at != pipelines.end() && at->second.device == d) {
         result = at->second.scale;
+        if (lobe == 1 || lobe == 2) {
+            if (auto *variant = at->second.native_lobe[lobe - 1])
+                result = variant;
+        }
+    }
     return result;
 }
 inline reshade::api::pipeline Bind(reshade::api::command_list *list,

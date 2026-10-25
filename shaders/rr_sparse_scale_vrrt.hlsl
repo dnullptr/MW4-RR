@@ -22,6 +22,14 @@ uint PixelCode(uint2 p){
  else{uint i=(byteOffset-65536)/4;word=RateWords1[i/4][i%4];}
  return (word>>((byteOffset&2)*8))&65535;
 }
+// RR_NATIVE_LOBE 1 or 2 takes that lobe from native temporal output (t0, the
+// native spatial input) instead of raw current-frame lighting. One lobe is
+// diffuse and one specular; native diffuse keeps the game's SSS blur from
+// spreading sparse raw samples into blotches. Its weight bits come along too,
+// matching the temporal-only passthrough comparison.
+#ifndef RR_NATIVE_LOBE
+#define RR_NATIVE_LOBE 0
+#endif
 uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
  float4 v=float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
  valid=sampled&&inverse!=0&&all(v>=0)&&all(v<=65504);
@@ -46,10 +54,21 @@ void main(uint3 id:SV_DispatchThreadID){
  uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,a);
  uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,b);
 #ifdef RR_PACKED_FLOAT
+ uint4 nc=asuint(nativeLighting.Load(int3(p,0)));uint nw=asuint(nativeWeights.Load(int3(p,0)));
+#else
+ uint4 nc=nativeLighting.Load(int3(p,0));uint nw=nativeWeights.Load(int3(p,0));
+#endif
+ uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
+#if RR_NATIVE_LOBE==1
+ ca=nc.xy;outWeights=(outWeights&~0xfff00000u)|(nw&0xfff00000u);
+#elif RR_NATIVE_LOBE==2
+ cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);
+#endif
+#ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));
- weights[p]=asfloat((wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(asuint(nativeWeights.Load(int3(p,0)))&255));
+ weights[p]=asfloat(outWeights);
 #else
  color[p]=uint4(ca,cb);
- weights[p]=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nativeWeights.Load(int3(p,0))&255);
+ weights[p]=outWeights;
 #endif
 }

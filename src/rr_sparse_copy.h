@@ -188,7 +188,9 @@ class Pool {
         ComPtr<ID3D12PipelineState> scale;
         ComPtr<ID3D12Resource> rates;
         ComPtr<ID3D12RootSignature> privateRoot;
-        ComPtr<ID3D12PipelineState> privateScale;
+        // Indexed by lobe source: 0 raw, 1 or 2 that lobe from native temporal output.
+        std::array<ComPtr<ID3D12PipelineState>, 3> privateScale;
+        unsigned privateLobe{};
         ComPtr<ID3D12DescriptorHeap> privateHeap;
         ID3D12GraphicsCommandList *command{};
         UINT64 serial{}, signaled{}, bytes{};
@@ -230,8 +232,22 @@ class Pool {
             Transition(from, D3D12_RESOURCE_STATE_COPY_SOURCE, fs)};
         cl->ResourceBarrier(2, after.data());
     }
-    static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output) {
-        if (!s.privateScale) {
+    static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe) {
+        if (packed_float)
+            return lobe == 1   ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1Float,
+                                                     sizeof(RRVrrtScaleNative1Float)}
+                   : lobe == 2 ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2Float,
+                                                     sizeof(RRVrrtScaleNative2Float)}
+                               : D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)};
+        return lobe == 1   ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative1, sizeof(RRVrrtScaleNative1)}
+               : lobe == 2 ? D3D12_SHADER_BYTECODE{RRVrrtScaleNative2, sizeof(RRVrrtScaleNative2)}
+                           : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
+    }
+    static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output,
+                                    unsigned lobe = 0) {
+        if (lobe > 2)
+            lobe = 0;
+        if (!s.privateRoot) {
             D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
             D3D12_ROOT_PARAMETER p[4]{};
@@ -244,22 +260,29 @@ class Pool {
             D3D12_ROOT_SIGNATURE_DESC rd{4, p};
             ComPtr<ID3DBlob> code, error;
             ComPtr<ID3D12RootSignature> root;
-            ComPtr<ID3D12PipelineState> pso;
             if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &code,
                                                    &error)) ||
                 FAILED(s.device->CreateRootSignature(0, code->GetBufferPointer(),
                                                      code->GetBufferSize(), IID_PPV_ARGS(&root))))
                 return false;
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = root.Get();
-            pd.CS = output.r[0]->GetDesc().Format == DXGI_FORMAT_R32G32B32A32_FLOAT
-                        ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
-                        : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
-            if (FAILED(s.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))))
-                return false;
             s.privateRoot = root;
-            s.privateScale = pso;
         }
+        const bool packed_float = output.r[0]->GetDesc().Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+        auto create = [&](unsigned variant) {
+            if (s.privateScale[variant])
+                return true;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.privateRoot.Get();
+            pd.CS = PrivateScaleCode(packed_float, variant);
+            return SUCCEEDED(s.device->CreateComputePipelineState(
+                &pd, IID_PPV_ARGS(&s.privateScale[variant])));
+        };
+        // A lobe variant that cannot be created falls back to raw preparation.
+        if (!create(lobe))
+            lobe = 0;
+        if (!create(lobe))
+            return false;
+        s.privateLobe = lobe;
         if (!s.privateHeap) {
             D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
@@ -405,7 +428,7 @@ class Pool {
     bool Apply(ID3D12GraphicsCommandList *cl, const Pair &input, const Pair &output,
                ID3D12PipelineState *scale, ID3D12PipelineState *restore, UINT x, UINT y, UINT z,
                const rrvrrt::Data *rates = nullptr, const rrvrrt::CBVs *cbvs = nullptr,
-               const rrcompute::Snapshot *privateRestore = nullptr) {
+               const rrcompute::Snapshot *privateRestore = nullptr, unsigned lobe = 0) {
         std::lock_guard lock(mutex);
         if (!Shape(input) || !Shape(output) || !scale || !restore || z != 1)
             return false;
@@ -462,7 +485,7 @@ class Pool {
                 !rates->buffer->GetGPUVirtualAddress())
                 return false;
         }
-        if (privateRestore && !PreparePrivateScale(s, input, output))
+        if (privateRestore && !PreparePrivateScale(s, input, output, lobe))
             return false;
         // All proofs and references acquired before the first output mutation.
         s.destination = output;
@@ -479,7 +502,7 @@ class Pool {
             ID3D12DescriptorHeap *heaps[] = {s.privateHeap.Get()};
             cl->SetDescriptorHeaps(1, heaps);
             cl->SetComputeRootSignature(s.privateRoot.Get());
-            cl->SetPipelineState(s.privateScale.Get());
+            cl->SetPipelineState(s.privateScale[s.privateLobe].Get());
             cl->SetComputeRootDescriptorTable(0, gpu);
             cl->SetComputeRootDescriptorTable(1, {gpu.ptr + 2 * stride});
         } else

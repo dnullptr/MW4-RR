@@ -167,7 +167,9 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         return false; // Dispatch the selected native or passthrough pipeline normally.
     }
 #endif
-    auto scale = rrbypass::Scale(device, binding.pipeline);
+    // One read per dispatch keeps the native-root and private paths on the same lobe source.
+    const unsigned lobe = rrbypass::lobe_source.load(std::memory_order_relaxed);
+    auto scale = rrbypass::Scale(device, binding.pipeline, lobe);
     rrinternal::Scope ignoreCopies;
     rrcompute::Tracker::Internal ignoreState;
     const auto rates = LiveRR().SamplingData(native.Get());
@@ -193,7 +195,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     }
     const bool replaced = SparsePool().Apply(
         native.Get(), input, output, scale.Get(), (ID3D12PipelineState *)effective, x, y, z, &rates,
-        cbvs.valid ? &cbvs : nullptr, cbvs.valid ? nullptr : &privateRestore);
+        cbvs.valid ? &cbvs : nullptr, cbvs.valid ? nullptr : &privateRestore, lobe);
     if (replaced) {
 #ifdef RR_FILTER_DIAGNOSTIC
         LiveRR().SeedSpatialOnly(native.Get(), output);
