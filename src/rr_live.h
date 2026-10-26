@@ -68,6 +68,7 @@ class Controller {
     ComPtr<ID3D12CommandQueue> last_queue;
     UINT64 signaled{};
     bool enabled{}, failed{}, initialized{}, history_queued{}, retired{};
+    bool slot_memory_logged{}; // a frame slot is waiting for GPU memory (the prepass)
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
@@ -964,8 +965,21 @@ class Controller {
                                                    UINT(guide_extent.Width), guide_extent.Height)),
                 "live prepass pool exceeds available GPU budget");
             auto &s = *free;
+            try {
+                s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+            } catch (const rrprivate::AllocationDeferred &) {
+                // Only a new slot allocates. Under GPU memory pressure (another add-on's
+                // VRAM, for one) this frame stays native and a later frame retries.
+                s.gpu.Release(budget);
+                if (!slot_memory_logged)
+                    Log("RR frame slot waiting for GPU memory; native frames until it fits");
+                slot_memory_logged = true;
+                status.Fallback(generation, GetTickCount64());
+                policy.Reject();
+                return false;
+            }
+            slot_memory_logged = false;
             s.busy = true;
-            s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
             // A null classification view unless a water test wants it this frame.
             // The guide mode follows it, so every water test waits and fails together.
             s.gpu.WaterTarget(pipelines, WaterWanted() && !water_failed &&
