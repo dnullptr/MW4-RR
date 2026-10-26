@@ -100,4 +100,46 @@ int main() {
     layouts.Observe(cl, 1, &replacement);
     assert(layouts.Get(cl, a.Get(), state) && state == D3D12_RESOURCE_STATE_COPY_SOURCE);
     assert(layouts.GetUnaliased(cl, a.Get(), state) && state == D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    // Status, for SR replacement: an input no barrier on the list named keeps the state it
+    // entered the list with; any other unknown state stays untracked.
+    using Seen = rrsparsecopy::Layouts::Seen;
+    Resource c, d;
+    rrsparsecopy::Layouts status;
+    auto list = reinterpret_cast<ID3D12GraphicsCommandList *>(2);
+    assert(status.Status(list, c.Get(), state) == Seen::Untouched); // no barrier yet
+    auto pixel = rrsparsecopy::Transition(c.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    status.Observe(list, 1, &pixel);
+    assert(status.Status(list, c.Get(), state) == Seen::Known &&
+           state == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    assert(status.Status(list, d.Get(), state) == Seen::Untouched);
+    auto plane = rrsparsecopy::Transition(d.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
+    plane.Transition.Subresource = 0;
+    status.Observe(list, 1, &plane);
+    assert(status.Status(list, d.Get(), state) == Seen::Untracked);
+    assert(!status.Get(list, d.Get(), state));
+    plane.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    status.Observe(list, 1, &plane);
+    assert(status.Status(list, d.Get(), state) == Seen::Known && state == read);
+    pixel.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+    status.Observe(list, 1, &pixel);
+    assert(status.Status(list, c.Get(), state) == Seen::Untracked);
+    pixel.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    status.Observe(list, 1, &pixel);
+    c.identity = 0; // a new resource at the same address
+    assert(status.Status(list, c.Get(), state) == Seen::Untracked);
+    // Barriers the tracker could not see (enhanced barriers, an observer failure) leave
+    // nothing untouched on that list until it is reset.
+    status.Lose(list);
+    assert(status.Status(list, d.Get(), state) == Seen::Untracked);
+    assert(status.Status(list, untouched.Get(), state) == Seen::Untracked);
+    status.Observe(list, 1, &plane);
+    assert(status.Get(list, d.Get(), state) && state == read); // Get tracks on as before
+    assert(status.Status(list, d.Get(), state) == Seen::Untracked);
+    status.Reset(list);
+    assert(status.Status(list, d.Get(), state) == Seen::Untouched);
+    status.Observe(list, 4097, &plane);
+    assert(status.Status(list, d.Get(), state) == Seen::Untracked);
+    assert(status.Status(nullptr, d.Get(), state) == Seen::Untracked);
 }

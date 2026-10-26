@@ -132,7 +132,7 @@ static void FrameBarriers(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RES
     try {
         SparseLayouts().Observe(cl, n, b);
     } catch (...) {
-        SparseLayouts().Reset(cl);
+        SparseLayouts().Lose(cl);
         SparseFailure("Resource-state observation failed");
     }
 }
@@ -162,7 +162,7 @@ static rrbuffer::Inspector &AlbedoInspector() {
         v->on_barriers = &FrameBarriers;
         v->on_unknown_states = [](ID3D12GraphicsCommandList *cl) {
             LiveRR().TransparencyProducerUnknown(cl);
-            SparseLayouts().Reset(cl);
+            SparseLayouts().Lose(cl);
         };
         v->on_execute = &FrameSubmit;
         v->on_execute_end = &FrameSubmitEnd;
@@ -195,6 +195,10 @@ static void SrBoundary(ID3D12GraphicsCommandList *cl, rrtrace::Kind kind,
 }
 static bool SrReplacement(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Parameter *p,
                           NVSDK_NGX_Result &result) {
+    if (rrtrace::Probe::ForeignBeneath()) {
+        rrsr::Note(rrsr::Foreign);
+        return false;
+    }
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
     const bool replaced = LiveRR().TryReplaceSR(
         cl, p, rrtrace::Probe::CurrentCall(), rrtrace::Probe::CurrentRuntime(),

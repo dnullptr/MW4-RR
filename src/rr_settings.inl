@@ -16,6 +16,7 @@ static bool &requested_tolerate = preferences.tolerate_isolated;
 static bool &requested_hit = preferences.hit;
 static bool &requested_weapon_depth = preferences.weapon_depth;
 static bool &requested_water = preferences.water;
+static bool &requested_replace_sr = preferences.replace_sr;
 static constexpr const char *SettingsSection = "MW4RayReconstruction";
 static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "Enabled", requested_rr);
@@ -27,6 +28,7 @@ static void SaveToggles() {
     reshade::set_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::set_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::set_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
+    reshade::set_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
@@ -39,6 +41,7 @@ static void ApplyEnabled(bool allowed) {
     LiveRR().SetTransparencyEnabled(requested_glass);
     LiveRR().SetTransparencyBlendEnabled(requested_blend);
     LiveRR().SetSpecularHitEnabled(requested_hit);
+    LiveRR().SetReplaceSR(requested_replace_sr);
     AlbedoInspector().observe_transitions = requested_glass;
     LiveRR().SetTolerateIsolated(requested_tolerate);
     rrwater::Settings water;
@@ -63,6 +66,7 @@ static void LoadSettings() {
     reshade::get_config_value(nullptr, SettingsSection, "SpecularHitDistance", requested_hit);
     reshade::get_config_value(nullptr, SettingsSection, "WeaponDepth", requested_weapon_depth);
     reshade::get_config_value(nullptr, SettingsSection, "WaterResponsivity", requested_water);
+    reshade::get_config_value(nullptr, SettingsSection, "ReplaceNativeSR", requested_replace_sr);
     reshade::get_config_value(nullptr, SettingsSection, "Preset", preset);
     if (!LiveRR().RequestPreset(preset))
         LiveRR().RequestPreset(6);
@@ -196,6 +200,22 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                                              : "waiting");
         ImGui::TextWrapped("Tells RR to lean on the current frame on running water, which it "
                            "otherwise blurs. Supported on RR preset F only.");
+        ImGui::Unindent();
+    }
+    changed |= ImGui::Checkbox("Replace the game's DLSS upscaling", &requested_replace_sr);
+    {
+        ImGui::Indent();
+        ImGui::TextWrapped("On, RR takes the place of the game's DLSS Super Resolution pass when "
+                           "it can, which saves that pass's GPU time. A frame RR rejects then "
+                           "shows a softer upscale for a few frames. Off, the game's pass always "
+                           "runs and RR draws over it. The path in use is shown below.");
+        if (requested_replace_sr && rrtrace::Probe::ForeignBeneath())
+            ImGui::TextWrapped("Kept: %s hooks the game's DLSS call and needs it (DLSS5 NR "
+                               "takes its depth and motion from it).",
+                               rrtrace::Probe::ForeignOwner());
+        else if (LiveRR().ReplaceSRPaused())
+            ImGui::TextWrapped("Paused: RR refused several replacement frames in a row (see "
+                               "ReShade.log). Turn the setting off and on to retry.");
         ImGui::Unindent();
     }
     ImGui::Separator();

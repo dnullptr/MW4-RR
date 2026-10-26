@@ -32,13 +32,16 @@ class Layouts {
         D3D12_RESOURCE_STATES layout{};
         UINT64 identity{};
         bool aliased{}, named{}; // named: by a barrier naming this resource
+        bool untracked{};        // a split or subresource transition: state not known
     };
     struct Recording {
         std::unordered_map<ID3D12Resource *, State> states;
         bool capped{};
+        bool lossy{}; // some barriers on this list were not recorded (Status only)
     };
     std::mutex mutex;
     std::unordered_map<ID3D12GraphicsCommandList *, Recording> lists;
+    bool overflowed{}; // a list was not recorded because 256 were already tracked
     static UINT64 Identity(ID3D12Resource *r, bool assign) {
         UINT64 value{};
         UINT size = sizeof(value);
@@ -63,14 +66,22 @@ class Layouts {
         std::lock_guard lock(mutex);
         lists.erase(cl);
     }
+    // cl's states are unknown from here, as after Reset, and Status never calls a resource
+    // on cl untouched until cl is reset.
+    void Lose(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        LoseLocked(cl);
+    }
     void Observe(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
         std::lock_guard lock(mutex);
         if (!cl || n > 4096 || (n && !b)) {
-            lists.erase(cl);
+            LoseLocked(cl);
             return;
         }
-        if (!lists.contains(cl) && lists.size() >= 256)
+        if (!lists.contains(cl) && lists.size() >= 256) {
+            overflowed = true;
             return;
+        }
         auto &l = lists[cl];
         if (l.capped)
             return;
@@ -97,7 +108,19 @@ class Layouts {
                     continue;
                 if (b[i].Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
                     t.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
-                    l.states.erase(t.pResource);
+                    // Kept as named but untracked, so Seen never calls it untouched.
+                    if (l.states.size() >= 4096 && !l.states.contains(t.pResource)) {
+                        l.states.clear();
+                        l.capped = true;
+                        return;
+                    }
+                    const auto id = Identity(t.pResource, true);
+                    if (id)
+                        l.states[t.pResource] = {{}, id, false, false, true};
+                    else {
+                        l.states.erase(t.pResource);
+                        l.lossy = true;
+                    }
                     continue;
                 }
                 if (l.states.size() >= 4096 && !l.states.contains(t.pResource)) {
@@ -108,18 +131,31 @@ class Layouts {
                 const auto id = Identity(t.pResource, true);
                 if (id)
                     l.states[t.pResource] = {t.StateAfter, id};
-                else
+                else {
                     l.states.erase(t.pResource);
+                    l.lossy = true;
+                }
             }
         }
     }
   private:
+    void LoseLocked(ID3D12GraphicsCommandList *cl) {
+        if (!cl)
+            return;
+        lists.erase(cl);
+        if (lists.size() >= 256) {
+            overflowed = true;
+            return;
+        }
+        lists[cl].lossy = true;
+    }
     const State *Find(ID3D12GraphicsCommandList *cl, ID3D12Resource *r) { // mutex held
         auto l = lists.find(cl);
         if (!r || l == lists.end() || l->second.capped)
             return nullptr;
         auto at = l->second.states.find(r);
-        if (at == l->second.states.end() || Identity(r, false) != at->second.identity)
+        if (at == l->second.states.end() || at->second.untracked ||
+            Identity(r, false) != at->second.identity)
             return nullptr;
         return &at->second;
     }
@@ -155,6 +191,28 @@ class Layouts {
         value = at->layout;
         alias = at->named ? Alias::Named : at->aliased ? Alias::Any : Alias::None;
         return true;
+    }
+    // Known: its last transition on cl is tracked (Get). Untouched: cl's barriers were all
+    // recorded and none named r since cl's reset, so r keeps the state it entered cl with.
+    // Untracked: anything else (split or subresource transition, capped or unrecorded list,
+    // a new resource at the same address).
+    enum class Seen { Known, Untouched, Untracked };
+    Seen Status(ID3D12GraphicsCommandList *cl, ID3D12Resource *r, D3D12_RESOURCE_STATES &value) {
+        std::lock_guard lock(mutex);
+        if (!cl || !r)
+            return Seen::Untracked;
+        auto l = lists.find(cl);
+        if (l == lists.end())
+            return overflowed ? Seen::Untracked : Seen::Untouched;
+        if (l->second.capped || l->second.lossy)
+            return Seen::Untracked;
+        auto at = l->second.states.find(r);
+        if (at == l->second.states.end())
+            return Seen::Untouched;
+        if (at->second.untracked || Identity(r, false) != at->second.identity)
+            return Seen::Untracked;
+        value = at->second.layout;
+        return Seen::Known;
     }
     // Fixture simulates allocation lifetime rollover at the same opaque address.
     static void RetireIdentityForTest(ID3D12Resource *r) {

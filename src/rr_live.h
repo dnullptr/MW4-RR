@@ -89,6 +89,9 @@ class Controller {
                                                      "until it fits, retried every second";
         Log(line.c_str());
     }
+    bool replace_sr = true;      // skip the game's SR when RR can take its place (ReplaceNativeSR)
+    unsigned replace_refusals{}; // replacement frames RR refused in a row
+    bool replace_paused{};       // after 3 refusals, until the setting changes
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
@@ -867,6 +870,20 @@ class Controller {
         std::lock_guard lock(mutex);
         return enabled;
     }
+    // Native SR history is reset when its evaluations resume (rrtrace::Probe).
+    // Changing the setting also clears a pause after refused replacement frames.
+    void SetReplaceSR(bool value) {
+        std::lock_guard lock(mutex);
+        if (replace_sr == value)
+            return;
+        replace_sr = value;
+        replace_paused = false;
+        replace_refusals = 0;
+    }
+    bool ReplaceSRPaused() {
+        std::lock_guard lock(mutex);
+        return replace_sr && replace_paused;
+    }
     void SetEnabled(bool value) {
         std::lock_guard lock(mutex);
         if (enabled == value)
@@ -1157,6 +1174,9 @@ class Controller {
             return;
         }
         try {
+            // A refused call must not leave an earlier call's list and states to match.
+            s->pending_sr = false;
+            s->states = {};
             Require(safe && LightingValid(*s),
                     "RR SR rejected: lighting route or pipeline revision unproven");
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
@@ -1204,32 +1224,66 @@ class Controller {
                       rrtrace::SlCall scope, HMODULE mod, UINT64 epoch, bool safe,
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
+        // Each refusal names itself for the health line (rrsr::counters).
+        const auto skip = [this](unsigned why) {
+            rrsr::Note(why);
+            if (why != rrsr::Rejected)
+                replace_refusals = 0; // an SR call between refusals: not in a row
+            return false;
+        };
+        if (!replace_sr || replace_paused)
+            return skip(rrsr::Off);
         if (!enabled)
-            return false;
+            return skip(rrsr::Disabled);
         if (failed || retired)
-            return false;
+            return skip(rrsr::Failed);
         if (NeedsReconfigure())
-            return false;
+            return skip(rrsr::Reconfigure);
         if (!safe)
-            return false;
+            return skip(rrsr::Unsafe);
         if (!scope.valid)
-            return false;
+            return skip(rrsr::Scope);
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
         auto *s = Match(scope);
         if (!s || !s->pending_sr)
-            return false;
+            return skip(rrsr::Scope);
         if (!native || s->sr.Get() != native.Get())
-            return false;
+            return skip(rrsr::List);
         rrsr::StateProof proof;
+        bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
-            proof.known[i] = layouts.Get(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            const auto seen = layouts.Status(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            proof.known[i] = seen == rrsparsecopy::Layouts::Seen::Known;
+            untracked |= seen == rrsparsecopy::Layouts::Seen::Untracked;
         }
-        if (!rrsr::Eligible(proof))
-            return false;
+        // Only an input no barrier on this list named may take the contract state: one whose
+        // transition was split, per subresource or unrecorded has no state RR can start from.
+        const bool eligible = !untracked && rrsr::Eligible(proof);
+        if (untracked)
+            return skip(rrsr::Untracked);
+        if (!eligible)
+            return skip(rrsr::Ineligible);
+        // An input the list never named stays unknown: AfterSR takes its contract state.
         for (unsigned i = 0; i < 4; ++i)
-            s->states[i] = {proof.states[i], true, true};
-        return AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true);
+            if (proof.known[i])
+                s->states[i] = {proof.states[i], true, true};
+        if (!AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true)) {
+            // Waiting for GPU memory is no refusal: native SR upscales the frame meanwhile.
+            if (memory_retry_after)
+                return skip(rrsr::Memory);
+            // A refused frame loses RR (native SR runs, AfterSR does not run again), so a
+            // check that keeps refusing pauses replacement until the setting changes.
+            if (++replace_refusals == 3) {
+                replace_paused = true;
+                Log("SR replacement off: RR refused 3 replacement frames in a row (reason "
+                    "above); the game's SR runs until the setting is turned off and on");
+            }
+            return skip(rrsr::Rejected);
+        }
+        replace_refusals = 0;
+        rrsr::Note(rrsr::None);
+        return true;
     }
     bool AfterSR(ID3D12GraphicsCommandList *public_cl, const NVSDK_NGX_Parameter *p,
                  rrtrace::SlCall scope, NVSDK_NGX_Result result, HMODULE mod, UINT64 epoch,
@@ -1310,11 +1364,7 @@ class Controller {
             std::array<D3D12_RESOURCE_STATES, 3> states;
             for (unsigned i = 0; i < 3; ++i) {
                 auto &v = s->states[i];
-                constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                Require(!v.known || (v.complete &&
-                                     (v.state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) &&
-                                     !(v.state & ~read)),
+                Require(!v.known || (v.complete && rrsr::ReadOnly(v.state)),
                         "live post-SR observed input state conflicts");
                 states[i] = v.known ? v.state : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             }

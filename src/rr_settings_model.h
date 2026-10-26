@@ -9,6 +9,7 @@ struct Preferences {
     bool hit = true;
     bool weapon_depth = true; // the weapon kept in front with its own depth (rr_weapon_depth.h)
     bool water = true;        // water responsivity mask (rr_water.h), preset F only
+    bool replace_sr = true;   // RR takes the place of the game's SR when it can
     unsigned preset = 6;
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame
 };
