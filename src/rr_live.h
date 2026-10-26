@@ -314,6 +314,23 @@ class Controller {
                     "live device generation was not retired before device change");
             return;
         }
+        const UINT64 before = persistent.bytes;
+        try {
+            InitializeLocked(d);
+        } catch (...) {
+            // Under GPU memory pressure, for one: back to uninitialized, so a later frame
+            // initializes from the start.
+            history.Reset();
+            zero.Reset();
+            persistent.Unwind(budget, before);
+            init_list.Reset();
+            init_allocator.Reset();
+            fence.Reset();
+            pipelines = {};
+            throw;
+        }
+    }
+    void InitializeLocked(ID3D12Device *d) {
         pipelines.Initialize(d);
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -977,23 +994,26 @@ class Controller {
             }
             ComPtr<ID3D12Device> d;
             Check(cl->GetDevice(IID_PPV_ARGS(&d)), "live prepass device missing");
-            Initialize(d.Get());
             const auto guide_extent = textures[3]->GetDesc();
             Require(guide_extent.Width <= UINT_MAX, "live prepass guide extent unsupported");
             auto &s = *free;
-            // Only a new slot allocates. Under GPU memory pressure (another add-on's VRAM, for
-            // one) Prepare leaves it unprepared, this frame stays native and a later one retries.
-            if (!s.gpu.heap && MemoryWait()) {
+            // Only a new slot (or a new RR) allocates. Under GPU memory pressure (another
+            // add-on's VRAM, for one) Initialize and Prepare leave nothing behind, this frame
+            // stays native and a later one retries.
+            const bool fresh = !initialized || !s.gpu.heap;
+            if (fresh && MemoryWait()) {
                 status.Fallback(generation, GetTickCount64());
                 policy.Reject();
                 return false;
             }
             try {
+                Initialize(d.Get());
                 if (!s.gpu.heap && !ReservePool(slots.size(), nullptr, nullptr,
                                                 UINT(guide_extent.Width), guide_extent.Height))
                     throw rrprivate::AllocationDeferred();
                 s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
-                memory_logged = false;
+                if (fresh)
+                    memory_logged = false;
             } catch (const rrprivate::AllocationDeferred &) {
                 MemoryDeferred("RR frame slot");
                 status.Fallback(generation, GetTickCount64());
@@ -1319,6 +1339,8 @@ class Controller {
                 if (sr_allocates && !ReservePool(slots.size(), &o, &native_depth))
                     throw rrprivate::AllocationDeferred();
                 s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+                if (sr_allocates)
+                    memory_logged = false;
             } catch (const rrprivate::AllocationDeferred &) {
                 MemoryDeferred("RR output");
                 policy.Reject();

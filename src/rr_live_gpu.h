@@ -383,6 +383,10 @@ struct GpuFrame {
             header_map = nullptr;
             stats.Reset();
             readback.Reset();
+            sources = {};
+            constants = {};
+            offsets = {};
+            w = h = 0;
             Unwind(b, before);
             throw;
         }
