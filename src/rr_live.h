@@ -91,6 +91,7 @@ class Controller {
     }
     bool replace_sr = true;      // skip the game's SR when RR can take its place (ReplaceNativeSR)
     unsigned replace_refusals{}; // replacement frames RR refused in a row
+    bool replace_paused{};       // after 3 refusals, until the setting changes
     struct Trail {
         struct Entry {
             ID3D12GraphicsCommandList *list{};
@@ -886,10 +887,18 @@ class Controller {
         return enabled;
     }
     // Native SR history is reset when its evaluations resume (rrtrace::Probe).
+    // Changing the setting also clears a pause after refused replacement frames.
     void SetReplaceSR(bool value) {
         std::lock_guard lock(mutex);
+        if (replace_sr == value)
+            return;
         replace_sr = value;
+        replace_paused = false;
         replace_refusals = 0;
+    }
+    bool ReplaceSRPaused() {
+        std::lock_guard lock(mutex);
+        return replace_sr && replace_paused;
     }
     void SetEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -1181,6 +1190,9 @@ class Controller {
             return;
         }
         try {
+            // A refused call must not leave an earlier call's list and states to match.
+            s->pending_sr = false;
+            s->states = {};
             Require(safe && LightingValid(*s),
                     "RR SR rejected: lighting route or pipeline revision unproven");
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
@@ -1233,11 +1245,13 @@ class Controller {
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
         // Each refusal names itself for the health line (rrsr::counters).
-        const auto skip = [](unsigned why) {
+        const auto skip = [this](unsigned why) {
             rrsr::Note(why);
+            if (why != rrsr::Rejected)
+                replace_refusals = 0; // an SR call between refusals: not in a row
             return false;
         };
-        if (!replace_sr)
+        if (!replace_sr || replace_paused)
             return skip(rrsr::Off);
         if (!enabled)
             return skip(rrsr::Disabled);
@@ -1256,25 +1270,32 @@ class Controller {
         if (!native || s->sr.Get() != native.Get())
             return skip(rrsr::List);
         rrsr::StateProof proof;
+        bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
-            proof.known[i] = layouts.Get(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            const auto seen = layouts.Status(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            proof.known[i] = seen == rrsparsecopy::Layouts::Seen::Known;
+            untracked |= seen == rrsparsecopy::Layouts::Seen::Untracked;
         }
-        const bool eligible = rrsr::Eligible(proof);
+        // Only an input no barrier on this list named may take the contract state: one whose
+        // transition was split, per subresource or unrecorded has no state RR can start from.
+        const bool eligible = !untracked && rrsr::Eligible(proof);
         LogTrailLocked(*s, native.Get(), proof, eligible);
+        if (untracked)
+            return skip(rrsr::Untracked);
         if (!eligible)
             return skip(rrsr::Ineligible);
-        // An input the list never transitioned stays unknown: AfterSR takes its contract state.
+        // An input the list never named stays unknown: AfterSR takes its contract state.
         for (unsigned i = 0; i < 4; ++i)
             if (proof.known[i])
                 s->states[i] = {proof.states[i], true, true};
         if (!AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true)) {
             // A refused frame loses RR (native SR runs, AfterSR does not run again), so a
-            // check that keeps refusing turns replacement off until a setting changes.
+            // check that keeps refusing pauses replacement until the setting changes.
             if (++replace_refusals == 3) {
-                replace_sr = false;
+                replace_paused = true;
                 Log("SR replacement off: RR refused 3 replacement frames in a row (reason "
-                    "above); the game's SR runs until a setting changes");
+                    "above); the game's SR runs until the setting is turned off and on");
             }
             return skip(rrsr::Rejected);
         }
@@ -1302,7 +1323,7 @@ class Controller {
         if (same && trail.logged < 3) {
             ++trail.logged;
             static constexpr const char *names[] = {"color", "depth", "motion", "output"};
-            char line[2048];
+            char line[2048] = {};
             size_t at = 0;
             const auto append = [&](const char *format, auto... values) {
                 if (at < sizeof(line)) {

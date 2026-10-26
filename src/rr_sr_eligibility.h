@@ -46,12 +46,13 @@ enum Skip : unsigned {
     Callback,    // the game passed a progress callback
     Creation,    // the SR feature's creation was not seen
     Reset,       // the Reset parameter cannot be written
+    Untracked,   // an input's transition on the SR list was split, per plane or unrecorded
     Count
 };
 inline const char *SkipText(unsigned why) {
-    static constexpr const char *text[] = {"none",     "setting",  "rrOff", "failed", "reconfigure",
-                                           "unsafe",   "noFrame",  "list",  "state",  "rrChecks",
-                                           "callback", "creation", "reset"};
+    static constexpr const char *text[] = {
+        "none", "setting", "rrOff",    "failed",   "reconfigure", "unsafe", "noFrame",
+        "list", "state",   "rrChecks", "callback", "creation",    "reset",  "untracked"};
     return why < Count ? text[why] : "unknown";
 }
 // Lock-free: written on the evaluate thread, read by the health line.

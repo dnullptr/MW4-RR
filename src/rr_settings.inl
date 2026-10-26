@@ -209,6 +209,9 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                            "it can, which saves that pass's GPU time. A frame RR rejects then "
                            "shows a softer upscale for a few frames. Off, the game's pass always "
                            "runs and RR draws over it. The path in use is shown below.");
+        if (LiveRR().ReplaceSRPaused())
+            ImGui::TextWrapped("Paused: RR refused several replacement frames in a row (see "
+                               "ReShade.log). Turn the setting off and on to retry.");
         ImGui::Unindent();
     }
     ImGui::Separator();
