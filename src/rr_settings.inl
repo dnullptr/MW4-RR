@@ -152,7 +152,7 @@ static void StatusRow(const char *name, rrstatus::State value) {
 static void DrawSettings(reshade::api::effect_runtime *) {
     std::lock_guard lock(settings_mutex);
     LoadSettings();
-    ImGui::TextUnformatted("MW4 Ray Reconstruction — Beta 1");
+    ImGui::TextUnformatted("MW4 Ray Reconstruction — Beta 2");
     bool changed = ImGui::Checkbox("Ray reconstruction (F8)", &requested_rr);
     changed |= ImGui::Checkbox("Transparency guide (F9)", &requested_glass);
     changed |= ImGui::Checkbox("Subsurface Scattering guide (F11)", &requested_sss);
@@ -179,11 +179,11 @@ static void DrawSettings(reshade::api::effect_runtime *) {
                     : !LiveRR().Running() ? "waiting for RR"
                                           : "waiting");
         ImGui::TextWrapped("The game draws the weapon and hands with their own camera, so with "
-                           "the game's depth RR sees them as one flat card. On, RR gets linear "
-                           "depth in which they keep their own depth steps, still in front of "
-                           "everything else; the rest of the scene keeps its distances, with the "
-                           "sky very far instead of infinitely far. Changing it restarts RR, like "
-                           "a preset change.");
+                           "the game's depth RR sees them as one flat card. On, RR gets a copy of "
+                           "the game's depth in which they keep their own depth steps, still in "
+                           "front of everything else; the rest of the scene keeps the game's "
+                           "depth unchanged, so add-ons such as DLSS5 NR keep working. Changing "
+                           "it restarts RR, like a preset change.");
         ImGui::Unindent();
     }
     changed |= ImGui::Checkbox("Water responsivity mask", &requested_water);
@@ -208,7 +208,8 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         ImGui::TextWrapped("On, RR takes the place of the game's DLSS Super Resolution pass when "
                            "it can, which saves that pass's GPU time. A frame RR rejects then "
                            "shows a softer upscale for a few frames. Off, the game's pass always "
-                           "runs and RR draws over it. The path in use is shown below.");
+                           "runs and RR draws over it. The path in use is shown below. Add-ons such "
+                           "as DLSS5 NR follow RR's call when this is on.");
         if (LiveRR().ReplaceSRPaused())
             ImGui::TextWrapped("Paused: RR refused several replacement frames in a row (see "
                                "ReShade.log). Turn the setting off and on to retry.");

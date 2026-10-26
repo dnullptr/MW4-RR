@@ -2,7 +2,17 @@
 
 A Windows x64 ReShade addon integrating NVIDIA DLSS Ray Reconstruction into the MW4 campaign's Direct3D 12 rendering path. Includes Transparency and Subsurface Scattering guides, live RR preset selection, and a ReShade status panel.
 
-**Beta 1** is the initial public beta. See the requirements and limitations below before installing or building.
+**Beta 2** is the current public beta. It is a beta mostly in name: in the author's own playtesting, roughly 98% of the noise seen before is gone, but some issues may not have been caught yet. That is a personal impression from gameplay, not a measurement, and results vary by scene, hardware, and settings. See the requirements and limitations below before installing or building.
+
+### What's new in Beta 2
+
+- Improved Subsurface Scattering lighting: skin and other subsurface materials use the game's native temporal lighting history where it exists, and a spatial estimate elsewhere.
+- Transparency albedo blend: texture seen through glass, particles, and refraction stays steadier while moving.
+- Specular hit distance: RR receives the game's specular ray hit distances.
+- Weapon depth: the weapon and hands keep their own depth instead of appearing to RR as a flat card.
+- Water responsivity mask (preset F): running water is less smeared.
+- Compatibility with third-party DLSS add-ons such as DLSS5 NR, together with Ray Reconstruction, frame generation, and Super Resolution replacement. Pre-rendered cutscenes are no longer filtered through such an add-on.
+- RR keeps running under heavy GPU memory use: a frame that cannot get memory is skipped and retried instead of turning RR off.
 
 ## Campaign only - anti-cheat warning
 
@@ -38,6 +48,7 @@ The panel also has these checkboxes, all on by default and saved in `ReShade.ini
 
 - Specular hit distance (`SpecularHitDistance`): gives RR the game's specular ray hit distances.
 - Weapon depth (`WeaponDepth`): gives RR a depth in which the weapon and hands keep their own depth, still in front of the scene, instead of a flat card at the near plane. World depth stays the game's own, in the game's reverse-Z format, so third-party add-ons such as DLSS5 NR keep working. Changing it restarts RR, like a preset change.
+- Replace the game's DLSS upscaling (`ReplaceNativeSR`): RR takes the place of the game's DLSS Super Resolution pass when it can. See Architecture below.
 - Water responsivity mask (`WaterResponsivity`): tells RR to favor the current frame on running water, which it otherwise blurs. It applies on preset F only.
 
 With the Subsurface Scattering Guide on, lighting on skin and other subsurface materials uses the game's native temporal history where it exists, and a spatial estimate elsewhere. The panel reports this as "SSS lighting".
@@ -128,7 +139,8 @@ Changes to shaders, descriptor layouts, transitions, synchronization, or tempora
 - The campaign configuration must be read-only. VRS can be enabled or disabled.
 - Residual noise and blotches remain on some Subsurface Scattering materials. Transparency coverage and image quality vary by scene.
 - Compatibility relies on recognized game shaders and layouts; game updates can require integration changes.
-- Unsupported inputs or resource allocation failures can prevent RR or a guide from being used.
+- Unsupported inputs or resource allocation failures can prevent RR or a guide from being used for a frame. Under heavy GPU memory use, optional guides can wait until memory allows them.
+- Third-party DLSS add-ons are supported only as far as they have been tested; DLSS5 NR is the one tested. Other add-ons that hook DLSS may behave differently.
 - If the game shuts down and reinitializes NGX, the addon retires its integration until the game is restarted.
 - Performance overhead and the proportion of frames that replace native Super Resolution have not yet been measured in gameplay.
 
