@@ -318,6 +318,12 @@ struct GpuFrame {
         bytes += info.SizeInBytes;
         return r;
     }
+    // Gives back what this frame allocated since `before` (bytes), after a failed preparation
+    // has dropped those resources: nothing references them yet.
+    void Unwind(Budget &b, UINT64 before) {
+        b.bytes -= bytes - before;
+        bytes = before;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(const Pipelines &p, UINT at) const {
         return {heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(at) * p.stride};
     }
@@ -364,6 +370,24 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
+        const UINT64 before = bytes;
+        try {
+            Allocations(p, b);
+        } catch (...) {
+            // A new slot that cannot be prepared (GPU memory pressure) is left unprepared, so
+            // a later frame prepares it from the start.
+            heap.Reset();
+            guides = {};
+            specular_hit.Reset();
+            header.Reset();
+            header_map = nullptr;
+            stats.Reset();
+            readback.Reset();
+            Unwind(b, before);
+            throw;
+        }
+    }
+    void Allocations(Pipelines &p, Budget &b) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, HeapSize,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
@@ -517,7 +541,7 @@ struct GpuFrame {
         if (!probability) {
             auto desc = rrprivate::Buffer(rrvrrt::Bytes(w, h));
             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            probability = Allocate(p, b, desc);
+            probability = Allocate(p, b, desc); // Nothing else allocated: no unwind needed.
         }
         if (!probability_heap) {
             D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
@@ -576,6 +600,26 @@ struct GpuFrame {
                    const std::array<ComPtr<ID3D12Resource>, 4> &in) {
         sr = in;
         use_depth = sr[1]->GetDesc().Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        const UINT64 before = bytes;
+        const bool had_output = bool(rr_output), had_depth = bool(depth);
+        try {
+            SRAllocations(p, b, o);
+        } catch (...) {
+            // Under GPU memory pressure: drop what this call allocated, so a later frame
+            // starts over (nothing references it yet).
+            if (!had_output) {
+                rr_output.Reset();
+                ow = oh = 0;
+            }
+            if (!had_depth) {
+                depth_buffer.Reset();
+                depth.Reset();
+            }
+            Unwind(b, before);
+            throw;
+        }
+    }
+    void SRAllocations(Pipelines &p, Budget &b, const rreval::Options &o) {
         if (rr_output)
             Require(ow == o.out_width && oh == o.out_height,
                     "live output generation was not retired before size change");

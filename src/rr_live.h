@@ -68,7 +68,27 @@ class Controller {
     ComPtr<ID3D12CommandQueue> last_queue;
     UINT64 signaled{};
     bool enabled{}, failed{}, initialized{}, history_queued{}, retired{};
-    bool slot_memory_logged{}; // a frame slot is waiting for GPU memory (the prepass)
+    // A new RR allocation found no GPU memory: native frames until memory_retry_after (ms), and
+    // one log line per wait.
+    ULONGLONG memory_retry_after{};
+    bool memory_logged{};
+    bool MemoryWait() {
+        if (!memory_retry_after)
+            return false;
+        if (GetTickCount64() < memory_retry_after)
+            return true;
+        memory_retry_after = 0;
+        return false;
+    }
+    void MemoryDeferred(const char *what) {
+        memory_retry_after = GetTickCount64() + 1000;
+        if (memory_logged)
+            return;
+        memory_logged = true;
+        const std::string line = std::string(what) + " waiting for GPU memory; native frames "
+                                                     "until it fits, retried every second";
+        Log(line.c_str());
+    }
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
@@ -959,26 +979,27 @@ class Controller {
             Check(cl->GetDevice(IID_PPV_ARGS(&d)), "live prepass device missing");
             Initialize(d.Get());
             const auto guide_extent = textures[3]->GetDesc();
-            Require(
-                guide_extent.Width <= UINT_MAX &&
-                    (free->gpu.heap || ReservePool(slots.size(), nullptr, nullptr,
-                                                   UINT(guide_extent.Width), guide_extent.Height)),
-                "live prepass pool exceeds available GPU budget");
+            Require(guide_extent.Width <= UINT_MAX, "live prepass guide extent unsupported");
             auto &s = *free;
-            try {
-                s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
-            } catch (const rrprivate::AllocationDeferred &) {
-                // Only a new slot allocates. Under GPU memory pressure (another add-on's
-                // VRAM, for one) this frame stays native and a later frame retries.
-                s.gpu.Release(budget);
-                if (!slot_memory_logged)
-                    Log("RR frame slot waiting for GPU memory; native frames until it fits");
-                slot_memory_logged = true;
+            // Only a new slot allocates. Under GPU memory pressure (another add-on's VRAM, for
+            // one) Prepare leaves it unprepared, this frame stays native and a later one retries.
+            if (!s.gpu.heap && MemoryWait()) {
                 status.Fallback(generation, GetTickCount64());
                 policy.Reject();
                 return false;
             }
-            slot_memory_logged = false;
+            try {
+                if (!s.gpu.heap && !ReservePool(slots.size(), nullptr, nullptr,
+                                                UINT(guide_extent.Width), guide_extent.Height))
+                    throw rrprivate::AllocationDeferred();
+                s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+                memory_logged = false;
+            } catch (const rrprivate::AllocationDeferred &) {
+                MemoryDeferred("RR frame slot");
+                status.Fallback(generation, GetTickCount64());
+                policy.Reject();
+                return false;
+            }
             s.busy = true;
             // A null classification view unless a water test wants it this frame.
             // The guide mode follows it, so every water test waits and fails together.
@@ -1050,6 +1071,8 @@ class Controller {
             }
         if (!match)
             return false;
+        if (!match->gpu.probability && MemoryWait())
+            return false;
         try {
             rrinternal::Scope copies;
             rrcompute::Tracker::Internal state;
@@ -1057,6 +1080,9 @@ class Controller {
             restore.Restore(cl, true);
             match->native_sampling = true;
             return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            MemoryDeferred("RR sampling buffer"); // Allocated before anything is recorded.
+            return false;
         } catch (const std::exception &e) {
             Failure(e.what());
             return false;
@@ -1282,11 +1308,22 @@ class Controller {
                     return false;
                 }
             }
-            if (!s->gpu.rr_output ||
-                (native_depth.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && !s->gpu.depth))
-                Require(ReservePool(slots.size(), &o, &native_depth),
-                        "live frame pool exceeds available GPU budget");
-            s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+            const bool sr_allocates =
+                !s->gpu.rr_output ||
+                (native_depth.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && !s->gpu.depth);
+            if (sr_allocates && MemoryWait()) {
+                policy.Reject();
+                return false;
+            }
+            try {
+                if (sr_allocates && !ReservePool(slots.size(), &o, &native_depth))
+                    throw rrprivate::AllocationDeferred();
+                s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+            } catch (const rrprivate::AllocationDeferred &) {
+                MemoryDeferred("RR output");
+                policy.Reject();
+                return false;
+            }
             Require(next_serial < UINT_MAX, "live serial overflow");
             s->serial = ++next_serial;
             const unsigned availability = !sss_enabled               ? 0
