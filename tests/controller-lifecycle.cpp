@@ -253,9 +253,9 @@ struct ControllerCpuTest {
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, refused.text);
         assert(!c.WeaponDepthWanted() && c.NeedsReconfigure());
         assert(c.WeaponDepthState() == State::Refused);
-        const std::string refusal = "Weapon depth: RR did not accept linear depth (0xBAD00005 "
+        const std::string refusal = "Weapon depth: RR failed with the weapon depth copy (0xBAD00005 "
                                     "FAIL_InvalidParameter); off until the setting changes, RR "
-                                    "runs with hardware depth\n";
+                                    "runs without it\n";
         assert(logged == refusal);
         c.HoldWeaponDepth(Controller::WeaponHold::Refused, rrweapondepth::changes, "threw");
         assert(logged == refusal); // Frames still in flight repeat the hold; logged once.

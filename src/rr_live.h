@@ -341,12 +341,12 @@ class Controller {
         // UseTest already logged a memory failure.
         if (why == WeaponHold::Projection)
             Log("Weapon depth: the game's projection is not supported; off until "
-                "the setting changes, RR runs with hardware depth");
+                "the setting changes, RR runs without it");
         else if (why == WeaponHold::Refused) {
             char line[200];
             snprintf(line, sizeof(line),
-                     "Weapon depth: RR failed with the weapon depth copy%s%s%s; off until the setting "
-                     "changes, RR runs with hardware depth",
+                     "Weapon depth: RR failed with the weapon depth copy%s%s%s; off until the "
+                     "setting changes, RR runs without it",
                      outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
             Log(line);
         }
