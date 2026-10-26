@@ -1,4 +1,5 @@
 #include "../src/rr_sr_eligibility.h"
+#include "../src/rr_foreign_hook.h"
 #include "../src/rr_spatial_fallback.h"
 #include "../src/rr_status.h"
 #include <cassert>
@@ -67,6 +68,21 @@ int main() {
            !rrsr::ReadOnly(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     assert(std::string(rrsr::SkipText(rrsr::Ineligible)) == "state" &&
            std::string(rrsr::SkipText(rrsr::Count)) == "unknown");
+    // Jumps a hook beneath RR's starts NGX evaluation with (rrforeign::Beneath).
+    {
+        const uint8_t rel[16] = {0xE9, 0x10, 0x00, 0x00, 0x00};
+        assert(rrforeign::JumpTarget(rel, 0x1000) == 0x1015);
+        const uint8_t back[16] = {0xE9, 0xF0, 0xFF, 0xFF, 0xFF};
+        assert(rrforeign::JumpTarget(back, 0x1000) == 0xFF5);
+        const uint8_t indirect[16] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+        assert(rrforeign::JumpTarget(indirect, 0x2000) == 0x2006);
+        const uint8_t absolute[16] = {0x48, 0xB8, 0x88, 0x77, 0x66, 0x55,
+                                      0x44, 0x33, 0x22, 0x11, 0xFF, 0xE0};
+        assert(rrforeign::JumpTarget(absolute, 0) == 0x1122334455667788ull);
+        const uint8_t prologue[16] = {0x48, 0x89, 0x5C, 0x24, 0x08}; // mov [rsp+8], rbx
+        assert(rrforeign::JumpTarget(prologue, 0x1000) == 0);
+        assert(std::string(rrsr::SkipText(rrsr::Foreign)) == "otherHook");
+    }
     q = p;
     q.states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     assert(!rrsr::Eligible(q));

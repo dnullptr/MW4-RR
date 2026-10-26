@@ -47,12 +47,13 @@ enum Skip : unsigned {
     Creation,    // the SR feature's creation was not seen
     Reset,       // the Reset parameter cannot be written
     Untracked,   // an input's transition on the SR list was split, per plane or unrecorded
+    Foreign,     // another add-on hooked DLSS evaluation beneath RR and needs the SR call
     Count
 };
 inline const char *SkipText(unsigned why) {
     static constexpr const char *text[] = {
-        "none", "setting", "rrOff",    "failed",   "reconfigure", "unsafe", "noFrame",
-        "list", "state",   "rrChecks", "callback", "creation",    "reset",  "untracked"};
+        "none",  "setting",  "rrOff",    "failed",   "reconfigure", "unsafe",    "noFrame",  "list",
+        "state", "rrChecks", "callback", "creation", "reset",       "untracked", "otherHook"};
     return why < Count ? text[why] : "unknown";
 }
 // Lock-free: written on the evaluate thread, read by the health line.
