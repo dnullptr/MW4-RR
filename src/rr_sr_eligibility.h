@@ -4,6 +4,10 @@
 #include <atomic>
 #include <cstdint>
 namespace rrsr {
+// With an add-on hooked beneath RR (DLSS5 NR), RR still replaces SR: its output and depth are
+// announced to other add-ons, so that add-on follows RR's DLSS call instead. Off keeps the game's
+// SR call for it.
+inline constexpr bool ReplaceUnderForeignHook = true;
 struct StateProof {
     std::array<bool, 4> known{};
     std::array<D3D12_RESOURCE_STATES, 4> states{};

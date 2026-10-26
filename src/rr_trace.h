@@ -408,8 +408,8 @@ class Probe {
             if (rrforeign::Beneath(eval, module, owner, sizeof(owner)) &&
                 !foreign_beneath.exchange(true)) {
                 strncpy_s(foreign_owner, owner[0] ? owner : "unknown code", _TRUNCATE);
-                Log("DLSS evaluation was hooked before RR by %s; the game's SR pass keeps "
-                    "running so that add-on still sees it",
+                Log("DLSS evaluation was hooked before RR by %s; RR's output and depth are "
+                    "announced to it",
                     foreign_owner);
             }
         }

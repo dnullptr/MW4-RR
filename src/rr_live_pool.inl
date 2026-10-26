@@ -66,6 +66,38 @@ bool ReservePool(size_t count, const rreval::Options *pending = nullptr,
         return false;
     return budget.Reserve(pipelines.device.Get(), required);
 }
+// The pool's other slots, prepared while GPU memory allows (after `self` first prepares), so a
+// deeper frame queue later finds them ready rather than competing with other add-ons' memory
+// (DLSS5 NR's, for one), which would send those frames back to native SR. A shortage or a
+// failure stops it quietly: the rest prepare when first used.
+void ReserveSlots(const Slot &self, const std::array<ComPtr<ID3D12Resource>, 4> &textures,
+                  const std::array<ComPtr<ID3D12Resource>, 2> &cb,
+                  const std::array<UINT64, 2> &offsets) {
+    for (auto &v : slots) {
+        if (&v == &self || v.busy || v.gpu.heap)
+            continue;
+        try {
+            v.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+            v.gpu.Retire(); // keeps no game resource until the slot is used
+        } catch (const std::exception &) {
+            return;
+        }
+    }
+}
+// The same for the slots' output and depth copy, after `self` first allocates its own.
+void ReserveOutputs(const Slot &self, const rreval::Options &o,
+                    const std::array<ComPtr<ID3D12Resource>, 4> &sr_inputs) {
+    for (auto &v : slots) {
+        if (&v == &self || v.busy || !v.gpu.heap || v.gpu.rr_output)
+            continue;
+        try {
+            v.gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+            v.gpu.sr = {};
+        } catch (const std::exception &) {
+            return;
+        }
+    }
+}
 Slot *GrowPool() {
     if (!initialized || slots.size() >= UINT_MAX || !ReservePool(slots.size() + 1))
         return nullptr;

@@ -11,6 +11,7 @@
 #include "rr_sss_mask.h"
 #include "rr_inputs.h"
 #include "rr_internal.h"
+#include "rr_lock.h"
 #include "rr_ngx_api.h"
 #include "rr_ngx_log.h"
 #include "rr_trace.h"
@@ -18,6 +19,8 @@
 #include <atomic>
 #include <mutex>
 #include <deque>
+#include <initializer_list>
+#include <vector>
 namespace rrlive {
 // Private resources remain retained until native recordings retire and every
 // submitted producer and consumer completes on the tracked fence.
@@ -56,7 +59,11 @@ class Controller {
         std::vector<bool> touched;
     };
     static inline thread_local std::vector<Call> submissions;
-    std::recursive_mutex mutex;
+    rrlock::Recursive mutex;
+    // An NGX call into the add-ons beneath RR is running with the lock released (Foreign).
+    bool foreign_call{};
+    // Objects a timed-out initialization left to the GPU: kept for the process.
+    std::vector<ComPtr<IUnknown>> stranded;
     std::deque<Slot> slots{6};
     Pipelines pipelines;
     Budget budget;
@@ -67,7 +74,7 @@ class Controller {
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandQueue> last_queue;
     UINT64 signaled{};
-    bool enabled{}, failed{}, initialized{}, history_queued{}, retired{};
+    bool enabled{}, failed{}, initialized{}, retired{};
     // A new RR allocation found no GPU memory: native frames until memory_retry_after (ms), and
     // one log line per wait.
     ULONGLONG memory_retry_after{};
@@ -153,6 +160,20 @@ class Controller {
     NVSDK_NGX_Handle *feature{};
     rreval::Options key;
     rreval::Api (*resolve)(HMODULE) = &rreval::Api::Load;
+    // A call into NGX, where an add-on beneath RR (DLSS5 NR) may wait for another thread's NGX
+    // call, Frame Generation's, which records barriers RR observes under this lock. The call runs
+    // with every hold released. The slot being recorded stays live (sr_live), so no
+    // reconfiguration, shutdown or slot reuse retires what the call uses, and foreign_call
+    // refuses another SR call meanwhile.
+    template <class F> auto Foreign(F &&f) -> decltype(f()) {
+        struct Flag {
+            bool &v;
+            ~Flag() {
+                v = false;
+            }
+        } flag{foreign_call = true};
+        return rrlock::Released(mutex, f);
+    }
     void Log(const char *s) {
         if (logger)
             logger(s);
@@ -180,7 +201,9 @@ class Controller {
                       budget.Reserve(pipelines.device.Get(), old + n);
             if (ok) {
                 try {
-                    t.texture = persistent.Allocate(pipelines, budget, d);
+                    // Weapon depth is the depth RR hands DLSS: announced like RR's own depth.
+                    t.texture = persistent.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT,
+                                                    nullptr, true);
                     test_reserve += budget.limit - old;
                 } catch (const std::exception &) {
                     budget.limit = old;
@@ -358,6 +381,31 @@ class Controller {
         Check(init_list->Close(), "live init close failed");
         Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
               "live timeline fence failed");
+        // Clear the history on a private queue and wait for it here, not from inside the
+        // game's ExecuteCommandLists: a nested submission there can reach a compute queue, and
+        // another add-on's submit hook (DLSS5 NR's) loses track of the outer submission.
+        ComPtr<ID3D12CommandQueue> setup_queue;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        Check(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&setup_queue)), "live init queue failed");
+        ComPtr<ID3D12Fence> setup_fence;
+        Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&setup_fence)),
+              "live init fence failed");
+        {
+            rrinternal::Scope guard;
+            ID3D12CommandList *setup = init_list.Get();
+            setup_queue->ExecuteCommandLists(1, &setup);
+        }
+        Check(setup_queue->Signal(setup_fence.Get(), 1), "live init signal failed");
+        if (!rrprivate::FencePoint{setup_fence, 1}.Wait(5000)) {
+            // The GPU may still run the clear: what it uses is never released, and RR stays off.
+            for (IUnknown *object : std::initializer_list<IUnknown *>{
+                     history.Get(), zero.Get(), init_list.Get(), init_allocator.Get(),
+                     setup_queue.Get(), setup_fence.Get()})
+                stranded.emplace_back(object);
+            failed = true;
+            throw std::runtime_error("live init unfinished; RR off");
+        }
         initialized = true;
     }
     bool NeedsReconfigure() const {
@@ -401,6 +449,8 @@ class Controller {
     bool Reconfigure() {
         if (!NeedsReconfigure())
             return true;
+        if (foreign_call)
+            return false;
         for (const auto &s : slots)
             if (!rrpreset::CanRetire(
                     s.poisoned, s.pre_live, s.sr_live, s.sss.live,
@@ -460,7 +510,7 @@ class Controller {
         transparency_source.Reset();
         transparency_composition = {};
         CoverageReconfigured();
-        initialized = history_queued = false;
+        initialized = false;
         signaled = 0;
         runtime = nullptr;
         runtime_epoch = 0;
@@ -1029,8 +1079,10 @@ class Controller {
                                                 UINT(guide_extent.Width), guide_extent.Height))
                     throw rrprivate::AllocationDeferred();
                 s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
-                if (fresh)
+                if (fresh) {
                     memory_logged = false;
+                    ReserveSlots(s, textures, cb, offsets);
+                }
             } catch (const rrprivate::AllocationDeferred &) {
                 MemoryDeferred("RR frame slot");
                 status.Fallback(generation, GetTickCount64());
@@ -1233,6 +1285,8 @@ class Controller {
         };
         if (!replace_sr || replace_paused)
             return skip(rrsr::Off);
+        if (foreign_call)
+            return skip(rrsr::Scope);
         if (!enabled)
             return skip(rrsr::Disabled);
         if (failed || retired)
@@ -1249,6 +1303,8 @@ class Controller {
             return skip(rrsr::Scope);
         if (!native || s->sr.Get() != native.Get())
             return skip(rrsr::List);
+        if (!rrsr::ReplaceUnderForeignHook && rrtrace::Probe::ForeignBeneath())
+            return skip(rrsr::Foreign);
         rrsr::StateProof proof;
         bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
@@ -1290,6 +1346,8 @@ class Controller {
                  bool safe, bool replacement = false) {
 
         std::lock_guard lock(mutex);
+        if (foreign_call)
+            return false;
         Slot *s{};
         for (auto &v : slots)
             if (v.pending_sr && v.frame == scope.frame && v.viewport == scope.viewport) {
@@ -1312,6 +1370,15 @@ class Controller {
                     "live original SR failed or scope changed");
             ComPtr<ID3D12Device> pub;
             Check(public_cl->GetDevice(IID_PPV_ARGS(&pub)), "live public device missing");
+            if (rrsr::ReplaceUnderForeignHook && !pipelines.announced &&
+                fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
+                pipelines.announced = pub;
+                Log(pub.Get() != fg::NativeObject<ID3D12Device>(pub.Get()).Get()
+                        ? "RR's output and depth are created through ReShade's device, announced "
+                          "to other add-ons"
+                        : "RR's output and depth are created on the native device: other add-ons "
+                          "are not told of them");
+            }
             if (!Key(s->options, mod, epoch, pub.Get(), scope.viewport)) {
                 QueueReconfigure();
                 return false;
@@ -1389,8 +1456,10 @@ class Controller {
                 if (sr_allocates && !ReservePool(slots.size(), &o, &native_depth))
                     throw rrprivate::AllocationDeferred();
                 s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
-                if (sr_allocates)
+                if (sr_allocates) {
                     memory_logged = false;
+                    ReserveOutputs(*s, o, sr_inputs);
+                }
             } catch (const rrprivate::AllocationDeferred &) {
                 MemoryDeferred("RR output");
                 policy.Reject();
@@ -1473,20 +1542,27 @@ class Controller {
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
                                   "live NGX parameter allocation failed",
                                   rrngxlog::Returned(allocated, parameters));
-                rreval::CreateParameters(*parameters, o, preset.desired);
-                Require(rrpreset::Requested(*parameters, preset.desired),
+                // The preset RR is created with: a request during the creation call below waits
+                // for the next RR.
+                const auto created_preset = preset.desired;
+                rreval::CreateParameters(*parameters, o, created_preset);
+                Require(rrpreset::Requested(*parameters, created_preset),
                         "live RR preset parameter readback failed");
-                auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
-                                          parameters, &feature);
+                NVSDK_NGX_Handle *created_feature{};
+                auto created = Foreign([&] {
+                    return api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction, parameters,
+                                      &created_feature);
+                });
+                feature = created_feature;
                 char line[200];
                 rrngxlog::CapabilityLine(api, line, sizeof(line));
                 Log(line);
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
                                   "live RR feature creation failed",
                                   rrngxlog::Returned(created, feature));
-                preset.Created();
+                preset.Created(created_preset);
                 weapon_linear = weapon_on;
-                rrngxlog::DescribeCreation(o, preset.desired, line, sizeof(line));
+                rrngxlog::DescribeCreation(o, created_preset, line, sizeof(line));
                 Log(line);
                 if (weapon_on)
                     Log("Weapon depth: on (RR reads the weapon-remapped depth copy)");
@@ -1560,7 +1636,8 @@ class Controller {
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
             bool threw = false; // then evaluated_result is the sentinel above, not NGX's
             try {
-                evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
+                evaluated_result =
+                    Foreign([&] { return api.evaluate(public_cl, feature, parameters, nullptr); });
             } catch (...) {
                 threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
@@ -1666,14 +1743,6 @@ class Controller {
                 const auto wait_result = q->Wait(fence.Get(), signaled);
                 Check(wait_result, "live cross-queue GPU wait failed");
             }
-            if (!history_queued) {
-                rrinternal::Scope guard;
-                ID3D12CommandList *setup = init_list.Get();
-                {
-                    q->ExecuteCommandLists(1, &setup);
-                }
-                history_queued = true;
-            }
             last_queue = q;
             queue_ready = q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
         } catch (const std::exception &e) {
@@ -1778,6 +1847,10 @@ class Controller {
         if (runtime != mod || (d && !fg::SameNativeObject(public_device.Get(), d)))
             return true;
         enabled = false;
+        if (foreign_call) {
+            Log("RR shutdown deferred: an RR evaluation is in NGX");
+            return false;
+        }
         for (const auto &s : slots)
             if (s.poisoned || s.pre_live || s.sr_live || s.sss.live || s.transparency.Live() ||
                 s.coverage.Live() || s.pending_sr) {
