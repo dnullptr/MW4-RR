@@ -1567,13 +1567,12 @@ struct ControllerCpuTest {
         for (const bool room : {true, false}) {
             Rig r;
             auto &c = r.c;
-            c.budget.limit = 64ull << 30;
+            // Without room, RR's own ledger is full.
+            c.budget.limit = room ? 64ull << 30 : c.budget.bytes;
             std::array<ComPtr<ID3D12Resource>, 4> textures;
             for (unsigned i = 0; i < 4; ++i)
                 textures[i] = &r.guides[i];
             c.slots[3].busy = true; // in flight: left alone
-            if (!room)
-                dxgi_budget = Usage();
             const auto before = c.budget.bytes;
             c.ReserveSlots(r.S(), textures, {}, {});
             for (size_t i = 1; i < c.slots.size(); ++i) {
@@ -1585,7 +1584,6 @@ struct ControllerCpuTest {
             assert((c.budget.bytes > before) == room && !c.failed);
             for (auto &v : c.slots)
                 v.gpu.header_map = nullptr; // GpuFrame never unmaps on destruction
-            dxgi_budget = 64ull << 30;
         }
     }
 
