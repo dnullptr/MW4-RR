@@ -1290,6 +1290,9 @@ class Controller {
             if (proof.known[i])
                 s->states[i] = {proof.states[i], true, true};
         if (!AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true)) {
+            // Waiting for GPU memory is no refusal: native SR upscales the frame meanwhile.
+            if (memory_retry_after)
+                return skip(rrsr::Memory);
             // A refused frame loses RR (native SR runs, AfterSR does not run again), so a
             // check that keeps refusing pauses replacement until the setting changes.
             if (++replace_refusals == 3) {

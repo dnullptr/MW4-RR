@@ -48,12 +48,14 @@ enum Skip : unsigned {
     Reset,       // the Reset parameter cannot be written
     Untracked,   // an input's transition on the SR list was split, per plane or unrecorded
     Foreign,     // another add-on hooked DLSS evaluation beneath RR and needs the SR call
+    Memory,      // a new RR allocation is waiting for GPU memory (not a refusal)
     Count
 };
 inline const char *SkipText(unsigned why) {
-    static constexpr const char *text[] = {
-        "none",  "setting",  "rrOff",    "failed",   "reconfigure", "unsafe",    "noFrame",  "list",
-        "state", "rrChecks", "callback", "creation", "reset",       "untracked", "otherHook"};
+    static constexpr const char *text[] = {"none",        "setting",   "rrOff",     "failed",
+                                           "reconfigure", "unsafe",    "noFrame",   "list",
+                                           "state",       "rrChecks",  "callback",  "creation",
+                                           "reset",       "untracked", "otherHook", "gpuMemory"};
     return why < Count ? text[why] : "unknown";
 }
 // Lock-free: written on the evaluate thread, read by the health line.
