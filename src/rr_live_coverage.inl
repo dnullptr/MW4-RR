@@ -11,8 +11,10 @@ ULONGLONG blend_retry = 0;
 rrblend::Counters blend_counters;
 rrblend::Tuning blend_tuning;
 rrblend::Pipeline blend_pipeline;
-ULONGLONG blend_report = 0;
+ULONGLONG blend_report = 0, blend_logged_at = 0; // the last 10 s check; the last line
 bool blend_off_logged{}; // "off" is logged once per switch-off, not every window
+unsigned blend_logged_state = 0; // the last line's window state (CoverageReportLocked)
+uint64_t blend_mark = 0;         // blend_counters.covered at the last check
 ULONGLONG blend_last_ran = 0;
 unsigned blend_logged = 0; // one-time log lines: 1 Oit, 2 Refraction, 4 typed, 8 memory
 
@@ -107,45 +109,60 @@ void CoverageReconfigured() {
 }
 void CoverageReportLocked(ULONGLONG now) {
     if (!blend_report) {
-        blend_report = now;
+        blend_report = blend_logged_at = now;
         return;
     }
     if (now - blend_report < 10000)
         return;
     blend_report = now;
-    // Every window while RR runs with the blend on, all-zero ones included, so
-    // "no transparency seen" reads differently from "refused" and from "failed"
-    // or "unavailable", which show in every window, not only the first. A blend
-    // that is off says so once.
+    // Checked every 10 s while RR runs. A line is logged when the window's state (on, failed,
+    // unavailable, and whether any transparency was blended) differs from the last line's, or
+    // as a 5-minute summary; it counts everything since the last line. A blend that is off
+    // says so once.
     if (blend_enabled)
         blend_off_logged = false;
-    if (enabled && !failed && !retired && !(blend_off_logged && !blend_enabled)) {
-        auto &k = blend_counters;
-        const char *state = "on";
-        if (!blend_enabled)
-            state = "off";
-        else if (blend_failed) {
-            state = "failed";
-            k.last = rrblend::Reason::Failed;
-        } else if (blend_unavailable != rrblend::Reason::None) {
-            state = "unavailable";
-            k.last = blend_unavailable;
-        }
-        char line[400];
-        if (!blend_enabled)
-        {
-            snprintf(line, sizeof(line), "Transparency albedo blend: off");
-            blend_off_logged = true;
-        }
-        else {
-            const int n = rrblend::Report(k, line, sizeof(line));
-            if (n > 0 && size_t(n) < sizeof(line))
-                snprintf(line + n, sizeof(line) - size_t(n), " changed=%llu state=%s",
-                         static_cast<unsigned long long>(k.covered), state);
-        }
-        Log(line);
+    auto &k = blend_counters;
+    if (!enabled || failed || retired || (blend_off_logged && !blend_enabled)) {
+        k = {};
+        blend_mark = 0;
+        blend_logged_state = 0;
+        blend_logged_at = now;
+        return;
     }
-    blend_counters = {};
+    const char *state = "on";
+    unsigned window = 1;
+    if (!blend_enabled) {
+        state = "off";
+        window = 2;
+    } else if (blend_failed) {
+        state = "failed";
+        window = 3;
+        k.last = rrblend::Reason::Failed;
+    } else if (blend_unavailable != rrblend::Reason::None) {
+        state = "unavailable";
+        window = 4;
+        k.last = blend_unavailable;
+    }
+    if (k.covered != blend_mark)
+        window |= 8;
+    blend_mark = k.covered;
+    if (blend_enabled && window == blend_logged_state && now - blend_logged_at < 300000)
+        return;
+    char line[400];
+    if (!blend_enabled) {
+        snprintf(line, sizeof(line), "Transparency albedo blend: off");
+        blend_off_logged = true;
+    } else {
+        const int n = rrblend::Report(k, line, sizeof(line), (now - blend_logged_at) / 1000);
+        if (n > 0 && size_t(n) < sizeof(line))
+            snprintf(line + n, sizeof(line) - size_t(n), " changed=%llu state=%s",
+                     static_cast<unsigned long long>(k.covered), state);
+    }
+    Log(line);
+    k = {};
+    blend_mark = 0;
+    blend_logged_state = window;
+    blend_logged_at = now;
 }
 // The stats of this slot's previous blend, once per recorded blend. The slot
 // keeps its guide size until it is released, so that blend covered w x h too.

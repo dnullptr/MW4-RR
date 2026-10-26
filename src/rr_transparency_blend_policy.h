@@ -436,13 +436,14 @@ struct Counters {
     uint64_t pixels{}, eligible{}, covered{}, opacity64{};
     Reason last{Reason::None};
 };
-inline int Report(const Counters &k, char *buf, size_t n) {
+// seconds: the span the counters cover.
+inline int Report(const Counters &k, char *buf, size_t n, unsigned long long seconds = 10) {
     auto ratio = [](double num, uint64_t den) { return den ? num / double(den) : 0.0; };
     return snprintf(buf, n,
-                    "Transparency albedo blend (10s): frames=%llu captures=%llu oit=%llu "
+                    "Transparency albedo blend (%llus): frames=%llu captures=%llu oit=%llu "
                     "refr=%llu admitted=%llu eligible=%.1f%% covered=%.1f%% meanOpacity=%.3f "
                     "lastReject=%s",
-                    static_cast<unsigned long long>(k.frames),
+                    seconds, static_cast<unsigned long long>(k.frames),
                     static_cast<unsigned long long>(k.captures_oit + k.captures_refr),
                     static_cast<unsigned long long>(k.captures_oit),
                     static_cast<unsigned long long>(k.captures_refr),

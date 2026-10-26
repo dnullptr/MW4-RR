@@ -1410,8 +1410,8 @@ struct ControllerCpuTest {
         s.gpu.coverage.readback_map = nullptr;
     }
 
-    // While RR runs, every 10 s window logs, all-zero ones included; a failed
-    // or unavailable blend shows in every window.
+    // While RR runs, each 10 s check logs a state change (on, failed, unavailable, blending
+    // or not), or a 5-minute summary; a line counts everything since the last one.
     static void Report() {
         Controller c;
         c.logger = [](const char *line) { logs.emplace_back(line); };
@@ -1427,56 +1427,56 @@ struct ControllerCpuTest {
                Logged("Transparency albedo blend (10s): frames=0 captures=3 oit=3 refr=0") &&
                Logged("lastReject=none changed=1234 state=on"));
         assert(c.blend_counters.captures_oit == 0 && c.blend_counters.covered == 0);
-        // Nothing transparent seen: the line still comes, all zero.
+        // Nothing transparent seen is a change: the line comes, all zero.
         logs.clear();
         c.CoverageReportLocked(120000);
         assert(logs.size() == 1 &&
                Logged("frames=0 captures=0 oit=0 refr=0 admitted=0 eligible=0.0% covered=0.0%") &&
                Logged("lastReject=none changed=0 state=on"));
-        // A refusal is named.
+        // The same state again waits, and keeps counting.
+        c.blend_counters.frames = 5;
         c.blend_counters.last = rrblend::Reason::NoSlot;
         c.CoverageReportLocked(130000);
-        assert(logs.size() == 2 && Logged("lastReject=no-slot changed=0 state=on"));
-        // A failed blend shows in consecutive windows.
+        assert(logs.size() == 1 && c.blend_counters.frames == 5);
+        // A failed blend logs at once, with the frames since the last line, then waits.
         logs.clear();
         c.blend_failed = true;
         c.CoverageReportLocked(140000);
         c.CoverageReportLocked(150000);
-        assert(logs.size() == 2);
-        for (const auto &line : logs)
-            assert(line.find("captures=0 oit=0 refr=0") != std::string::npos &&
-                   line.find("lastReject=failed changed=0 state=failed") != std::string::npos);
-        // So does an unavailable one.
+        assert(logs.size() == 1 && Logged("blend (20s): frames=5 ") &&
+               Logged("lastReject=failed changed=0 state=failed"));
+        // So does an unavailable one, and the same state comes again as the summary.
         logs.clear();
         c.blend_failed = false;
         c.blend_unavailable = rrblend::Reason::Typed;
         c.CoverageReportLocked(160000);
-        c.CoverageReportLocked(170000);
-        assert(logs.size() == 2);
-        for (const auto &line : logs)
-            assert(line.find("lastReject=typed-load changed=0 state=unavailable") !=
-                   std::string::npos);
+        assert(logs.size() == 1 && Logged("lastReject=typed-load changed=0 state=unavailable"));
+        for (ULONGLONG t = 170000; t < 460000; t += 10000)
+            c.CoverageReportLocked(t);
+        assert(logs.size() == 1);
+        c.CoverageReportLocked(460000);
+        assert(logs.size() == 2 && logs[1].find("blend (300s): ") != std::string::npos);
         c.blend_unavailable = rrblend::Reason::None;
         // Blend off: one short line, not repeated while it stays off; counters reset.
         logs.clear();
         c.blend_counters.frames = 1;
         c.SetTransparencyBlendEnabled(false);
-        c.CoverageReportLocked(180000);
+        c.CoverageReportLocked(470000);
         assert(logs.size() == 1 && logs[0] == "Transparency albedo blend: off");
         assert(c.blend_counters.frames == 0);
-        c.CoverageReportLocked(185000);
-        c.CoverageReportLocked(195000);
+        c.CoverageReportLocked(475000);
+        c.CoverageReportLocked(485000);
         assert(logs.size() == 1);
-        // RR off, failed or retired: no line.
+    // RR off, failed or retired: no line.
         c.SetTransparencyBlendEnabled(true);
         c.SetEnabled(false);
-        c.CoverageReportLocked(190000);
+        c.CoverageReportLocked(495000);
         c.SetEnabled(true);
         c.failed = true;
-        c.CoverageReportLocked(200000);
+        c.CoverageReportLocked(505000);
         c.failed = false;
         c.retired = true;
-        c.CoverageReportLocked(210000);
+        c.CoverageReportLocked(515000);
         assert(logs.size() == 1);
     }
 
