@@ -527,6 +527,15 @@ class Pool {
                 return s.history.r == input.r;
         return false;
     }
+    // A spatial proof skipped after this list's snapshot: the snapshot is left unused, so Before()
+    // fences it like an applied one. live stays set, so Complete() cannot reuse the slot before the
+    // recorded copy has run.
+    void Abandon(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        for (auto &s : slots)
+            if (s.live && s.command == cl && !s.consumed)
+                s.consumed = true;
+    }
     bool Apply(ID3D12GraphicsCommandList *cl, const Pair &input, const Pair &output,
                ID3D12PipelineState *scale, ID3D12PipelineState *restore, UINT x, UINT y, UINT z,
                const rrvrrt::Data *rates = nullptr, const rrvrrt::CBVs *cbvs = nullptr,

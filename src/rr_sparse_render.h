@@ -107,12 +107,14 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         return false;
     }
     if (!SparsePair(list, native.Get(), effective, false, 0, input)) {
+        SparsePool().Abandon(native.Get());
         rrbypass::Skip(device, "RR spatial input proof failed");
         return false;
     }
     if (!SparsePool().Pending(native.Get(), input))
         return false;
     if (!SparsePair(list, native.Get(), effective, true, 0, output, true)) {
+        SparsePool().Abandon(native.Get());
         rrbypass::Skip(device, "RR first spatial output proof failed");
         return false;
     }
