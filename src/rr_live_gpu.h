@@ -146,7 +146,7 @@ struct Pipelines {
         Pipeline(gate_root.Get(), RRLiveBegin, sizeof(RRLiveBegin), gate[0]);
         Pipeline(gate_root.Get(), RRLiveValidate, sizeof(RRLiveValidate), gate[1]);
         Pipeline(gate_root.Get(), RRLiveDisplay, sizeof(RRLiveDisplay), gate[2]);
-        // Weapon depth: depth SRV table, linear depth UAV table, 8 root constants.
+        // Weapon depth: depth SRV table, depth copy UAV table, 8 root constants.
         ranges[0].NumDescriptors = 1;
         ranges[1].NumDescriptors = 1;
         D3D12_ROOT_PARAMETER e[3]{};
@@ -682,8 +682,9 @@ struct GpuFrame {
         Change(cl, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_COMMON);
     }
-    // RR's depth (the private copy, or the game's R32_FLOAT depth) as linear view depth
-    // (R32_FLOAT, w x h), read from the depth subrect at (x, y); see rrweapondepth::Map.
+    // RR's depth (the private copy, or the game's R32_FLOAT depth) with the weapon slice
+    // remapped (R32_FLOAT, w x h), read from the depth subrect at (x, y); see
+    // rrweapondepth::Hardware.
     void WeaponDepth(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *linear, UINT x,
                      UINT y, const rrweapondepth::Mapping &m) {
         SRV(p, use_depth ? depth.Get() : sr[1].Get(), DepthSource);

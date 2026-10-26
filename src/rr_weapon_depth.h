@@ -5,12 +5,12 @@
 namespace rrweapondepth {
 // Weapon depth (a saved setting, rrsettings::Preferences::weapon_depth): real depth on the
 // first-person weapon. The game draws the weapon and arms with their own camera into the
-// nearest depth slice, so with hardware depth RR sees them as a flat card at the near plane.
-// With this on, RR is created with linear (view-space) depth instead
-// (shaders/rr_weapon_depth.hlsl): world depth is exactly what the projection RR is given
-// implies, and the weapon keeps its own depth order, entirely in front of the near plane, so
-// it never lands behind world geometry it is drawn over. RR's depth type is fixed when RR is
-// created, so a change restarts RR.
+// nearest depth slice, so RR sees them as a flat card at the near plane. With this on, RR
+// reads a copy of the game's hardware depth (shaders/rr_weapon_depth.hlsl): world depth is
+// unchanged, and the weapon slice is remapped so the weapon keeps its own depth order,
+// entirely in front of the near plane, so it never lands behind world geometry it is drawn
+// over. RR stays on hardware depth: the third-party DLSS5 NR add-on declines RR frames
+// created with linear depth. A change restarts RR.
 // The setting as applied (rr_settings.inl ApplyEnabled); off until the settings are loaded.
 inline std::atomic<bool> enabled{};
 // Bumped on every change of the setting (retries linear depth held off for GPU memory, an
@@ -93,14 +93,20 @@ inline constexpr FrameDepth Choose(bool feature, bool feature_linear, bool wante
         f.linear = false;
     return f;
 }
-// CPU reference of shaders/rr_weapon_depth.hlsl, same operations in the same order.
-inline float Linear(float depth, const Mapping &m) {
+// CPU reference of shaders/rr_weapon_depth.hlsl, same operations in the same order: the
+// hardware depth RR reads.
+inline float Hardware(float depth, const Mapping &m) {
     if (!(depth > 0))
-        return m.sky;
+        return 0;
     if (depth > Slice) {
         const float t = std::fmin((depth - Slice) * 64, 1.0f);
-        return m.scale / (1 + m.offset) / (1 + t / Knee);
+        return (1 + m.offset) * (1 + t / Knee) - m.offset;
     }
-    return std::fmin(m.scale / (depth + m.offset), m.sky);
+    return depth;
+}
+// The linear view depth RR's projection implies for a hardware depth, sky at m.sky.
+inline float Linear(float depth, const Mapping &m) {
+    const float d = Hardware(depth, m);
+    return d > 0 ? std::fmin(m.scale / (d + m.offset), m.sky) : m.sky;
 }
 } // namespace rrweapondepth

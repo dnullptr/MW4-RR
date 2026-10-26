@@ -34,10 +34,10 @@ Transparency albedo blend (on by default, with a checkbox in the panel and no ho
 - `TransparencyBlendSky` (1): 1 also blends where transparency layers cover the sky; 0 leaves sky pixels alone.
 - `TransparencyBlendFilter` (1): 1 smooths the blend mask over neighboring pixels; 0 uses it unfiltered.
 
-The panel also has these checkboxes, saved in `ReShade.ini`. All but weapon depth are on by default:
+The panel also has these checkboxes, all on by default and saved in `ReShade.ini`:
 
 - Specular hit distance (`SpecularHitDistance`): gives RR the game's specular ray hit distances.
-- Weapon depth (`WeaponDepth`): gives RR linear depth in which the weapon and hands keep their own depth, still in front of the scene. Changing it restarts RR, like a preset change. It is off by default because the third-party DLSS5 NR add-on only works when RR reads the game's own depth buffer.
+- Weapon depth (`WeaponDepth`): gives RR a depth in which the weapon and hands keep their own depth, still in front of the scene, instead of a flat card at the near plane. World depth stays the game's own, in the game's reverse-Z format, so third-party add-ons such as DLSS5 NR keep working. Changing it restarts RR, like a preset change.
 - Water responsivity mask (`WaterResponsivity`): tells RR to favor the current frame on running water, which it otherwise blurs. It applies on preset F only.
 
 With the Subsurface Scattering Guide on, lighting on skin and other subsurface materials uses the game's native temporal history where it exists, and a spatial estimate elsewhere. The panel reports this as "SSS lighting".

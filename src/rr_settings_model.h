@@ -7,8 +7,7 @@ struct Preferences {
     bool glass = true;
     bool blend = true;
     bool hit = true;
-    bool weapon_depth = false; // linear depth for RR, the weapon kept in front (rr_weapon_depth.h);
-                               // off: the DLSS5 NR add-on needs the game's own depth buffer
+    bool weapon_depth = true; // the weapon kept in front with its own depth (rr_weapon_depth.h)
     bool water = true;        // water responsivity mask (rr_water.h), preset F only
     unsigned preset = 6;
     bool tolerate_isolated = true; // count isolated bad guide pixels, keep the frame

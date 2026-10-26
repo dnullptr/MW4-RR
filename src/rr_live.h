@@ -79,7 +79,7 @@ class Controller {
     HistoryPolicy policy;
     rrhealth::Tracker health;
     bool tolerate_isolated = true;
-    // Weapon depth's linear depth texture, shared by every slot, created on first use and
+    // Weapon depth's depth copy, shared by every slot, created on first use and
     // released by Reconfigure. It sits in the persistent ledger, so pool projections count it
     // once, and the reserve grows by exactly its size (test_reserve, given back on release).
     struct DevTest {
@@ -88,13 +88,13 @@ class Controller {
         bool blocked{};    // no GPU memory: retried once its setting changes
         unsigned changes{}; // the setting's change count when it was blocked
     };
-    // weapon_test: the linear depth RR reads while weapon depth is on.
+    // weapon_test: the remapped depth copy RR reads while weapon depth is on.
     DevTest weapon_test;
     UINT64 test_reserve{};
-    // Weapon depth (rrweapondepth): weapon_linear is the depth type the current RR feature
-    // was created with; weapon_hold says why linear depth stays off until the setting next
-    // changes. The hold outlives Reconfigure, so linear depth that cannot run restarts RR
-    // once, never over and over.
+    // Weapon depth (rrweapondepth): weapon_linear is whether the current RR feature was
+    // created to read the weapon depth copy; weapon_hold says why weapon depth stays off until
+    // the setting next changes. The hold outlives Reconfigure, so weapon depth that cannot
+    // run restarts RR once, never over and over.
     using WeaponHold = rrweapondepth::Hold;
     bool weapon_linear{};
     WeaponHold weapon_hold{};
@@ -339,12 +339,12 @@ class Controller {
         weapon_hold_changes = changes;
         // UseTest already logged a memory failure.
         if (why == WeaponHold::Projection)
-            Log("Weapon depth: the game's projection does not map to linear depth; off until "
+            Log("Weapon depth: the game's projection is not supported; off until "
                 "the setting changes, RR runs with hardware depth");
         else if (why == WeaponHold::Refused) {
             char line[200];
             snprintf(line, sizeof(line),
-                     "Weapon depth: RR did not accept linear depth%s%s%s; off until the setting "
+                     "Weapon depth: RR failed with the weapon depth copy%s%s%s; off until the setting "
                      "changes, RR runs with hardware depth",
                      outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
             Log(line);
@@ -1307,7 +1307,7 @@ class Controller {
             auto projection = s->projection;
             // Weapon depth: RR's depth type is fixed when RR is created, so a frame follows
             // the feature's type and a new feature takes the setting's (rrweapondepth::Choose).
-            // Linear depth matches the projection RR is given.
+            // The weapon slice is remapped with the projection RR is given.
             const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
             const bool weapon_wanted = WeaponDepthWanted();
             rrweapondepth::Mapping weapon_map;
@@ -1350,21 +1350,11 @@ class Controller {
                 rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
                                   "live NGX parameter allocation failed",
                                   rrngxlog::Returned(allocated, parameters));
-                rreval::CreateParameters(*parameters, o, preset.desired, weapon_on);
+                rreval::CreateParameters(*parameters, o, preset.desired);
                 Require(rrpreset::Requested(*parameters, preset.desired),
                         "live RR preset parameter readback failed");
                 auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
                                           parameters, &feature);
-                if (weapon_on && (NVSDK_NGX_FAILED(created) || !feature)) {
-                    // RR refused linear depth: hold the test and create RR as before.
-                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes,
-                                    rrngxlog::Returned(created, feature).text);
-                    weapon_on = weapon_test.active = false;
-                    feature = nullptr;
-                    rreval::CreateParameters(*parameters, o, preset.desired);
-                    created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
-                                         parameters, &feature);
-                }
                 char line[200];
                 rrngxlog::CapabilityLine(api, line, sizeof(line));
                 Log(line);
@@ -1373,18 +1363,10 @@ class Controller {
                                   rrngxlog::Returned(created, feature));
                 preset.Created();
                 weapon_linear = weapon_on;
-                rrngxlog::DescribeCreation(o, preset.desired, weapon_on, line, sizeof(line));
+                rrngxlog::DescribeCreation(o, preset.desired, line, sizeof(line));
                 Log(line);
-                if (weapon_on) {
-                    int sent = -1;
-                    parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &sent);
-                    // Read back from the parameters; decimal, as the "RR created" line above.
-                    snprintf(line, sizeof(line),
-                             "Weapon depth: RR created with linear depth (game create flags "
-                             "%d, sent %d)",
-                             o.flags, sent);
-                    Log(line);
-                }
+                if (weapon_on)
+                    Log("Weapon depth: on (RR reads the weapon-remapped depth copy)");
             }
             // Water responsivity mask, written by WaterPass below.
             const bool water_responsivity = rrwater::UseResponsivity(
@@ -1411,7 +1393,7 @@ class Controller {
                                                            : nullptr,
                                         s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
             s->responsivity_used = resources.responsivity != nullptr;
-            // The linear depth copy is read at its own origin.
+            // The weapon depth copy is read at its own origin.
             auto evaluated = o;
             if (weapon_on)
                 evaluated.depth_x = evaluated.depth_y = 0;

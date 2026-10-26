@@ -30,8 +30,8 @@ static void SaveToggles() {
 }
 static void ApplyEnabled(bool allowed) {
     config_allowed = allowed;
-    // Before RR can be enabled: RR takes its depth type when it is created. A change restarts
-    // a running RR and retries linear depth held off since the last change.
+    // Before RR can be enabled: RR takes its depth source when it is created. A change restarts
+    // a running RR and retries weapon depth held off since the last change.
     if (rrweapondepth::enabled.exchange(requested_weapon_depth) != requested_weapon_depth)
         ++rrweapondepth::changes;
     LiveRR().SetEnabled(requested_rr && config_allowed);
@@ -162,16 +162,16 @@ static void DrawSettings(reshade::api::effect_runtime *) {
         using WeaponState = rrlive::Controller::WeaponState;
         const auto weapon = LiveRR().WeaponDepthState();
         ImGui::Text("Weapon depth: %s",
-                    weapon == WeaponState::Active       ? "active (RR uses linear depth)"
+                    weapon == WeaponState::Active       ? "active"
                     : weapon == WeaponState::Off        ? "off"
-                    : weapon == WeaponState::Restarting ? "restarting RR with the new depth type"
+                    : weapon == WeaponState::Restarting ? "restarting RR"
                     : weapon == WeaponState::NoMemory
                         ? "off: not enough GPU memory (turn it off and on to retry)"
                     : weapon == WeaponState::Unsupported
                         ? "off: the game's projection is not supported (turn it off and on to "
                           "retry)"
                     : weapon == WeaponState::Refused
-                        ? "off: RR did not accept linear depth (turn it off and on to retry)"
+                        ? "off: RR failed with it (turn it off and on to retry)"
                     : !LiveRR().Running() ? "waiting for RR"
                                           : "waiting");
         ImGui::TextWrapped("The game draws the weapon and hands with their own camera, so with "

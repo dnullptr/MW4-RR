@@ -34,6 +34,13 @@ static void GameProjection() {
     Mapping m;
     assert(Map(game, m));
     assert(m.scale == 1 && m.offset == 0 && m.sky == FarScale);
+    // RR keeps hardware depth: world depth is the game's, bit for bit, and sky stays 0.
+    for (float d : {Slice, 0.5f, 0.1f, 1e-3f, 1e-5f, 2e-6f, 1e-7f})
+        assert(Hardware(d, m) == d);
+    assert(Hardware(0, m) == 0 && Hardware(-0.0f, m) == 0 &&
+           Hardware(std::numeric_limits<float>::quiet_NaN(), m) == 0);
+    // The weapon slice lies past the near plane (hardware depth above 1), in its own order.
+    assert(Hardware(std::nextafter(Slice, 1.0f), m) > 1 && Near(Hardware(1, m), 2049, 1e-6));
     // World depth is exactly near / depth, what RR's projection says.
     for (float d : {Slice, 0.5f, 0.1f, 1e-3f, 1e-5f, 2e-6f})
         assert(Linear(d, m) == 1 / d);
@@ -138,8 +145,8 @@ static void Choice() {
 }
 
 static void Creation() {
-    // RR is told the depth type at creation; linear depth is not inverted, so the game's
-    // flag is cleared and every other flag kept.
+    // RR is always created with hardware depth and the game's flags (AutoExposure aside):
+    // the DLSS5 NR add-on declines RR frames created with linear depth.
     rreval::Options v;
     v.width = 1280;
     v.height = 720;
@@ -148,34 +155,18 @@ static void Creation() {
     v.quality = 1;
     v.flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
               NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
-    RecordingParams hw, linear;
+    RecordingParams hw;
     rreval::CreateParameters(hw, v);
-    rreval::CreateParameters(linear, v, 6, true);
     int flags{};
     unsigned depth{};
     assert(NVSDK_NGX_SUCCEED(hw.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)) &&
            flags == v.flags);
     assert(NVSDK_NGX_SUCCEED(hw.Get(NVSDK_NGX_Parameter_Use_HW_Depth, &depth)) &&
            depth == NVSDK_NGX_DLSS_Depth_Type_HW);
-    assert(NVSDK_NGX_SUCCEED(linear.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)) &&
-           flags == (NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
-    assert(NVSDK_NGX_SUCCEED(linear.Get(NVSDK_NGX_Parameter_Use_HW_Depth, &depth)) &&
-           depth == NVSDK_NGX_DLSS_Depth_Type_Linear);
-    // CreateFlags is what RR is created with, and what a capture's manifest reports: v.flags is
-    // IsHDR | MVLowRes | DepthInverted (11), so 11, and 3 for linear depth. The game's
-    // AutoExposure (64) is never sent.
-    assert(rreval::CreateFlags(v.flags, false) == 11);
-    assert(rreval::CreateFlags(v.flags, true) == flags && flags == 3);
-    assert(rreval::CreateFlags(v.flags | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure, false) == 11);
-    assert(rreval::CreateFlags(v.flags | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure, true) == 3);
-    assert(rreval::CreateFlags(NVSDK_NGX_DLSS_Feature_Flags_IsHDR, true) ==
-           NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
-    // Nothing else changes.
-    assert(hw.values.size() == linear.values.size());
-    for (const auto &[key, value] : hw.values)
-        if (key != NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags &&
-            key != NVSDK_NGX_Parameter_Use_HW_Depth)
-            assert(linear.values.at(key) == value);
+    // CreateFlags is what RR is created with, and what the "RR created" line reports: v.flags
+    // is IsHDR | MVLowRes | DepthInverted (11). The game's AutoExposure (64) is never sent.
+    assert(rreval::CreateFlags(v.flags) == 11);
+    assert(rreval::CreateFlags(v.flags | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) == 11);
 }
 
 int main() {

@@ -195,12 +195,6 @@ static void CreationParameters() {
     rreval::CreateParameters(q, o);
     assert(NVSDK_NGX_SUCCEED(q.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
     assert(flags == 0x1bf);
-    // Linear depth (weapon depth) drops DepthInverted as well, AutoExposure still.
-    o.flags = 75;
-    RecordingParams l;
-    rreval::CreateParameters(l, o, 6, true);
-    assert(NVSDK_NGX_SUCCEED(l.Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags)));
-    assert(flags == 3);
 }
 static RecordingParams *capability_map{};
 static NVSDK_NGX_Result capability_result = NVSDK_NGX_Result_Success;
@@ -376,20 +370,16 @@ static void NgxLog() {
     o.out_height = 2160;
     o.quality = 1;
     o.flags = 75;
-    rrngxlog::DescribeCreation(o, 6, false, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 6, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 11, "
-                         "render 2224x1248, output 3840x2160"));
-    // Linear depth (weapon depth): the flags RR got lose DepthInverted too.
-    rrngxlog::DescribeCreation(o, 6, true, text, sizeof(text));
-    assert(!strcmp(text, "RR created: preset F, quality 1 (Balanced), flags 75 -> 3, "
                          "render 2224x1248, output 3840x2160"));
     o.flags = 0;
     o.quality = 5;
-    rrngxlog::DescribeCreation(o, 0, false, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 0, text, sizeof(text));
     assert(!strcmp(text, "RR created: preset Default, quality 5 (Native / DLAA), flags 0 -> 0, "
                          "render 2224x1248, output 3840x2160"));
     o.quality = 6;
-    rrngxlog::DescribeCreation(o, 1, false, text, sizeof(text));
+    rrngxlog::DescribeCreation(o, 1, text, sizeof(text));
     assert(!strncmp(text, "RR created: preset unknown, quality 6 (unknown),",
                     strlen("RR created: preset unknown, quality 6 (unknown),")));
     // The widest line still fits the 200-byte buffer AfterSR formats it into.
@@ -397,7 +387,7 @@ static void NgxLog() {
     o.quality = INT_MIN;
     o.flags = INT_MIN;
     char creation[200];
-    rrngxlog::DescribeCreation(o, 1, false, creation, sizeof(creation));
+    rrngxlog::DescribeCreation(o, 1, creation, sizeof(creation));
     assert(std::string_view(creation).ends_with(" output 4294967295x4294967295"));
 }
 int main() {
