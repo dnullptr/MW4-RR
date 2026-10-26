@@ -1178,7 +1178,9 @@ struct ControllerCpuTest {
 
     // Coverage reserves the whole pool first: a later mandatory pool
     // reservation (a slot's first prepass, rr_live.h Prepass) must still fit
-    // the ceiling when the GPU has no free memory left.
+    // the ceiling when the GPU has no free memory left. Without budget headroom the
+    // ledger still grows to Budget::OverBudget, so the slots carry extra storage (pad)
+    // that puts the pool past it.
     static void PoolReservation() {
         const UINT w = 3840, h = 2160;
         Rig r(w, h);
@@ -1187,20 +1189,21 @@ struct ControllerCpuTest {
         const UINT64 prepass = GpuFrame::RequiredPrepassBytes(&r.device, w, h);
         const UINT64 out = FakeDevice::Size(r.output.desc);
         const UINT64 C = rrblend::Gpu::RequiredBytes(&r.device, Scene(w / 2, h / 2));
+        const UINT64 pad = 512ull << 20;
         assert(prepass && C);
-        // Three warm slots hold their prepass storage (slot 0 also its output).
+        // Three warm slots hold their prepass storage plus pad (slot 0 also its output).
         for (size_t i = 0; i < 3; ++i) {
             auto &f = c.slots[i].gpu;
             f.w = w;
             f.h = h;
-            f.bytes += prepass;
-            b.bytes += prepass;
-            r.device.created_bytes += prepass;
+            f.bytes += prepass + pad;
+            b.bytes += prepass + pad;
+            r.device.created_bytes += prepass + pad;
         }
-        assert(c.slots[0].gpu.bytes == prepass + out);
+        assert(c.slots[0].gpu.bytes == prepass + pad + out);
         assert(c.ReservePool(c.slots.size(), nullptr, nullptr, w, h));
         const UINT64 limit0 = b.limit;
-        assert(limit0 == 6 * (prepass + out));
+        assert(limit0 == 6 * (prepass + pad + out) && limit0 > Budget::OverBudget);
 
         // Not enough room for coverage on every slot: wait, allocate nothing.
         dxgi_budget = Usage() + (limit0 - b.bytes) + 5 * C;
@@ -1219,7 +1222,7 @@ struct ControllerCpuTest {
         c.blend_retry = 1;
         t = r.Capture(r.list);
         assert(t && r.S().gpu.coverage.bytes == C && !c.blend_retry);
-        assert(b.limit == limit0 + 6 * C && b.bytes == 3 * prepass + out + C);
+        assert(b.limit == limit0 + 6 * C && b.bytes == 3 * (prepass + pad) + out + C);
         c.CoverageCaptured(std::move(t), rrblend::Kind::Oit);
 
         // The game takes every free byte. Slot 3's first prepass reserves the
