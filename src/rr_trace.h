@@ -25,6 +25,7 @@
 #include <atomic>
 #include "rr_trace_model.h"
 #include "rr_sr_reset.h"
+#include "rr_sr_eligibility.h"
 #include <optional>
 
 namespace rrtrace {
@@ -631,10 +632,14 @@ class Probe {
                 self->Log("pre-evaluate observer failed; original NGX call preserved");
             }
         std::optional<rrsr::ResetParameter> reset_parameter;
+        if (kind == Kind::SR && self->replace_evaluate && (cb || !creation.valid))
+            rrsr::Note(cb ? rrsr::Callback : rrsr::Creation);
         if (kind == Kind::SR && !cb && creation.valid && self->replace_evaluate) {
             try {
                 rrsr::ResetParameter availability(p);
                 NVSDK_NGX_Result replacement_result = NVSDK_NGX_Result_FAIL_PlatformError;
+                if (!availability.Ready())
+                    rrsr::Note(rrsr::Reset);
                 if (availability.Ready() && self->replace_evaluate(cl, p, replacement_result) &&
                     NVSDK_NGX_SUCCEED(replacement_result)) {
                     std::lock_guard lock(self->mutex);

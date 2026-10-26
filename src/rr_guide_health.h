@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include "rr_sr_eligibility.h"
 namespace rrhealth {
 // What one RR evaluation was given and produced: the gate's non-finite pixel counts in the
 // color RR received and in the RR output the gate displayed (none if rejected or blocked), and
@@ -30,7 +31,8 @@ class Tracker {
     unsigned sss_frames{}, glass_frames{}, hit_frames{}, responsivity_frames{};
     unsigned non_finite_color_frames{}, non_finite_output_frames{};
     std::uint32_t non_finite_color_max{}, non_finite_output_max{};
-    std::array<unsigned, 3> shown{}; // presents, unfocused presents, FG evaluations
+    std::array<unsigned, 5>
+        shown{}; // presents, unfocused presents, FG evaluations, SR replaced, SR native
     std::uint64_t since{}, checked{};
     unsigned logged_state{}, mark{};    // the last line's state; frames... at the last check
     std::array<unsigned, 6> marks{};    // rejected, non-finite, sss, glass, hit, responsivity
@@ -106,23 +108,25 @@ class Tracker {
         }
         if (state == logged_state && now - since < Summary)
             return false;
-        char text[640];
-        std::snprintf(text, sizeof(text),
-                      "RR health (%llus): frames=%u rejected=%u resets=%u "
-                      "[rejected=%u cut=%u generation=%u gap=%u] "
-                      "isolatedGuideFrames=%u maxIsolatedPixels=%u "
-                      "sanitizedSssFrames=%u maxSanitizedSamples=%u "
-                      "guides[sss=%u glass=%u hit=%u responsivity=%u] "
-                      "nonFiniteColorFrames=%u maxNonFiniteColorPixels=%u "
-                      "nonFiniteOutputFrames=%u maxNonFiniteOutputPixels=%u "
-                      "presents=%u unfocusedPresents=%u focused=%d fgEvaluations=%u",
-                      static_cast<unsigned long long>((now - since) / 1000), frames, rejected,
-                      resets, reasons[0], reasons[1], reasons[2], reasons[3], isolated_frames,
-                      isolated_max, sanitized_frames, sanitized_max, sss_frames, glass_frames,
-                      hit_frames, responsivity_frames, non_finite_color_frames,
-                      non_finite_color_max, non_finite_output_frames, non_finite_output_max,
-                      shown[0], shown[1],
-                      presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, shown[2]);
+        char text[768];
+        std::snprintf(
+            text, sizeof(text),
+            "RR health (%llus): frames=%u rejected=%u resets=%u "
+            "[rejected=%u cut=%u generation=%u gap=%u] "
+            "isolatedGuideFrames=%u maxIsolatedPixels=%u "
+            "sanitizedSssFrames=%u maxSanitizedSamples=%u "
+            "guides[sss=%u glass=%u hit=%u responsivity=%u] "
+            "nonFiniteColorFrames=%u maxNonFiniteColorPixels=%u "
+            "nonFiniteOutputFrames=%u maxNonFiniteOutputPixels=%u "
+            "presents=%u unfocusedPresents=%u focused=%d fgEvaluations=%u "
+            "srReplaced=%u srNative=%u srWhy=%s",
+            static_cast<unsigned long long>((now - since) / 1000), frames, rejected, resets,
+            reasons[0], reasons[1], reasons[2], reasons[3], isolated_frames, isolated_max,
+            sanitized_frames, sanitized_max, sss_frames, glass_frames, hit_frames,
+            responsivity_frames, non_finite_color_frames, non_finite_color_max,
+            non_finite_output_frames, non_finite_output_max, shown[0], shown[1],
+            presentation.focused.load(std::memory_order_relaxed) ? 1 : 0, shown[2], shown[3],
+            shown[4], rrsr::SkipText(rrsr::counters.last.load(std::memory_order_relaxed)));
         out = text;
         logged_state = state;
         Restart(now);
@@ -137,12 +141,16 @@ class Tracker {
         since = checked = now;
         logged_state = state;
     }
-    // presents, unfocused presents, frame generation evaluations since the last call.
-    static std::array<unsigned, 3> Take() {
+    // presents, unfocused presents, frame generation evaluations, SR evaluations RR replaced
+    // and SR evaluations that ran natively, since the last call.
+    static std::array<unsigned, 5> Take() {
         auto &p = presentation;
+        auto &sr = rrsr::counters;
         return {p.presents.exchange(0, std::memory_order_relaxed),
                 p.unfocused_presents.exchange(0, std::memory_order_relaxed),
-                p.fg_evaluations.exchange(0, std::memory_order_relaxed)};
+                p.fg_evaluations.exchange(0, std::memory_order_relaxed),
+                sr.replaced.exchange(0, std::memory_order_relaxed),
+                sr.native.exchange(0, std::memory_order_relaxed)};
     }
 };
 } // namespace rrhealth

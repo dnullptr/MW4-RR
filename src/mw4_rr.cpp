@@ -202,6 +202,7 @@ static bool SrReplacement(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Paramet
         n && AlbedoInspector().SafeCopies(n.Get()) && AlbedoInspector().StateCoverage(n.Get()),
         SparseLayouts());
     if (replaced) {
+        rrsr::counters.replaced.fetch_add(1, std::memory_order_relaxed);
         ComputeState().Invalidate(n.Get());
         result = NVSDK_NGX_Result_Success;
     }
@@ -222,6 +223,7 @@ static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
     }
     if (k != rrtrace::Kind::SR)
         return;
+    rrsr::counters.native.fetch_add(1, std::memory_order_relaxed);
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
     LiveRR().AfterSR(cl, p, rrtrace::Probe::CurrentCall(), r, rrtrace::Probe::CurrentRuntime(),
                      rrtrace::Probe::RuntimeEpoch(),

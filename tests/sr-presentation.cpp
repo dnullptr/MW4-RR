@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <string>
 int main() {
     rrstatus::Telemetry telemetry;
     rrstatus::Flags flags;
@@ -35,12 +36,38 @@ int main() {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     p.resources = {1, 2, 3, 4};
     assert(rrsr::Eligible(p));
+    // An input this list never transitioned takes the DLSS contract state; the output must be seen.
     for (unsigned i = 0; i < 4; ++i) {
         auto q = p;
         q.known[i] = false;
-        assert(!rrsr::Eligible(q));
+        assert(rrsr::Eligible(q) == (i < 3));
     }
+    // What the game hands RR (17:45 and 17:54 captures): colour pixel-shader read only, depth
+    // and motion never transitioned on the SR list. RR's evaluate transitions colour itself.
     auto q = p;
+    q.known = {true, false, false, true};
+    q.states[0] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    assert(rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_COMMON;
+    assert(!rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    assert(!rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
+    assert(!rrsr::Eligible(q));
+    q = p;
+    q.states[1] = D3D12_RESOURCE_STATE_DEPTH_READ;
+    assert(!rrsr::Eligible(q));
+    q = p;
+    q.resources[2] = 0;
+    q.known[2] = false;
+    assert(!rrsr::Eligible(q));
+    assert(rrsr::ReadOnly(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) &&
+           rrsr::ReadOnly(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) &&
+           !rrsr::ReadOnly(D3D12_RESOURCE_STATE_COMMON) &&
+           !rrsr::ReadOnly(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    assert(std::string(rrsr::SkipText(rrsr::Ineligible)) == "state" &&
+           std::string(rrsr::SkipText(rrsr::Count)) == "unknown");
+    q = p;
     q.states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     assert(!rrsr::Eligible(q));
     q = p;
