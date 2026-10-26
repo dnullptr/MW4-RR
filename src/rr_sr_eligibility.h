@@ -31,7 +31,7 @@ inline bool Eligible(const StateProof &p) {
     }
     return p.known[3] && p.states[3] == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
-// Why the latest SR evaluate kept native SR, for the health line.
+// Why the latest SR evaluate kept native SR.
 enum Skip : unsigned {
     None,
     Off,         // replacement setting off
@@ -58,9 +58,9 @@ inline const char *SkipText(unsigned why) {
                                            "reset",       "untracked", "otherHook", "gpuMemory"};
     return why < Count ? text[why] : "unknown";
 }
-// Lock-free: written on the evaluate thread, read by the health line.
+// Lock-free: written on the evaluate thread.
 struct Counters {
-    std::atomic<unsigned> replaced{}, native{}, last{};
+    std::atomic<unsigned> last{};
 };
 inline Counters counters;
 inline void Note(unsigned why) {

@@ -92,22 +92,6 @@ class Controller {
     bool replace_sr = true;      // skip the game's SR when RR can take its place (ReplaceNativeSR)
     unsigned replace_refusals{}; // replacement frames RR refused in a row
     bool replace_paused{};       // after 3 refusals, until the setting changes
-    struct Trail {
-        struct Entry {
-            ID3D12GraphicsCommandList *list{};
-            D3D12_RESOURCE_STATES before{}, after{};
-            UINT subresource{};
-            D3D12_RESOURCE_BARRIER_FLAGS flags{};
-        };
-        struct Seen {
-            std::array<Entry, 6> entries{};
-            unsigned count{};
-        };
-        std::array<ID3D12Resource *, 4> watch{}; // opaque: compared, never dereferenced
-        std::array<Seen, 4> seen{};
-        ID3D12GraphicsCommandList *sr_list{};
-        unsigned logged{};
-    } trail;
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
@@ -1223,10 +1207,6 @@ class Controller {
         TransparencyProducerBarriersLocked(cl, n, b);
         if (n > 4096 || (n && !b))
             return;
-        if (trail.watch[0])
-            for (UINT i = 0; i < n; ++i)
-                if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
-                    TrailLocked(cl, b[i]);
         for (auto &s : slots)
             if (s.pending_sr && s.sr.Get() == cl)
                 for (UINT i = 0; i < n; ++i)
@@ -1280,7 +1260,6 @@ class Controller {
         // Only an input no barrier on this list named may take the contract state: one whose
         // transition was split, per subresource or unrecorded has no state RR can start from.
         const bool eligible = !untracked && rrsr::Eligible(proof);
-        LogTrailLocked(*s, native.Get(), proof, eligible);
         if (untracked)
             return skip(rrsr::Untracked);
         if (!eligible)
@@ -1305,65 +1284,6 @@ class Controller {
         replace_refusals = 0;
         rrsr::Note(rrsr::None);
         return true;
-    }
-    // The game's transitions of the SR inputs and output since the previous SR call, on any
-    // list, for the first few SR calls: they show the state each input really has at the call.
-    void TrailLocked(ID3D12GraphicsCommandList *cl, const D3D12_RESOURCE_BARRIER &b) {
-        const auto &t = b.Transition;
-        for (unsigned k = 0; k < 4; ++k)
-            if (trail.watch[k] && t.pResource == trail.watch[k]) {
-                auto &r = trail.seen[k];
-                r.entries[r.count % r.entries.size()] = {cl, t.StateBefore, t.StateAfter,
-                                                         t.Subresource, b.Flags};
-                ++r.count;
-            }
-    }
-    void LogTrailLocked(const Slot &s, ID3D12GraphicsCommandList *sr_list,
-                        const rrsr::StateProof &proof, bool eligible) {
-        bool same = true;
-        for (unsigned k = 0; k < 4; ++k)
-            same &= trail.watch[k] == s.gpu.sr[k].Get();
-        if (same && trail.logged < 3) {
-            ++trail.logged;
-            static constexpr const char *names[] = {"color", "depth", "motion", "output"};
-            char line[2048] = {};
-            size_t at = 0;
-            const auto append = [&](const char *format, auto... values) {
-                if (at < sizeof(line)) {
-                    const int n = snprintf(line + at, sizeof(line) - at, format, values...);
-                    at = n < 0 ? sizeof(line) : at + size_t(n);
-                }
-            };
-            append("SR state trail %u (%s):", trail.logged, eligible ? "eligible" : "not eligible");
-            for (unsigned k = 0; k < 4; ++k) {
-                const auto &r = trail.seen[k];
-                append(" %s %s 0x%x, %u seen:", names[k],
-                       proof.known[k] ? "at SR" : "at SR unknown", unsigned(proof.states[k]),
-                       r.count);
-                const unsigned n =
-                    r.count < r.entries.size() ? r.count : unsigned(r.entries.size());
-                for (unsigned e = r.count - n; e < r.count; ++e) {
-                    const auto &v = r.entries[e % r.entries.size()];
-                    append(" [%s 0x%x->0x%x%s%s]",
-                           v.list == sr_list         ? "srList"
-                           : v.list == trail.sr_list ? "lastSrList"
-                                                     : "other",
-                           unsigned(v.before), unsigned(v.after),
-                           v.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? "" : " sub",
-                           v.flags == D3D12_RESOURCE_BARRIER_FLAG_NONE ? "" : " split");
-                }
-                append(";");
-            }
-            Log(line);
-        }
-        if (trail.logged >= 3) {
-            trail.watch = {};
-            return;
-        }
-        trail.seen = {};
-        trail.sr_list = sr_list;
-        for (unsigned k = 0; k < 4; ++k)
-            trail.watch[k] = s.gpu.sr[k].Get();
     }
     bool AfterSR(ID3D12GraphicsCommandList *public_cl, const NVSDK_NGX_Parameter *p,
                  rrtrace::SlCall scope, NVSDK_NGX_Result result, HMODULE mod, UINT64 epoch,

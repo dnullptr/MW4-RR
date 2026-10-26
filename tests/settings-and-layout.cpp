@@ -431,9 +431,6 @@ int main() {
     shown.unfocused_presents += 5;
     shown.focused = true;
     shown.fg_evaluations += 12;
-    rrsr::counters.replaced += 3;
-    rrsr::counters.native += 1;
-    rrsr::Note(rrsr::Ineligible);
     assert(!health.Report(1000 + rrhealth::Tracker::Interval - 1, report));
     assert(shown.presents == 16);
     assert(health.Report(1000 + rrhealth::Tracker::Interval, report));
@@ -444,11 +441,8 @@ int main() {
     assert(report.find("maxSanitizedSamples=30 guides[sss=4 glass=1 hit=2 responsivity=3] "
                        "nonFiniteColorFrames=2 maxNonFiniteColorPixels=3 "
                        "nonFiniteOutputFrames=1 maxNonFiniteOutputPixels=7 presents=16 "
-                       "unfocusedPresents=5 focused=1 fgEvaluations=12 "
-                       "srReplaced=3 srNative=1 srWhy=state") != std::string::npos);
+                       "unfocusedPresents=5 focused=1 fgEvaluations=12") != std::string::npos);
     assert(shown.presents == 0 && shown.unfocused_presents == 0 && shown.fg_evaluations == 0);
-    assert(rrsr::counters.replaced == 0 && rrsr::counters.native == 0);
-    rrsr::Note(rrsr::None);
     // An inactive interval logs nothing and still drops its presentation counts.
     shown.presents = 7;
     shown.unfocused_presents = 7;
@@ -467,8 +461,7 @@ int main() {
                        "maxSanitizedSamples=0 guides[sss=0 glass=0 hit=0 responsivity=0] "
                        "nonFiniteColorFrames=0 maxNonFiniteColorPixels=0 "
                        "nonFiniteOutputFrames=0 maxNonFiniteOutputPixels=0 presents=2 "
-                       "unfocusedPresents=2 focused=0 fgEvaluations=0 srReplaced=0 srNative=0 "
-                       "srWhy=none") != std::string::npos);
+                       "unfocusedPresents=2 focused=0 fgEvaluations=0") != std::string::npos);
     // The same state again is held back until the slow summary, which counts every frame since
     // the last line; a state change (a rejected frame) logs at its interval.
     const std::uint64_t logged_at = 1000 + 3 * rrhealth::Tracker::Interval;
@@ -489,14 +482,9 @@ int main() {
     assert(!wide.Report(0, report));
     wide.Frame({~0u, 0, ~0u, ~0u}, {~0u, ~0u, true, true, true, true});
     shown.presents = shown.unfocused_presents = shown.fg_evaluations = ~0u;
-    rrsr::counters.replaced = rrsr::counters.native = ~0u;
-    rrsr::Note(rrsr::Reconfigure);
     assert(wide.Report(~0ull, report));
-    assert(report.size() > 400 &&
-           report.ends_with(" fgEvaluations=4294967295 srReplaced=4294967295 "
-                            "srNative=4294967295 srWhy=reconfigure"));
+    assert(report.size() > 400 && report.ends_with(" fgEvaluations=4294967295"));
     shown.presents = shown.unfocused_presents = shown.fg_evaluations = 0;
-    rrsr::Note(rrsr::None);
     // NGX feature kinds the probe tells apart (NVSDK_NGX_Feature values).
     assert(rrtrace::FeatureKind(1) == rrtrace::Kind::SR);
     assert(rrtrace::FeatureKind(13) == rrtrace::Kind::RR);
