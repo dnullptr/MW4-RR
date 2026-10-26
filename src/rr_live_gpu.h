@@ -53,17 +53,15 @@ struct Budget {
     UINT64 limit = Minimum, bytes{};
     // A pool projection is not a DXGI reservation. Recheck each actual new
     // allocation; matching retained resources never enter this path.
-    // Within budget, an allocation must fit what is left. Once the process is already over
-    // budget (another add-on's VRAM, for one: DLSS5 NR runs it to three times the budget),
-    // refusing RR's allocations no longer keeps anything resident; it only drops RR to native
-    // frames and resets its history every retry. RR's own ledger (limit) still caps it, and
-    // a real E_OUTOFMEMORY still defers.
+    // RR's own ledger (limit, see Reserve) is the cap; the process budget alone no longer
+    // refuses. Over or near budget (another add-on's VRAM, for one: DLSS5 NR runs it to three
+    // times the budget) a refusal keeps nothing resident; it only drops RR to native frames
+    // and resets its history every retry. A real E_OUTOFMEMORY still defers.
     template <class Query> bool AdmitAllocation(UINT64 needed, Query query) const {
         if (!needed || needed == UINT64_MAX || needed > limit || bytes > limit - needed)
             return false;
         UINT64 available_budget{}, usage{};
-        return query(available_budget, usage) &&
-               (usage > available_budget || needed <= available_budget - usage);
+        return query(available_budget, usage);
     }
     static DXGI_MEMORY_SEGMENT_GROUP Segment(bool uma, D3D12_HEAP_TYPE type) {
         return uma || type == D3D12_HEAP_TYPE_DEFAULT ? DXGI_MEMORY_SEGMENT_GROUP_LOCAL
@@ -103,9 +101,11 @@ struct Budget {
             FAILED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) ||
             FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
             return false;
-        // Already over budget (see AdmitAllocation): the ledger may still grow, to OverBudget.
-        if (info.CurrentUsage > info.Budget ? required > OverBudget
-                                            : required - bytes > info.Budget - info.CurrentUsage)
+        // The ledger grows into what the budget has left, and in any case to OverBudget (see
+        // AdmitAllocation), so RR near or over budget keeps running at a fixed cap.
+        const bool fits = info.CurrentUsage <= info.Budget &&
+                          required - bytes <= info.Budget - info.CurrentUsage;
+        if (!fits && required > OverBudget)
             return false;
         limit = required;
         return true;
