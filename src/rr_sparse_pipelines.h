@@ -6,6 +6,7 @@
 #include "rr_sss_vertex_proof.h"
 #include "../build/rr_sparse.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +57,22 @@ inline void Fail(reshade::api::device *d, const char *why) {
         ++unsafe_revision[d];
         if (logger)
             logger(why);
+    }
+}
+// A proof that can fail for a while, as after the game recreates its lighting targets on a
+// swapchain resize: frames already corrected are invalidated and RR waits, then retries on the
+// next dispatch instead of staying blocked for the session. Logged on the 1st to 3rd and every
+// power-of-two occurrence.
+inline std::unordered_map<reshade::api::device *, uint64_t> skipped;
+inline void Skip(reshade::api::device *d, const char *why) {
+    std::lock_guard lock(mutex);
+    ++unsafe_revision[d];
+    const auto n = ++skipped[d];
+    if (logger && (n <= 3 || !(n & (n - 1)))) {
+        char line[256];
+        snprintf(line, sizeof(line), "%s; RR waits and retries (%llu so far)", why,
+                 (unsigned long long)n);
+        logger(line);
     }
 }
 inline Status Health(reshade::api::device *d) {
@@ -113,6 +130,7 @@ inline void Forget(reshade::api::device *d) {
     ++unsafe_revision[d];
     failed_devices.erase(d);
     corrected_devices.erase(d);
+    skipped.erase(d);
     for (auto i = pipelines.begin(); i != pipelines.end();)
         if (i->second.device == d)
             i = pipelines.erase(i);

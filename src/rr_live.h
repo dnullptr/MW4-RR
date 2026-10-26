@@ -1191,16 +1191,14 @@ class Controller {
     bool SamplingReady(ID3D12GraphicsCommandList *cl) {
         return bool(SamplingData(cl).buffer);
     }
-    bool RawWasCorrected(ID3D12GraphicsCommandList *cl) {
-        std::lock_guard lock(mutex);
-        for (auto &s : slots)
-            if (RawSlot(s, cl) && s.raw_corrected)
-                return true;
-        return false;
-    }
+    // Only while the correction still holds: a proof skipped later in the recording (rrbypass::Skip)
+    // leaves the native filters running for the frame RR will reject.
     bool RawSpatialPassthrough(ID3D12GraphicsCommandList *cl) {
         std::lock_guard lock(mutex);
-        return RawWasCorrected(cl);
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && LightingValid(s))
+                return true;
+        return false;
     }
     void BeforeSR(ID3D12GraphicsCommandList *public_cl, const NVSDK_NGX_Parameter *p,
                   rrtrace::SlCall scope, bool safe) {

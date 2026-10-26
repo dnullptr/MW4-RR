@@ -96,8 +96,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
             !SparsePair(list, native.Get(), effective, true, 0, output) || z != 1 ||
             x != (input.r[0]->GetDesc().Width + 7) / 8 ||
             y != (input.r[0]->GetDesc().Height + 7) / 8) {
-            rrbypass::Fail(device,
-                           "RR current/native-history bindings or layouts unproven; RR blocked");
+            rrbypass::Skip(device, "RR current/native-history bindings or layouts unproven");
             return false;
         }
         rrinternal::Scope ignoreCopies;
@@ -108,13 +107,13 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         return false;
     }
     if (!SparsePair(list, native.Get(), effective, false, 0, input)) {
-        rrbypass::Fail(device, "RR spatial input proof failed; RR blocked");
+        rrbypass::Skip(device, "RR spatial input proof failed");
         return false;
     }
     if (!SparsePool().Pending(native.Get(), input))
         return false;
     if (!SparsePair(list, native.Get(), effective, true, 0, output, true)) {
-        rrbypass::Fail(device, "RR first spatial output proof failed; RR blocked");
+        rrbypass::Skip(device, "RR first spatial output proof failed");
         return false;
     }
     // SSS pixels take lobe 2 history first + spatial; the native-root path prepares raw.
