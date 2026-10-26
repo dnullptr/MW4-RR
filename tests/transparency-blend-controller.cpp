@@ -1467,7 +1467,7 @@ struct ControllerCpuTest {
         c.CoverageReportLocked(475000);
         c.CoverageReportLocked(485000);
         assert(logs.size() == 1);
-    // RR off, failed or retired: no line.
+        // RR off, failed or retired: no line.
         c.SetTransparencyBlendEnabled(true);
         c.SetEnabled(false);
         c.CoverageReportLocked(495000);
