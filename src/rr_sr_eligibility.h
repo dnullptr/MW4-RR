@@ -55,13 +55,6 @@ enum Skip : unsigned {
     Memory,      // a new RR allocation is waiting for GPU memory (not a refusal)
     Count
 };
-inline const char *SkipText(unsigned why) {
-    static constexpr const char *text[] = {"none",        "setting",   "rrOff",     "failed",
-                                           "reconfigure", "unsafe",    "noFrame",   "list",
-                                           "state",       "rrChecks",  "callback",  "creation",
-                                           "reset",       "untracked", "otherHook", "gpuMemory"};
-    return why < Count ? text[why] : "unknown";
-}
 // Lock-free: written on the evaluate thread.
 struct Counters {
     std::atomic<unsigned> last{};

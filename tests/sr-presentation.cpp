@@ -66,8 +66,6 @@ int main() {
            rrsr::ReadOnly(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) &&
            !rrsr::ReadOnly(D3D12_RESOURCE_STATE_COMMON) &&
            !rrsr::ReadOnly(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-    assert(std::string(rrsr::SkipText(rrsr::Ineligible)) == "state" &&
-           std::string(rrsr::SkipText(rrsr::Count)) == "unknown");
     // Jumps a hook beneath RR's starts NGX evaluation with (rrforeign::Beneath).
     {
         const uint8_t rel[16] = {0xE9, 0x10, 0x00, 0x00, 0x00};
@@ -81,7 +79,6 @@ int main() {
         assert(rrforeign::JumpTarget(absolute, 0) == 0x1122334455667788ull);
         const uint8_t prologue[16] = {0x48, 0x89, 0x5C, 0x24, 0x08}; // mov [rsp+8], rbx
         assert(rrforeign::JumpTarget(prologue, 0x1000) == 0);
-        assert(std::string(rrsr::SkipText(rrsr::Foreign)) == "otherHook");
     }
     q = p;
     q.states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
