@@ -696,8 +696,11 @@ class Pool {
                 occurrences += lists[i] == s.command;
             if (!occurrences)
                 continue;
+            // A snapshot no first spatial used (its proof was skipped, or RR or its checks were
+            // off by then) is abandoned here, and fenced like an applied one.
+            s.consumed = true;
             ComPtr<ID3D12Device> d;
-            const bool valid = occurrences == 1 && s.consumed && !s.pending && !s.poisoned &&
+            const bool valid = occurrences == 1 && !s.pending && !s.poisoned &&
                                q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
                                SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&d))) &&
                                fg::SameNativeObject(d.Get(), s.device.Get()) &&

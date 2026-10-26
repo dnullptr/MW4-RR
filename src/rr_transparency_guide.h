@@ -138,15 +138,25 @@ struct Gpu {
             return;
         }
         const auto before = owner.bytes;
-        snapshot = owner.Allocate(p, budget, SnapshotDesc(d));
-        guide = owner.Allocate(p, budget, GuideDesc(rw, rh));
+        // All or nothing, so a later try allocates again instead of finding half a guide.
+        try {
+            snapshot = owner.Allocate(p, budget, SnapshotDesc(d));
+            guide = owner.Allocate(p, budget, GuideDesc(rw, rh));
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+            Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
+                  "glass immutable heap failed");
+        } catch (...) {
+            snapshot.Reset();
+            guide.Reset();
+            heap.Reset();
+            budget.bytes -= owner.bytes - before;
+            owner.bytes = before;
+            throw;
+        }
         bytes = owner.bytes - before;
         w = rw;
         h = rh;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
-                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-        Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
-              "glass immutable heap failed");
         const auto stride =
             p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto cpu = heap->GetCPUDescriptorHandleForHeapStart();

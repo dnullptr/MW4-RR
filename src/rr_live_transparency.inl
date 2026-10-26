@@ -9,9 +9,11 @@ bool transparency_producer_suspended{};
 // non-admission backs off (5, 10, 20, 40, 60 s) until a producer frame is admitted again.
 ULONGLONG transparency_resume_at{};
 unsigned transparency_suspensions{}, transparency_backoff{};
-void SuspendTransparencyProducer(const char *why) {
+// why: nullptr for a frame not admitted, else the reason. Memory waits 1 s; anything else backs
+// off from 5 s.
+void SuspendTransparencyProducer(const char *why, bool memory = false) {
     ULONGLONG pause = 1000;
-    if (!why) {
+    if (!memory) {
         pause = (std::min)(5000ull << (std::min)(transparency_backoff, 4u), 60000ull);
         ++transparency_backoff;
     }
@@ -244,13 +246,11 @@ bool TransparencyProducerTransition(ID3D12GraphicsCommandList *cl, const D3D12_R
             return true;
         } catch (const rrprivate::AllocationDeferred &) {
             t.written = false;
-            SuspendTransparencyProducer("waiting for GPU memory");
+            SuspendTransparencyProducer("waiting for GPU memory", true);
             return false;
         } catch (const std::exception &e) {
             t.written = false;
-            transparency_producer_suspended = true;
-            transparency_resume_at = ~0ull; // A real failure stays until the guide toggles.
-            Log(e.what());
+            SuspendTransparencyProducer(e.what());
             return false;
         }
     }
