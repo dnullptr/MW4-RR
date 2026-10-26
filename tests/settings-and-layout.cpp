@@ -26,7 +26,7 @@
 constexpr rrsettings::Preferences defaults;
 static_assert(defaults.blend);
 static_assert(defaults.rr && defaults.sss && defaults.glass && defaults.hit &&
-              defaults.weapon_depth && defaults.preset == 6);
+              !defaults.weapon_depth && defaults.preset == 6);
 static_assert(defaults.tolerate_isolated && defaults.water);
 // The water responsivity mask starts on, and only preset F wants it.
 static_assert(rrwater::Settings{}.responsivity && rrwater::Settings{}.strength == 1.0f);
