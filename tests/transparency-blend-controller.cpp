@@ -1170,7 +1170,7 @@ struct ControllerCpuTest {
             auto t = r.Capture(r.list);
             r.c.CoverageFailed(std::move(t), "replay refused");
             assert(!t && !OwnsLock(r.c.mutex) && r.c.blend_failed && !r.c.failed);
-            assert(Logged("recording failed: replay refused; disabled until toggled"));
+            assert(Logged("recording failed: replay refused; off for a few seconds"));
             assert(r.S().coverage.Live() && !r.S().coverage.captures_oit);
             assert(!r.Capture(r.list));
         }

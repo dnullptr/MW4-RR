@@ -26,7 +26,7 @@ void BlendFailed(const char *what) noexcept {
     try {
         char line[256];
         snprintf(line, sizeof(line),
-                 "Transparency albedo blend recording failed: %s; disabled until toggled",
+                 "Transparency albedo blend recording failed: %s; off for a few seconds",
                  what ? what : "unknown");
         Log(line);
     } catch (...) {

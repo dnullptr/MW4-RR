@@ -141,6 +141,24 @@ class Controller {
     ComPtr<ID3D12Resource> transparency_source;
     bool sss_enabled{}, sss_failed{};
     UINT64 sss_retry_after{};
+    // An error turns RR or an optional guide off for a pause, not for the session: 5 s,
+    // doubling for repeats up to 60 s, back to 5 s after 5 minutes without one. RR itself
+    // restarts through Reconfigure, which waits for its outstanding GPU work and never retires
+    // a poisoned slot, so RR stays off when that work cannot be accounted for. fatal: GPU
+    // objects were stranded or NGX refused to release them, and RR stays off.
+    struct Pause {
+        UINT64 at{}, lifted{};
+        unsigned repeats{};
+        UINT64 Schedule(UINT64 now) {
+            if (now - lifted > 300000)
+                repeats = 0;
+            const UINT64 delay = (std::min)(5000ull << (std::min)(repeats, 4u), 60000ull);
+            at = now + delay;
+            return delay;
+        }
+    };
+    Pause rr_pause, sss_pause, transparency_pause, water_pause, blend_pause;
+    bool fatal{};
     // Latest guide an admitted SR submission resolves, for SSS-masked lighting.
     rrsssmask::Record sss_mask;
     ComPtr<ID3D12Resource> sss_mask_guide;
@@ -318,10 +336,57 @@ class Controller {
     bool Complete(const Slot &s) const {
         return Complete(s, (s.poisoned || !s.fence_value) ? 0 : fence->GetCompletedValue());
     }
-    void Failure(const char *why) {
+    void Failure(const char *why, bool permanent = false) {
+        const bool first = !failed;
         failed = true;
+        fatal |= permanent;
+        // A poisoned slot never retires: its GPU work is unaccounted for.
+        for (const auto &s : slots)
+            fatal |= s.poisoned;
         policy.Reject();
-        Log(why);
+        if (!first || fatal || retired) {
+            Log(why);
+            return;
+        }
+        char line[320];
+        snprintf(line, sizeof(line), "%s; RR restarts in %llu s", why,
+                 (unsigned long long)(rr_pause.Schedule(GetTickCount64()) / 1000));
+        Log(line);
+    }
+    // At a native rendering boundary: restart RR once its pause is over and every slot retires.
+    bool Recover() {
+        if (!failed)
+            return true;
+        const UINT64 now = GetTickCount64();
+        if (fatal || retired || !rr_pause.at || now < rr_pause.at)
+            return false;
+        layout_pending = true;
+        if (!Reconfigure() || fatal)
+            return false;
+        failed = false;
+        rr_pause.at = 0;
+        rr_pause.lifted = now;
+        ++rr_pause.repeats;
+        Log("RR restarted after an error");
+        return true;
+    }
+    // In PollLocked: an optional guide turned off by an error comes back after its pause.
+    void Resume(bool &off, Pause &p, UINT64 now, const char *what) {
+        if (!off)
+            return;
+        if (!p.at) {
+            p.Schedule(now);
+            return;
+        }
+        if (now < p.at)
+            return;
+        off = false;
+        p.at = 0;
+        p.lifted = now;
+        ++p.repeats;
+        char line[128];
+        snprintf(line, sizeof(line), "%s: retrying after an error", what);
+        Log(line);
     }
     // A failed retirement call logs its NGX result; a missing export has none.
     bool RetirementFailed(const char *what, bool exported, NVSDK_NGX_Result result) {
@@ -331,7 +396,7 @@ class Controller {
                      rrngxlog::Code(result).text);
         else
             snprintf(line, sizeof(line), "%s (export missing); allocations retained", what);
-        Failure(line);
+        Failure(line, true);
         return false;
     }
     void Initialize(ID3D12Device *d) {
@@ -404,6 +469,7 @@ class Controller {
                      setup_queue.Get(), setup_fence.Get()})
                 stranded.emplace_back(object);
             failed = true;
+            fatal = true;
             throw std::runtime_error("live init unfinished; RR off");
         }
         initialized = true;
@@ -519,7 +585,7 @@ class Controller {
         selected_view = UINT_MAX;
         key = {};
         if (++generation == 0) {
-            Failure("RR feature generation overflow");
+            Failure("RR feature generation overflow", true);
             return false;
         }
         status.Reset(generation);
@@ -577,6 +643,10 @@ class Controller {
             }
         }
         const UINT64 now = GetTickCount64();
+        Resume(sss_failed, sss_pause, now, "Subsurface Scattering guide");
+        Resume(transparency_failed, transparency_pause, now, "Transparency guide");
+        Resume(water_failed, water_pause, now, "Water responsivity mask");
+        Resume(blend_failed, blend_pause, now, "Transparency albedo blend");
         std::string report;
         if (health.Report(now, report))
             Log(report.c_str());
@@ -940,7 +1010,7 @@ class Controller {
             return;
         enabled = value;
         if (++generation == 0) {
-            Failure("RR enable generation overflow");
+            Failure("RR enable generation overflow", true);
             return;
         }
         status.Reset(generation);
@@ -998,11 +1068,13 @@ class Controller {
                  const std::array<UINT64, 2> &offsets, const rrcompute::Snapshot &restore, UINT x,
                  UINT y, UINT z) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired)
+        if (!enabled || retired)
             return false;
         bool dispatched = false;
         try {
             PollLocked();
+            if (!Recover())
+                return false;
             if (!restore.valid || !restore.heap_restore_valid || restore.command != cl ||
                 camera_frame == UINT_MAX || camera_view == UINT_MAX || !latest.readable ||
                 !latest.basis_valid || !latest.projection_valid ||
@@ -1858,7 +1930,7 @@ class Controller {
             }
         rrprivate::FencePoint point{fence, signaled};
         if (!point.Wait(30000)) {
-            Failure("RR shutdown deferred: live GPU inference unfinished");
+            Failure("RR shutdown deferred: live GPU inference unfinished", true);
             return false;
         }
         return true;

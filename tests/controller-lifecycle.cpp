@@ -186,6 +186,44 @@ struct ControllerCpuTest {
         assert(logged == "RR feature retirement failed (export missing); allocations retained\n");
         logged.clear();
     }
+    // An error turns RR off for a pause, then RR restarts through Reconfigure; a poisoned slot
+    // or a failed retirement keeps it off. Optional guides come back after their own pause.
+    static void FailureRecovers() {
+        Controller c;
+        c.logger = &Logged;
+        c.Failure("boom");
+        assert(c.failed && !c.fatal && c.rr_pause.at);
+        assert(logged == "boom; RR restarts in 5 s\n");
+        logged.clear();
+        assert(!c.Recover() && c.failed); // the pause is not over
+        c.rr_pause.at = 1;
+        assert(c.Recover() && !c.failed && !c.layout_pending && c.rr_pause.repeats == 1);
+        assert(logged == "RR restarted after an error\n");
+        logged.clear();
+        c.Failure("again");
+        assert(logged == "again; RR restarts in 10 s\n");
+        logged.clear();
+        Controller p;
+        p.logger = &Logged;
+        p.slots.emplace_back();
+        p.slots.back().poisoned = true;
+        p.Failure("lost");
+        assert(p.fatal && logged == "lost\n");
+        logged.clear();
+        p.rr_pause.at = 1;
+        assert(!p.Recover() && p.failed);
+        Controller g;
+        g.logger = &Logged;
+        g.sss_failed = true;
+        g.Resume(g.sss_failed, g.sss_pause, 100000, "Subsurface Scattering guide");
+        assert(g.sss_failed && g.sss_pause.at == 105000);
+        g.Resume(g.sss_failed, g.sss_pause, 104999, "Subsurface Scattering guide");
+        assert(g.sss_failed && logged.empty());
+        g.Resume(g.sss_failed, g.sss_pause, 105000, "Subsurface Scattering guide");
+        assert(!g.sss_failed && !g.sss_pause.at && g.sss_pause.repeats == 1);
+        assert(logged == "Subsurface Scattering guide: retrying after an error\n");
+        logged.clear();
+    }
     // Each stats reader maps only its own bytes: the gate (0..15) and the non-finite counts
     // (256, 260), inside the 512-byte readback.
     static void StatsReaders() {
@@ -284,6 +322,7 @@ struct ControllerCpuTest {
     static void Run() {
         DevTests();
         RetirementFailure();
+        FailureRecovers();
         StatsReaders();
         RuntimeLog();
         WeaponDepth();

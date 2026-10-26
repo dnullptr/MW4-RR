@@ -85,6 +85,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
         (ID3D12GraphicsCommandList *)list->get_native());
     if (!native || !AlbedoInspector().SafeCopies(native.Get()) ||
         !AlbedoInspector().StateCoverage(native.Get())) {
+        SparsePool().Abandon(native.Get());
         rrbypass::Fail(device,
                        "RR unsupported native copy context; correction disabled and RR blocked");
         return false;
@@ -145,6 +146,7 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
                  "RR scale rejected: rates=%d rootCBVs=%d snapshot=%s complete=%d heapRestore=%d",
                  bool(rates.buffer), cbvs.valid, privateRestore.status, privateRestore.complete,
                  privateRestore.heap_restore_valid);
+        SparsePool().Abandon(native.Get());
         rrbypass::Fail(device, text);
         return false;
     }
@@ -177,9 +179,12 @@ static bool SparseDispatch(reshade::api::command_list *list, uint32_t x, uint32_
     if (replaced) {
         rrbypass::Corrected(device);
     }
-    else
+    else {
+        // Retried after the pause; Before() then fences the unused snapshot.
+        SparsePool().Abandon(native.Get());
         rrbypass::Fail(
             device,
             "RR first spatial correction validation failed; native temporal continues, RR blocked");
+    }
     return replaced;
 }
