@@ -9,6 +9,7 @@
 #include "rr_lighting_source.h"
 #include "rr_sss_mask.h"
 #include <array>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -413,6 +414,8 @@ class Pool {
 
   public:
     void (*failure)(const char *){};
+    void (*logger)(const char *){};
+    uint64_t abandoned{}; // snapshots no first spatial used, logged at 1-3 and powers of two
     void Fail(const char *why) {
         if (failure)
             failure(why);
@@ -698,7 +701,18 @@ class Pool {
                 continue;
             // A snapshot no first spatial used (its proof was skipped, or RR or its checks were
             // off by then) is abandoned here, and fenced like an applied one.
-            s.consumed = true;
+            if (!s.consumed) {
+                s.consumed = true;
+                const auto n = ++abandoned;
+                if (logger && (n <= 3 || !(n & (n - 1)))) {
+                    char line[160];
+                    snprintf(line, sizeof(line),
+                             "RR lighting snapshot submitted without its first spatial pass; "
+                             "frame skipped (%llu so far)",
+                             (unsigned long long)n);
+                    logger(line);
+                }
+            }
             ComPtr<ID3D12Device> d;
             const bool valid = occurrences == 1 && !s.pending && !s.poisoned &&
                                q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&

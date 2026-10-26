@@ -64,6 +64,7 @@ static rrsparsecopy::Pool &SparsePool() {
     static auto *p = []() {
         auto *v = new rrsparsecopy::Pool;
         v->failure = &SparseFailure;
+        v->logger = &WriteLog;
         return v;
     }();
     return *p;
