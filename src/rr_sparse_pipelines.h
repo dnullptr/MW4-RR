@@ -2,13 +2,18 @@
 #include <reshade.hpp>
 #include "feed_fg_identity.h"
 #include "rr_shader_versions.h"
+#include "rr_lighting_source.h"
+#include "rr_sss_vertex_proof.h"
 #include "../build/rr_sparse.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
 #include <atomic>
+#include <vector>
 namespace rrbypass {
 inline constexpr uint64_t Temporal = 0x6ef368e46fa21120ull, Spatial = 0xd63e707761558424ull,
                           Vrrt = 0x53958092126ea74aull;
@@ -36,7 +41,8 @@ inline void GlobalFail(const char *why) {
     if (!global_failed.exchange(true) && logger)
         logger(why);
 }
-inline std::unordered_map<uint64_t, Entry> pipelines;
+// Never destroyed: entries hold root signatures, which must not be released at process exit.
+inline auto &pipelines = *new std::unordered_map<uint64_t, Entry>;
 inline std::unordered_set<reshade::api::device *> failed_devices, corrected_devices;
 inline std::unordered_map<reshade::api::device *, uint64_t> unsafe_revision;
 struct Status {
@@ -46,16 +52,66 @@ struct Status {
 inline bool Target(uint64_t h) {
     return h == Temporal || h == Spatial || h == Vrrt;
 }
+// A failed check blocks RR on the device for a pause, then RR's checks run again: 5 s, doubling
+// for repeats up to 60 s, back to 5 s after 5 minutes without one. Failures recorded without
+// Fail (pipeline table overflow, a target pipeline created outside the hooks) and GlobalFail
+// (a lost state observation) stay for the session.
+struct Pause {
+    uint64_t at{}, lifted{};
+    unsigned repeats{};
+};
+inline std::unordered_map<reshade::api::device *, Pause> paused;
+inline uint64_t NowMs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
 inline void Fail(reshade::api::device *d, const char *why) {
     std::lock_guard lock(mutex);
     if (failed_devices.insert(d).second) {
         ++unsafe_revision[d];
-        if (logger)
-            logger(why);
+        auto &p = paused[d];
+        const auto now = NowMs();
+        if (now - p.lifted > 300000)
+            p.repeats = 0;
+        const uint64_t delay = (std::min)(5000ull << (std::min)(p.repeats, 4u), 60000ull);
+        p.at = now + delay;
+        if (logger) {
+            char line[320];
+            snprintf(line, sizeof(line), "%s; RR retries in %llu s", why,
+                     (unsigned long long)(delay / 1000));
+            logger(line);
+        }
+    }
+}
+// A proof that can fail for a while, as after the game recreates its lighting targets on a
+// swapchain resize: frames already corrected are invalidated and RR waits, then retries on the
+// next dispatch instead of staying blocked for the session. Logged on the 1st to 3rd and every
+// power-of-two occurrence.
+inline std::unordered_map<reshade::api::device *, uint64_t> skipped;
+inline void Skip(reshade::api::device *d, const char *why) {
+    std::lock_guard lock(mutex);
+    ++unsafe_revision[d];
+    const auto n = ++skipped[d];
+    if (logger && (n <= 3 || !(n & (n - 1)))) {
+        char line[256];
+        snprintf(line, sizeof(line), "%s; RR waits and retries (%llu so far)", why,
+                 (unsigned long long)n);
+        logger(line);
     }
 }
 inline Status Health(reshade::api::device *d) {
     std::lock_guard lock(mutex);
+    if (auto p = paused.find(d);
+        p != paused.end() && p->second.at && failed_devices.contains(d) && NowMs() >= p->second.at) {
+        failed_devices.erase(d);
+        ++unsafe_revision[d];
+        p->second.at = 0;
+        p->second.lifted = NowMs();
+        ++p->second.repeats;
+        if (logger && !global_failed)
+            logger("RR lighting checks: retrying after an error");
+    }
     Status s;
     s.failed = global_failed || failed_devices.contains(d);
     s.corrected = corrected_devices.contains(d);
@@ -109,6 +165,8 @@ inline void Forget(reshade::api::device *d) {
     ++unsafe_revision[d];
     failed_devices.erase(d);
     corrected_devices.erase(d);
+    skipped.erase(d);
+    paused.erase(d);
     for (auto i = pipelines.begin(); i != pipelines.end();)
         if (i->second.device == d)
             i = pipelines.erase(i);

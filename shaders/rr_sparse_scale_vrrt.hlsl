@@ -22,34 +22,162 @@ uint PixelCode(uint2 p){
  else{uint i=(byteOffset-65536)/4;word=RateWords1[i/4][i%4];}
  return (word>>((byteOffset&2)*8))&65535;
 }
+// RR_NATIVE_LOBE is a lobe mask (1 = first, 2 = second, 3 = both) taken from
+// native temporal output (t0, the native spatial input) instead of raw
+// current-frame lighting. The game's SSS blur spreads sparse, boosted raw
+// diffuse samples into blotches. Its weight bits come along too, matching the
+// temporal-only passthrough comparison.
+// RR_NATIVE_FILL keeps a lobe's fresh sample, without the inverse-probability
+// boost, wherever a ray landed this frame; only unsampled pixels take native.
+#ifndef RR_NATIVE_LOBE
+#define RR_NATIVE_LOBE 0
+#endif
+#ifndef RR_NATIVE_FILL
+#define RR_NATIVE_FILL 0
+#endif
+// RR_SSS_MASK applies that selection only where the previous frame's SSS guide
+// (t2) is nonzero; every other pixel keeps raw boosted lighting. The game's
+// guide is exactly 0 off SSS pixels. Only the private root binds t2.
+#ifndef RR_SSS_MASK
+#define RR_SSS_MASK 0
+#endif
+#if RR_SSS_MASK
+Texture2D<float> sssGuide:register(t2);
+#endif
+float4 UnpackLobe(uint2 packed){
+ return float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
+}
 uint2 ScaleLobe(uint2 packed,bool sampled,uint inverse,out bool valid){
- float4 v=float4(f16tof32(packed.x&65535),f16tof32(packed.x>>16),f16tof32(packed.y&65535),f16tof32(packed.y>>16));
+ float4 v=UnpackLobe(packed);
  valid=sampled&&inverse!=0&&all(v>=0)&&all(v<=65504);
  if(!valid)return 0;
  float f=float(inverse);v=min(v*float4(f,f,f,f*f),65504);
  uint4 h=f32tof16(v);return uint2(h.x|(h.y<<16),h.z|(h.w<<16));
 }
+uint2 SelectLobe(uint2 raw,bool sampled,uint2 native,out bool fresh){
+#if RR_NATIVE_FILL
+ float4 v=float4(f16tof32(raw.x&65535),f16tof32(raw.x>>16),f16tof32(raw.y&65535),f16tof32(raw.y>>16));
+ fresh=sampled&&all(v>=0)&&all(v<=65504);
+#else
+ fresh=false;
+#endif
+ return fresh?raw:native;
+}
+// RR_FILL_SPATIAL (SSS-masked lobe 2 fill gaps only): an unsampled pixel takes native
+// temporal only where its native lobe-2 field ((nw>>8)&4095) is at least RR_FILL_HISTORY
+// (4096: never). Otherwise it takes the mean of this frame's fresh, unboosted, finite
+// lobe-2 samples within 2 px, inside this 16x16 group (0 if there are none). Neighbours
+// come from groupshared copies taken before any thread writes, so there is no race with
+// the in-place output or with other groups and strips. Fresh pixels stay unboosted.
+#ifndef RR_FILL_SPATIAL
+#define RR_FILL_SPATIAL 0
+#endif
+#ifndef RR_FILL_HISTORY
+#define RR_FILL_HISTORY 0
+#endif
+#if RR_FILL_SPATIAL&&!(RR_SSS_MASK&&RR_NATIVE_FILL&&RR_NATIVE_LOBE==2&&RR_FILL_HISTORY>=1)
+#error RR_FILL_SPATIAL refines SSS-masked lobe 2 fill gaps and needs RR_FILL_HISTORY >= 1
+#endif
+#if !RR_FILL_SPATIAL&&RR_FILL_HISTORY
+#error RR_FILL_HISTORY needs RR_FILL_SPATIAL
+#endif
+// RR_FILL_PREFER_NATIVE (as RR_FILL_SPATIAL): a pixel whose native lobe-2 field is at least
+// RR_FILL_HISTORY takes native temporal even where a fresh ray landed, so a settled pixel never
+// shows a single noisy sample; fresh unboosted samples are used only where there is no history.
+#ifndef RR_FILL_PREFER_NATIVE
+#define RR_FILL_PREFER_NATIVE 0
+#endif
+#if RR_FILL_PREFER_NATIVE&&!RR_FILL_SPATIAL
+#error RR_FILL_PREFER_NATIVE needs RR_FILL_SPATIAL
+#endif
+#if RR_FILL_SPATIAL
+groupshared uint3 fillTile[256]; // packed lobe 2, fresh flag
+uint2 GroupMean(uint2 gt,out uint n){
+ float4 sum=0;n=0;
+ [unroll]for(int dy=-2;dy<=2;++dy)[unroll]for(int dx=-2;dx<=2;++dx){
+  int2 q=int2(gt)+int2(dx,dy);
+  if(any(q<0)||any(q>15))continue;
+  uint3 s=fillTile[q.y*16+q.x];
+  if(s.z!=0){sum+=UnpackLobe(s.xy);++n;}
+ }
+ if(n==0)return 0;
+ uint4 m=f32tof16(min(sum/float(n),65504));return uint2(m.x|(m.y<<16),m.z|(m.w<<16));
+}
+#endif
 [numthreads(16,16,1)]
+#if RR_FILL_SPATIAL
+void main(uint3 id:SV_DispatchThreadID,uint3 gt:SV_GroupThreadID,uint gi:SV_GroupIndex){
+ uint w,h;color.GetDimensions(w,h);uint2 p=uint2(id.x,id.y+RateHeader.z);
+ // Every thread reaches the barrier; out-of-range threads read nothing (no rate-table or
+ // texture access) and return after it. The header test below is uniform per dispatch.
+ const bool inside=id.x<w&&id.y<RateHeader.w&&p.y<h;
+#else
 void main(uint3 id:SV_DispatchThreadID){
  uint w,h;color.GetDimensions(w,h);uint2 p=uint2(id.x,id.y+RateHeader.z);
  if(id.x>=w||id.y>=RateHeader.w||p.y>=h)return;
+#endif
  // A malformed header cannot be interpreted as a native weighting profile.
  uint rows=w>0?min(32u,(131072u-16u)/(w*2u)):0;
  if(w==0||w>RR_TEXTURE2D_LIMIT||(w&1)!=0||RateHeader.x!=w||RateHeader.y!=h||RateHeader.w==0||RateHeader.w>rows)return;
+ #if RR_FILL_SPATIAL
+ uint4 c=0;uint wt=0;
+ if(inside){
+#ifdef RR_PACKED_FLOAT
+  c=asuint(color[p]);wt=asuint(weights[p]);
+#else
+  c=color[p];wt=weights[p];
+#endif
+ }
+ {const float4 v=UnpackLobe(c.zw);
+  fillTile[gi]=uint3(c.zw,inside&&((wt>>8)&4095)!=0&&all(v>=0)&&all(v<=65504)?1u:0u);}
+ GroupMemoryBarrierWithGroupSync();
+ if(!inside)return;
+ uint code=PixelCode(id.xy);
+#else
  uint code=PixelCode(id.xy);
 #ifdef RR_PACKED_FLOAT
  uint4 c=asuint(color[p]);uint wt=asuint(weights[p]);
 #else
  uint4 c=color[p];uint wt=weights[p];
 #endif
+#endif
+#ifdef RR_PACKED_FLOAT
+ uint4 nc=asuint(nativeLighting.Load(int3(p,0)));uint nw=asuint(nativeWeights.Load(int3(p,0)));
+#else
+ uint4 nc=nativeLighting.Load(int3(p,0));uint nw=nativeWeights.Load(int3(p,0));
+#endif
  bool a,b;
  uint2 ca=ScaleLobe(c.xy,(wt>>20)!=0,code&255,a);
  uint2 cb=ScaleLobe(c.zw,((wt>>8)&4095)!=0,code>>8,b);
+ uint outWeights=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nw&255);
+#if RR_SSS_MASK
+ uint2 rawA=ca,rawB=cb;uint rawWeights=outWeights;
+#endif
+#if RR_NATIVE_LOBE&1
+ bool fa;ca=SelectLobe(c.xy,(wt>>20)!=0,nc.xy,fa);
+ outWeights=(outWeights&~0xfff00000u)|((fa?wt:nw)&0xfff00000u);
+#endif
+#if RR_NATIVE_LOBE&2
+ bool fb;cb=SelectLobe(c.zw,((wt>>8)&4095)!=0,nc.zw,fb);
+ outWeights=(outWeights&~0x000fff00u)|((fb?wt:nw)&0x000fff00u);
+#if RR_FILL_SPATIAL
+ uint found=1;
+ if(!fb&&((nw>>8)&4095)<RR_FILL_HISTORY)cb=GroupMean(gt.xy,found);
+#if RR_FILL_PREFER_NATIVE
+ if(fb&&((nw>>8)&4095)>=RR_FILL_HISTORY){
+  cb=nc.zw;outWeights=(outWeights&~0x000fff00u)|(nw&0x000fff00u);}
+#endif
+#endif
+#endif
+#if RR_SSS_MASK
+ // An out-of-range load returns 0, so a mismatched guide leaves raw lighting.
+ if(sssGuide.Load(int3(p,0))==0){ca=rawA;cb=rawB;outWeights=rawWeights;}
+#endif
 #ifdef RR_PACKED_FLOAT
  color[p]=asfloat(uint4(ca,cb));
- weights[p]=asfloat((wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(asuint(nativeWeights.Load(int3(p,0)))&255));
+ weights[p]=asfloat(outWeights);
 #else
  color[p]=uint4(ca,cb);
- weights[p]=(wt&((a?0xfff00000:0)|(b?0x000fff00:0)))|(nativeWeights.Load(int3(p,0))&255);
+ weights[p]=outWeights;
 #endif
 }

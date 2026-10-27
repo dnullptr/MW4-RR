@@ -2,7 +2,17 @@
 
 A Windows x64 ReShade addon integrating NVIDIA DLSS Ray Reconstruction into the MW4 campaign's Direct3D 12 rendering path. Includes Transparency and Subsurface Scattering guides, live RR preset selection, and a ReShade status panel.
 
-**Beta 1** is the initial public beta. See the requirements and limitations below before installing or building.
+**Beta 2** is the current public beta. It is a beta mostly in name: in the author's own playtesting, roughly 98% of the noise seen before is gone, but some issues may not have been caught yet. That is a personal impression from gameplay, not a measurement, and results vary by scene, hardware, and settings. See the requirements and limitations below before installing or building.
+
+### What's new in Beta 2
+
+- Improved Subsurface Scattering lighting: skin and other subsurface materials use the game's native temporal lighting history where it exists, and a spatial estimate elsewhere.
+- Transparency albedo blend: texture seen through glass, particles, and refraction stays steadier while moving.
+- Specular hit distance: RR receives the game's specular ray hit distances.
+- Weapon depth: the weapon and hands keep their own depth instead of appearing to RR as a flat card.
+- Water responsivity mask (preset F): running water is less smeared.
+- Compatibility with third-party DLSS add-ons such as DLSS5 NR, together with Ray Reconstruction, frame generation, and Super Resolution replacement. Pre-rendered cutscenes are no longer filtered through such an add-on.
+- RR keeps running under heavy GPU memory use: a frame that cannot get memory is skipped and retried instead of turning RR off.
 
 ## Campaign only - anti-cheat warning
 
@@ -21,7 +31,27 @@ Ray Reconstruction, the Transparency Guide, and the Subsurface Scattering Guide 
 | F11 | Toggle the Subsurface Scattering Guide |
 | ReShade Add-ons panel | Feature toggles, status, and live Default/D/E/F preset selection |
 
+F8, F9, and F11 are ignored while Ctrl or Alt is held, so NVIDIA's development DLL debug hotkeys (Ctrl+Alt+F9 and Ctrl+Alt+F11) do not toggle guides.
+
 DLSS quality is configured through `DLSSPerfModeMP` in the game's configuration and requires a restart. Preset changes are handled separately and can apply during gameplay.
+
+Transparency albedo blend (on by default, with a checkbox in the panel and no hotkey) moves RR's albedo guides toward neutral values where the game's transparency layers (OIT glass and particles, and screen-space refraction) cover a pixel, so texture seen through glass is kept while moving. It is controlled by the `TransparencyBlend` key in `ReShade.ini`. Running water is not affected. Optional tuning keys, not shown in the panel:
+
+- `TransparencyBlendDiffuse` (0.5): the diffuse albedo value the guide moves toward.
+- `TransparencyBlendSpecular` (0): the specular albedo value the guide moves toward.
+- `TransparencyBlendRoughness` (-1): the roughness the guide moves toward; -1 leaves roughness unchanged.
+- `TransparencyBlendStrength` (1): overall blend amount, from 0 (no change) to 1.
+- `TransparencyBlendSky` (1): 1 also blends where transparency layers cover the sky; 0 leaves sky pixels alone.
+- `TransparencyBlendFilter` (1): 1 smooths the blend mask over neighboring pixels; 0 uses it unfiltered.
+
+The panel also has these checkboxes, all on by default and saved in `ReShade.ini`:
+
+- Specular hit distance (`SpecularHitDistance`): gives RR the game's specular ray hit distances.
+- Weapon depth (`WeaponDepth`): gives RR a depth in which the weapon and hands keep their own depth, still in front of the scene, instead of a flat card at the near plane. World depth stays the game's own, in the game's reverse-Z format, so third-party add-ons such as DLSS5 NR keep working. Changing it restarts RR, like a preset change.
+- Replace the game's DLSS upscaling (`ReplaceNativeSR`): RR takes the place of the game's DLSS Super Resolution pass when it can. See Architecture below.
+- Water responsivity mask (`WaterResponsivity`): tells RR to favor the current frame on running water, which it otherwise blurs. It applies on preset F only.
+
+With the Subsurface Scattering Guide on, lighting on skin and other subsurface materials uses the game's native temporal history where it exists, and a spatial estimate elsewhere. The panel reports this as "SSS lighting".
 
 ## Architecture
 
@@ -31,7 +61,11 @@ The addon observes relevant Direct3D 12 and NGX calls, identifies the campaign's
 
 The Transparency Guide uses an image taken before transparency composition. The Subsurface Scattering Guide is generated through an instrumented variant of a recognized game shader. That variant is prepared in memory from the game-supplied shader when its pipeline loads, validated against the expected result, and reused for the session. Game shader bytecode is not embedded in the addon. Guide use depends on matching resources, frame/view identity, and GPU submission order; an enabled guide can still be unavailable for a particular frame.
 
-Eligible evaluations replace native DLSS Super Resolution. When replacement is unavailable, the native call is retained and RR may run afterward if its own requirements are met. A replacement rejected during GPU execution uses a current-frame spatial upscale, which can appear softer or noisier. Native Super Resolution history is reset when native evaluations resume after being skipped. The ReShade panel reports the completed reconstruction path.
+Eligible evaluations replace native DLSS Super Resolution ("Replace the game's DLSS upscaling", `ReplaceNativeSR`, on by default). An input the SR command list never transitioned is taken in the non-pixel-shader read state DLSS requires of the game; one seen in a pixel-shader read state is transitioned for RR and back. When replacement is unavailable, the native call is retained and RR may run afterward if its own requirements are met. A replacement rejected during GPU execution uses a current-frame spatial upscale, which can appear softer or noisier. Native Super Resolution history is reset when native evaluations resume after being skipped. The ReShade panel reports the completed reconstruction path.
+
+### Third-party DLSS add-ons
+
+Add-ons that hook NGX evaluation beneath RR, such as the DLSS5 NR add-on, keep working with replacement on: RR's output and depth are created through ReShade's device and announced to other add-ons, so such an add-on follows RR's DLSS call instead of the game's skipped one. With DLSS5 NR running on RR's output directly, pre-rendered cutscenes are no longer filtered through it. RR releases its lock while inside NGX, so an add-on that calls back into the game or frame generation from there cannot deadlock it. Under heavy GPU memory use (DLSS5 NR can run the process far over its VRAM budget), RR keeps its own allocations within a fixed ledger instead of refusing them, and a frame that truly cannot get memory stays native and retries.
 
 Resource ownership follows command-recording and fence lifetimes. Preset or resource-size changes require outstanding work to retire before replacing the RR configuration. Internal rendering calls are distinguished from observed game calls to avoid recursive observation and lock re-entry.
 
@@ -105,7 +139,8 @@ Changes to shaders, descriptor layouts, transitions, synchronization, or tempora
 - The campaign configuration must be read-only. VRS can be enabled or disabled.
 - Residual noise and blotches remain on some Subsurface Scattering materials. Transparency coverage and image quality vary by scene.
 - Compatibility relies on recognized game shaders and layouts; game updates can require integration changes.
-- Unsupported inputs or resource allocation failures can prevent RR or a guide from being used.
+- Unsupported inputs or resource allocation failures can prevent RR or a guide from being used for a frame. Under heavy GPU memory use, optional guides can wait until memory allows them.
+- Third-party DLSS add-ons are supported only as far as they have been tested; DLSS5 NR is the one tested. Other add-ons that hook DLSS may behave differently.
 - If the game shuts down and reinitializes NGX, the addon retires its integration until the game is restarted.
 - Performance overhead and the proportion of frames that replace native Super Resolution have not yet been measured in gameplay.
 

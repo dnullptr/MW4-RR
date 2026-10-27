@@ -8,6 +8,8 @@ struct Api {
     decltype(&NVSDK_NGX_D3D12_CreateFeature) create{};
     decltype(&NVSDK_NGX_D3D12_EvaluateFeature) evaluate{};
     decltype(&NVSDK_NGX_D3D12_ReleaseFeature) release{};
+    // Optional: only the creation log reads NGX's capability map.
+    decltype(&NVSDK_NGX_D3D12_GetCapabilityParameters) capabilities{};
     bool Valid() const {
         return allocate && destroy && create && evaluate && release;
     }
@@ -25,6 +27,8 @@ struct Api {
             GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature"));
         a.release = reinterpret_cast<decltype(a.release)>(
             GetProcAddress(module, "NVSDK_NGX_D3D12_ReleaseFeature"));
+        a.capabilities = reinterpret_cast<decltype(a.capabilities)>(
+            GetProcAddress(module, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
         return a;
     }
 };

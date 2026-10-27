@@ -6,7 +6,10 @@
 #include "rr_vrrt_data.h"
 #include "rr_compute_state.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include "rr_lighting_source.h"
+#include "rr_sss_mask.h"
 #include <array>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -29,14 +32,17 @@ class Layouts {
     struct State {
         D3D12_RESOURCE_STATES layout{};
         UINT64 identity{};
-        bool aliased{};
+        bool aliased{}, named{}; // named: by a barrier naming this resource
+        bool untracked{};        // a split or subresource transition: state not known
     };
     struct Recording {
         std::unordered_map<ID3D12Resource *, State> states;
         bool capped{};
+        bool lossy{}; // some barriers on this list were not recorded (Status only)
     };
     std::mutex mutex;
     std::unordered_map<ID3D12GraphicsCommandList *, Recording> lists;
+    bool overflowed{}; // a list was not recorded because 256 were already tracked
     static UINT64 Identity(ID3D12Resource *r, bool assign) {
         UINT64 value{};
         UINT size = sizeof(value);
@@ -61,14 +67,22 @@ class Layouts {
         std::lock_guard lock(mutex);
         lists.erase(cl);
     }
+    // cl's states are unknown from here, as after Reset, and Status never calls a resource
+    // on cl untouched until cl is reset.
+    void Lose(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        LoseLocked(cl);
+    }
     void Observe(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
         std::lock_guard lock(mutex);
         if (!cl || n > 4096 || (n && !b)) {
-            lists.erase(cl);
+            LoseLocked(cl);
             return;
         }
-        if (!lists.contains(cl) && lists.size() >= 256)
+        if (!lists.contains(cl) && lists.size() >= 256) {
+            overflowed = true;
             return;
+        }
         auto &l = lists[cl];
         if (l.capped)
             return;
@@ -80,15 +94,13 @@ class Layouts {
             // https://microsoft.github.io/DirectX-Specs/d3d/ResourceHeaps.html
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
                 const auto &a = b[i].Aliasing;
-                if (!a.pResourceBefore || !a.pResourceAfter) {
+                if (!a.pResourceBefore || !a.pResourceAfter)
                     for (auto &[resource, state] : l.states)
                         state.aliased = true;
-                } else {
-                    for (auto *resource : {a.pResourceBefore, a.pResourceAfter}) {
-                        auto at = l.states.find(resource);
-                        if (at != l.states.end())
-                            at->second.aliased = true;
-                    }
+                for (auto *resource : {a.pResourceBefore, a.pResourceAfter}) {
+                    auto at = l.states.find(resource);
+                    if (at != l.states.end())
+                        at->second.aliased = at->second.named = true;
                 }
             }
             if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
@@ -97,7 +109,19 @@ class Layouts {
                     continue;
                 if (b[i].Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
                     t.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
-                    l.states.erase(t.pResource);
+                    // Kept as named but untracked, so Seen never calls it untouched.
+                    if (l.states.size() >= 4096 && !l.states.contains(t.pResource)) {
+                        l.states.clear();
+                        l.capped = true;
+                        return;
+                    }
+                    const auto id = Identity(t.pResource, true);
+                    if (id)
+                        l.states[t.pResource] = {{}, id, false, false, true};
+                    else {
+                        l.states.erase(t.pResource);
+                        l.lossy = true;
+                    }
                     continue;
                 }
                 if (l.states.size() >= 4096 && !l.states.contains(t.pResource)) {
@@ -108,23 +132,41 @@ class Layouts {
                 const auto id = Identity(t.pResource, true);
                 if (id)
                     l.states[t.pResource] = {t.StateAfter, id};
-                else
+                else {
                     l.states.erase(t.pResource);
+                    l.lossy = true;
+                }
             }
         }
     }
   private:
+    void LoseLocked(ID3D12GraphicsCommandList *cl) {
+        if (!cl)
+            return;
+        lists.erase(cl);
+        if (lists.size() >= 256) {
+            overflowed = true;
+            return;
+        }
+        lists[cl].lossy = true;
+    }
+    const State *Find(ID3D12GraphicsCommandList *cl, ID3D12Resource *r) { // mutex held
+        auto l = lists.find(cl);
+        if (!r || l == lists.end() || l->second.capped)
+            return nullptr;
+        auto at = l->second.states.find(r);
+        if (at == l->second.states.end() || at->second.untracked ||
+            Identity(r, false) != at->second.identity)
+            return nullptr;
+        return &at->second;
+    }
     bool Lookup(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
                 D3D12_RESOURCE_STATES &value, bool require_unaliased) {
         std::lock_guard lock(mutex);
-        auto l = lists.find(cl);
-        if (!r || l == lists.end() || l->second.capped)
+        const auto *at = Find(cl, r);
+        if (!at || (require_unaliased && at->aliased))
             return false;
-        auto at = l->second.states.find(r);
-        if (at == l->second.states.end() || Identity(r, false) != at->second.identity ||
-            (require_unaliased && at->second.aliased))
-            return false;
-        value = at->second.layout;
+        value = at->layout;
         return true;
     }
   public:
@@ -136,6 +178,42 @@ class Layouts {
     bool GetUnaliased(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
                       D3D12_RESOURCE_STATES &value) {
         return Lookup(cl, r, value, true);
+    }
+    // Get, also saying which aliasing barrier on cl, if any, came after r's last
+    // transition: Any for one with a null side (it covers every resource), Named
+    // for one naming r.
+    enum class Alias { None, Any, Named };
+    bool Get(ID3D12GraphicsCommandList *cl, ID3D12Resource *r, D3D12_RESOURCE_STATES &value,
+             Alias &alias) {
+        std::lock_guard lock(mutex);
+        const auto *at = Find(cl, r);
+        if (!at)
+            return false;
+        value = at->layout;
+        alias = at->named ? Alias::Named : at->aliased ? Alias::Any : Alias::None;
+        return true;
+    }
+    // Known: its last transition on cl is tracked (Get). Untouched: cl's barriers were all
+    // recorded and none named r since cl's reset, so r keeps the state it entered cl with.
+    // Untracked: anything else (split or subresource transition, capped or unrecorded list,
+    // a new resource at the same address).
+    enum class Seen { Known, Untouched, Untracked };
+    Seen Status(ID3D12GraphicsCommandList *cl, ID3D12Resource *r, D3D12_RESOURCE_STATES &value) {
+        std::lock_guard lock(mutex);
+        if (!cl || !r)
+            return Seen::Untracked;
+        auto l = lists.find(cl);
+        if (l == lists.end())
+            return overflowed ? Seen::Untracked : Seen::Untouched;
+        if (l->second.capped || l->second.lossy)
+            return Seen::Untracked;
+        auto at = l->second.states.find(r);
+        if (at == l->second.states.end())
+            return Seen::Untouched;
+        if (at->second.untracked || Identity(r, false) != at->second.identity)
+            return Seen::Untracked;
+        value = at->second.layout;
+        return Seen::Known;
     }
     // Fixture simulates allocation lifetime rollover at the same opaque address.
     static void RetireIdentityForTest(ID3D12Resource *r) {
@@ -188,8 +266,14 @@ class Pool {
         ComPtr<ID3D12PipelineState> scale;
         ComPtr<ID3D12Resource> rates;
         ComPtr<ID3D12RootSignature> privateRoot;
-        ComPtr<ID3D12PipelineState> privateScale;
+        // privateRoot plus a t2 table for the SSS guide, for SSS-masked sources.
+        ComPtr<ID3D12RootSignature> privateMaskRoot;
+        // Indexed by rrlighting::Source.
+        std::array<ComPtr<ID3D12PipelineState>, rrlighting::Count> privateScale;
+        unsigned privateLobe{};
         ComPtr<ID3D12DescriptorHeap> privateHeap;
+        // SSS guide an SSS-masked preparation reads, retained like the inputs.
+        ComPtr<ID3D12Resource> mask;
         ID3D12GraphicsCommandList *command{};
         UINT64 serial{}, signaled{}, bytes{};
         bool live{}, consumed{}, pending{}, poisoned{};
@@ -215,6 +299,7 @@ class Pool {
                 s.destination = {};
                 s.scale.Reset();
                 s.rates.Reset();
+                s.mask.Reset();
                 s.command = nullptr;
             }
     }
@@ -230,44 +315,76 @@ class Pool {
             Transition(from, D3D12_RESOURCE_STATE_COPY_SOURCE, fs)};
         cl->ResourceBarrier(2, after.data());
     }
-    static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output) {
-        if (!s.privateScale) {
+    static D3D12_SHADER_BYTECODE PrivateScaleCode(bool packed_float, unsigned lobe) {
+        if (lobe == rrlighting::SssHistory2)
+            return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2Float,
+                                                        sizeof(RRVrrtScaleSssHistory2Float)}
+                                : D3D12_SHADER_BYTECODE{RRVrrtScaleSssHistory2,
+                                                        sizeof(RRVrrtScaleSssHistory2)};
+        return packed_float ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
+                            : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
+    }
+    // mask: a proven SSS guide for an SSS-masked lobe; without one it prepares raw.
+    static bool PreparePrivateScale(Slot &s, const Pair &input, const Pair &output,
+                                    unsigned lobe = 0, ID3D12Resource *mask = nullptr) {
+        if (lobe >= rrlighting::Count || (rrlighting::SssMasked(lobe) && !mask))
+            lobe = 0;
+        // The mask root is the same layout plus parameter 4, a t2 table.
+        auto makeRoot = [&](bool masked, ComPtr<ID3D12RootSignature> &result) {
+            if (result)
+                return true;
             D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
-                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0}};
-            D3D12_ROOT_PARAMETER p[4]{};
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0},
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0}};
+            D3D12_ROOT_PARAMETER p[5]{};
             for (unsigned i = 0; i < 2; ++i) {
                 p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
                 p[i].DescriptorTable = {1, &ranges[i]};
                 p[i + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
                 p[i + 2].Descriptor.ShaderRegister = i ? 3 : 1;
             }
-            D3D12_ROOT_SIGNATURE_DESC rd{4, p};
+            p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p[4].DescriptorTable = {1, &ranges[2]};
+            D3D12_ROOT_SIGNATURE_DESC rd{masked ? 5u : 4u, p};
             ComPtr<ID3DBlob> code, error;
             ComPtr<ID3D12RootSignature> root;
-            ComPtr<ID3D12PipelineState> pso;
             if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &code,
                                                    &error)) ||
                 FAILED(s.device->CreateRootSignature(0, code->GetBufferPointer(),
                                                      code->GetBufferSize(), IID_PPV_ARGS(&root))))
                 return false;
+            result = root;
+            return true;
+        };
+        if (!makeRoot(false, s.privateRoot))
+            return false;
+        if (rrlighting::SssMasked(lobe) && !makeRoot(true, s.privateMaskRoot))
+            lobe = 0;
+        const bool packed_float = output.r[0]->GetDesc().Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+        auto create = [&](unsigned variant) {
+            if (s.privateScale[variant])
+                return true;
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = root.Get();
-            pd.CS = output.r[0]->GetDesc().Format == DXGI_FORMAT_R32G32B32A32_FLOAT
-                        ? D3D12_SHADER_BYTECODE{RRVrrtScaleFloat, sizeof(RRVrrtScaleFloat)}
-                        : D3D12_SHADER_BYTECODE{RRVrrtScale, sizeof(RRVrrtScale)};
-            if (FAILED(s.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))))
-                return false;
-            s.privateRoot = root;
-            s.privateScale = pso;
-        }
+            pd.pRootSignature = rrlighting::SssMasked(variant) ? s.privateMaskRoot.Get()
+                                                               : s.privateRoot.Get();
+            pd.CS = PrivateScaleCode(packed_float, variant);
+            return SUCCEEDED(s.device->CreateComputePipelineState(
+                &pd, IID_PPV_ARGS(&s.privateScale[variant])));
+        };
+        // A lobe variant that cannot be created falls back to raw preparation.
+        if (!create(lobe))
+            lobe = 0;
+        if (!create(lobe))
+            return false;
+        s.privateLobe = lobe;
         if (!s.privateHeap) {
-            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5,
                                           D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
             if (FAILED(s.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.privateHeap))))
                 return false;
         }
         // A slot is selected only after both recording retirement and GPU completion.
-        // Its four descriptors stay immutable from Apply through every submission.
+        // Its five descriptors stay immutable from Apply through every submission.
         auto cpu = s.privateHeap->GetCPUDescriptorHandleForHeapStart();
         auto stride =
             s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -284,11 +401,21 @@ class Pool {
             s.device->CreateUnorderedAccessView(output.r[i].Get(), nullptr, &u,
                                                 {cpu.ptr + (2 + i) * stride});
         }
+        if (rrlighting::SssMasked(lobe)) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+            v.Format = DXGI_FORMAT_R16_FLOAT;
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.Texture2D.MipLevels = 1;
+            v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            s.device->CreateShaderResourceView(mask, &v, {cpu.ptr + 4 * stride});
+        }
         return true;
     }
 
   public:
     void (*failure)(const char *){};
+    void (*logger)(const char *){};
+    uint64_t abandoned{}; // snapshots no first spatial used, logged at 1-3 and powers of two
     void Fail(const char *why) {
         if (failure)
             failure(why);
@@ -387,6 +514,7 @@ class Pool {
         s.history = history;
         s.destination = {};
         s.scale.Reset();
+        s.mask.Reset();
         s.command = cl;
         s.live = true;
         s.consumed = false;
@@ -402,11 +530,23 @@ class Pool {
                 return s.history.r == input.r;
         return false;
     }
+    // A spatial proof skipped after this list's snapshot: the snapshot is left unused, so Before()
+    // fences it like an applied one. live stays set, so Complete() cannot reuse the slot before the
+    // recorded copy has run.
+    void Abandon(ID3D12GraphicsCommandList *cl) {
+        std::lock_guard lock(mutex);
+        for (auto &s : slots)
+            if (s.live && s.command == cl && !s.consumed)
+                s.consumed = true;
+    }
     bool Apply(ID3D12GraphicsCommandList *cl, const Pair &input, const Pair &output,
                ID3D12PipelineState *scale, ID3D12PipelineState *restore, UINT x, UINT y, UINT z,
                const rrvrrt::Data *rates = nullptr, const rrvrrt::CBVs *cbvs = nullptr,
-               const rrcompute::Snapshot *privateRestore = nullptr) {
+               const rrcompute::Snapshot *privateRestore = nullptr, unsigned lobe = 0,
+               ID3D12Resource *mask = nullptr, bool *masked = nullptr) {
         std::lock_guard lock(mutex);
+        if (masked)
+            *masked = false;
         if (!Shape(input) || !Shape(output) || !scale || !restore || z != 1)
             return false;
         Slot *slot = nullptr;
@@ -462,12 +602,19 @@ class Pool {
                 !rates->buffer->GetGPUVirtualAddress())
                 return false;
         }
-        if (privateRestore && !PreparePrivateScale(s, input, output))
+        // An SSS-masked lobe reads the guide through the private root only, at the
+        // lighting extent; otherwise it prepares raw lighting.
+        if (!privateRestore || !mask || !SameDevice(s.device.Get(), mask) ||
+            !rrsssmask::Shape(mask->GetDesc(), desc))
+            mask = nullptr;
+        if (privateRestore && !PreparePrivateScale(s, input, output, lobe, mask))
             return false;
+        const bool useMask = privateRestore && rrlighting::SssMasked(s.privateLobe);
         // All proofs and references acquired before the first output mutation.
         s.destination = output;
         s.scale = scale;
         s.rates = rates ? rates->buffer : nullptr;
+        s.mask = useMask ? mask : nullptr;
         s.consumed = true;
         for (unsigned i = 0; i < 2; ++i)
             Copy(cl, output.r[i].Get(), output.state[i], s.privatePair.r[i].Get(),
@@ -478,10 +625,16 @@ class Pool {
                 s.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             ID3D12DescriptorHeap *heaps[] = {s.privateHeap.Get()};
             cl->SetDescriptorHeaps(1, heaps);
-            cl->SetComputeRootSignature(s.privateRoot.Get());
-            cl->SetPipelineState(s.privateScale.Get());
+            cl->SetComputeRootSignature(useMask ? s.privateMaskRoot.Get() : s.privateRoot.Get());
+            cl->SetPipelineState(s.privateScale[s.privateLobe].Get());
             cl->SetComputeRootDescriptorTable(0, gpu);
             cl->SetComputeRootDescriptorTable(1, {gpu.ptr + 2 * stride});
+            if (useMask) {
+                cl->SetComputeRootDescriptorTable(4, {gpu.ptr + 4 * stride});
+                auto read = Transition(s.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                cl->ResourceBarrier(1, &read);
+            }
         } else
             cl->SetPipelineState(scale);
         if (rates) {
@@ -504,6 +657,13 @@ class Pool {
             cl->ResourceBarrier(1, &before);
         } else
             cl->Dispatch(x, y, z);
+        if (useMask) {
+            auto done = Transition(s.mask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   D3D12_RESOURCE_STATE_COMMON);
+            cl->ResourceBarrier(1, &done);
+        }
+        if (masked)
+            *masked = useMask;
         if (privateRestore)
             privateRestore->Restore(cl, true);
         else
@@ -539,8 +699,22 @@ class Pool {
                 occurrences += lists[i] == s.command;
             if (!occurrences)
                 continue;
+            // A snapshot no first spatial used (its proof was skipped, or RR or its checks were
+            // off by then) is abandoned here, and fenced like an applied one.
+            if (!s.consumed) {
+                s.consumed = true;
+                const auto n = ++abandoned;
+                if (logger && (n <= 3 || !(n & (n - 1)))) {
+                    char line[160];
+                    snprintf(line, sizeof(line),
+                             "RR lighting snapshot submitted without its first spatial pass; "
+                             "frame skipped (%llu so far)",
+                             (unsigned long long)n);
+                    logger(line);
+                }
+            }
             ComPtr<ID3D12Device> d;
-            const bool valid = occurrences == 1 && s.consumed && !s.pending && !s.poisoned &&
+            const bool valid = occurrences == 1 && !s.pending && !s.poisoned &&
                                q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
                                SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&d))) &&
                                fg::SameNativeObject(d.Get(), s.device.Get()) &&

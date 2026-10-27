@@ -1,8 +1,11 @@
 #include "../src/rr_sr_eligibility.h"
+#include "../src/rr_foreign_hook.h"
 #include "../src/rr_spatial_fallback.h"
 #include "../src/rr_status.h"
 #include <cassert>
 #include <cmath>
+#include <cstring>
+#include <string>
 int main() {
     rrstatus::Telemetry telemetry;
     rrstatus::Flags flags;
@@ -15,6 +18,16 @@ int main() {
     telemetry.Completed(3, 1, 102, true, false, false, false);
     assert(telemetry.Read(flags, 102).route == rrstatus::Route::NativeSR);
     assert(telemetry.Read(flags, 2000).route == rrstatus::Route::Unknown);
+    assert(telemetry.Read(flags, 102).hit == rrstatus::State::Off);
+    flags.hit = true;
+    assert(telemetry.Read(flags, 102).hit == rrstatus::State::Waiting);
+    telemetry.Completed(4, 1, 103, true, false, false, true, true);
+    assert(telemetry.Read(flags, 103).hit == rrstatus::State::Active);
+    telemetry.Completed(5, 1, 104, true, false, false, true, false);
+    assert(telemetry.Read(flags, 104).hit == rrstatus::State::Waiting);
+    flags.rr = false;
+    assert(telemetry.Read(flags, 104).hit == rrstatus::State::ParentOff);
+    flags.rr = true;
 
     rrsr::StateProof p;
     p.known = {true, true, true, true};
@@ -24,12 +37,50 @@ int main() {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     p.resources = {1, 2, 3, 4};
     assert(rrsr::Eligible(p));
+    // An input this list never transitioned takes the DLSS contract state; the output must be seen.
     for (unsigned i = 0; i < 4; ++i) {
         auto q = p;
         q.known[i] = false;
-        assert(!rrsr::Eligible(q));
+        assert(rrsr::Eligible(q) == (i < 3));
     }
+    // What the game hands RR (17:45 and 17:54 captures): colour pixel-shader read only, depth
+    // and motion never transitioned on the SR list. RR's evaluate transitions colour itself.
     auto q = p;
+    q.known = {true, false, false, true};
+    q.states[0] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    assert(rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_COMMON;
+    assert(!rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    assert(!rrsr::Eligible(q));
+    q.states[0] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
+    assert(!rrsr::Eligible(q));
+    q = p;
+    q.states[1] = D3D12_RESOURCE_STATE_DEPTH_READ;
+    assert(!rrsr::Eligible(q));
+    q = p;
+    q.resources[2] = 0;
+    q.known[2] = false;
+    assert(!rrsr::Eligible(q));
+    assert(rrsr::ReadOnly(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) &&
+           rrsr::ReadOnly(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) &&
+           !rrsr::ReadOnly(D3D12_RESOURCE_STATE_COMMON) &&
+           !rrsr::ReadOnly(D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    // Jumps a hook beneath RR's starts NGX evaluation with (rrforeign::Beneath).
+    {
+        const uint8_t rel[16] = {0xE9, 0x10, 0x00, 0x00, 0x00};
+        assert(rrforeign::JumpTarget(rel, 0x1000) == 0x1015);
+        const uint8_t back[16] = {0xE9, 0xF0, 0xFF, 0xFF, 0xFF};
+        assert(rrforeign::JumpTarget(back, 0x1000) == 0xFF5);
+        const uint8_t indirect[16] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+        assert(rrforeign::JumpTarget(indirect, 0x2000) == 0x2006);
+        const uint8_t absolute[16] = {0x48, 0xB8, 0x88, 0x77, 0x66, 0x55,
+                                      0x44, 0x33, 0x22, 0x11, 0xFF, 0xE0};
+        assert(rrforeign::JumpTarget(absolute, 0) == 0x1122334455667788ull);
+        const uint8_t prologue[16] = {0x48, 0x89, 0x5C, 0x24, 0x08}; // mov [rsp+8], rbx
+        assert(rrforeign::JumpTarget(prologue, 0x1000) == 0);
+    }
+    q = p;
     q.states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     assert(!rrsr::Eligible(q));
     q = p;

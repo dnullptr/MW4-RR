@@ -6,6 +6,17 @@
 #include <climits>
 #include "rr_resolution_limits.h"
 #include "rr_presets.h"
+// Older local NGX headers may predate the RR responsivity mask key.
+#ifdef NVSDK_NGX_Parameter_DLSSD_ResponsivityMask
+#define RR_RESPONSIVITY_MASK_KEY NVSDK_NGX_Parameter_DLSSD_ResponsivityMask
+#else
+#define RR_RESPONSIVITY_MASK_KEY "DLSSD.ResponsivityMask"
+#endif
+#ifdef NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#define RR_FREE_MEM_ON_RELEASE_KEY NVSDK_NGX_Parameter_FreeMemOnReleaseFeature
+#else
+#define RR_FREE_MEM_ON_RELEASE_KEY "FreeMemOnReleaseFeature"
+#endif
 namespace rreval {
 struct Options {
     unsigned width = UINT_MAX, height = UINT_MAX, out_width = UINT_MAX, out_height = UINT_MAX,
@@ -40,6 +51,15 @@ inline bool Valid(const Options &v) {
            v.exposure_scale > 0;
 }
 
+// The game creates SR with AutoExposure; RR supports neither exposure nor auto-exposure. Only the
+// creation parameters drop it: Options::flags keeps the game's value for SameCreation.
+inline constexpr int CreateFlags(int game_flags) {
+    return game_flags & ~int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
+}
+static_assert(int(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) == 64 && CreateFlags(75) == 11);
+static_assert(CreateFlags(11) == 11 && CreateFlags(0x1ff) == 0x1bf && CreateFlags(64) == 0);
+
+// RR always reads hardware depth, weapon depth included (src/rr_weapon_depth.h).
 inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned preset = 6) {
     rrpreset::Set(p, preset);
     p.Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
@@ -49,7 +69,9 @@ inline void CreateParameters(NVSDK_NGX_Parameter &p, const Options &v, unsigned 
     p.Set(NVSDK_NGX_Parameter_OutWidth, v.out_width);
     p.Set(NVSDK_NGX_Parameter_OutHeight, v.out_height);
     p.Set(NVSDK_NGX_Parameter_PerfQualityValue, v.quality);
-    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, v.flags);
+    p.Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, CreateFlags(v.flags));
+    // A released feature frees its VRAM instead of staying cached in NGX (Streamline does too).
+    p.Set(RR_FREE_MEM_ON_RELEASE_KEY, 1);
     p.Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     p.Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, int(NVSDK_NGX_DLSS_Denoise_Mode_DLUnified));
     p.Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, unsigned(NVSDK_NGX_DLSS_Roughness_Mode_Packed));
@@ -65,6 +87,8 @@ struct Resources {
     ID3D12Resource *specular{};
     ID3D12Resource *sss{};
     ID3D12Resource *before_transparency{};
+    ID3D12Resource *responsivity{};
+    ID3D12Resource *specular_hit{};
 };
 inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const Resources &r,
                                float *world_to_view, float *view_to_clip) {
@@ -77,7 +101,7 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_GBuffer_Normals, r.normal);
     p.Set(NVSDK_NGX_Parameter_GBuffer_Roughness, static_cast<ID3D12Resource *>(nullptr));
     // Set every frame, including null: never reuse a prior frame's optional guide.
-    p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, static_cast<ID3D12Resource *>(nullptr));
+    p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, r.specular_hit);
     p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance_Subrect_Base_Y, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ScreenSpaceSubsurfaceScatteringGuide, r.sss);
@@ -86,6 +110,11 @@ inline void EvaluateParameters(NVSDK_NGX_Parameter &p, const Options &v, const R
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency, r.before_transparency);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency_Subrect_Base_X, 0u);
     p.Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency_Subrect_Base_Y, 0u);
+    p.Set(RR_RESPONSIVITY_MASK_KEY, r.responsivity);
+#ifdef NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X
+    p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_X, 0u);
+    p.Set(NVSDK_NGX_Parameter_DLSSD_ResponsivityMask_Subrect_Base_Y, 0u);
+#endif
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_X, v.jitter_x);
     p.Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, v.jitter_y);
     p.Set(NVSDK_NGX_Parameter_Reset, 1);

@@ -4,6 +4,33 @@
 private:
 rrtrans::CompositionLatch transparency_composition;
 bool transparency_producer_suspended{};
+// A suspension ends after a pause instead of lasting until the guide is toggled: one frame that
+// was not admitted (or found no GPU memory) no longer drops the guide for the session. Repeated
+// non-admission backs off (5, 10, 20, 40, 60 s) until a producer frame is admitted again.
+ULONGLONG transparency_resume_at{};
+unsigned transparency_suspensions{}, transparency_backoff{};
+// why: nullptr for a frame not admitted, else the reason. Memory waits 1 s; anything else backs
+// off from 5 s.
+void SuspendTransparencyProducer(const char *why, bool memory = false) {
+    ULONGLONG pause = 1000;
+    if (!memory) {
+        pause = (std::min)(5000ull << (std::min)(transparency_backoff, 4u), 60000ull);
+        ++transparency_backoff;
+    }
+    transparency_producer_suspended = true;
+    transparency_resume_at = GetTickCount64() + pause;
+    if (++transparency_suspensions > 3)
+        return;
+    char line[192];
+    snprintf(line, sizeof(line), "Transparency guide paused (%s); retrying in %llus%s",
+             why ? why : "frame not admitted", pause / 1000,
+             transparency_suspensions == 3 ? " (further pauses not logged)" : "");
+    Log(line);
+}
+void ResumeTransparencyProducer() {
+    if (transparency_producer_suspended && GetTickCount64() >= transparency_resume_at)
+        transparency_producer_suspended = false;
+}
 
 Slot *TransparencySlot(ID3D12Resource *source, bool allow_late_anchor = false) {
     if (!source || !initialized || camera_frame == UINT_MAX || camera_view == UINT_MAX ||
@@ -51,16 +78,19 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
     const UINT64 glass = rrtrans::RequiredBytes(pipelines.device.Get(), source, w, h);
     if (!glass)
         return false;
-    UINT64 base{}, depth{}, sss{};
+    UINT64 base{}, depth{}, sss{}, water{};
     for (const auto &s : slots) {
         UINT64 b{}, d{};
         if (!SlotReservationParts(pipelines.device.Get(), s.gpu, budget.limit, b, d) ||
-            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes)
+            b < s.gpu.sss.bytes || b - s.gpu.sss.bytes < s.gpu.transparency.bytes ||
+            b - s.gpu.sss.bytes - s.gpu.transparency.bytes < s.gpu.water.bytes)
             return false;
-        base = (std::max)(base, b - s.gpu.sss.bytes - s.gpu.transparency.bytes);
+        base = (std::max)(base, b - s.gpu.sss.bytes - s.gpu.transparency.bytes - s.gpu.water.bytes);
         depth = (std::max)(depth, d);
         sss = (std::max)(sss, s.gpu.sss.bytes);
+        water = (std::max)(water, s.gpu.water.bytes);
     }
+    const UINT64 kept = persistent.bytes;
     // Protect mandatory depth conversion and enabled SSS even while some slots
     // have not yet needed those resources. Exact device allocation sizes only.
     auto depth_desc = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
@@ -83,15 +113,14 @@ bool TransparencyBudget(const D3D12_RESOURCE_DESC &source, UINT w, UINT h) {
         sss = (std::max)(sss, n);
     }
     uint64_t required{};
-    if (!rrtrans::RequiredSlots(slots.size(), base, depth, sss, glass, 0, persistent.bytes,
-                                required))
+    // Water storage (rr_water.h) takes the otherwise unused hit term.
+    if (!rrtrans::RequiredSlots(slots.size(), base, depth, sss, glass, water, kept, required))
         return false;
     if (required > budget.limit) {
         if (!budget.Reserve(pipelines.device.Get(), required))
             return false;
     }
-    return rrtrans::FitsSlots(slots.size(), base, depth, sss, glass, 0, persistent.bytes,
-                              budget.limit);
+    return rrtrans::FitsSlots(slots.size(), base, depth, sss, glass, water, kept, budget.limit);
 }
 
 public:
@@ -101,6 +130,7 @@ public:
 bool TransparencyProducerMark(ID3D12GraphicsCommandList *cl, ID3D12Resource *source,
                               UINT64 recording) {
     std::lock_guard lock(mutex);
+    ResumeTransparencyProducer();
     if (!enabled || !transparency_enabled || transparency_failed ||
         transparency_producer_suspended || failed || retired || NeedsReconfigure() || !cl ||
         !source || !recording || cl->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
@@ -214,10 +244,13 @@ bool TransparencyProducerTransition(ID3D12GraphicsCommandList *cl, const D3D12_R
             s.gpu.transparency.Copy(cl, t.source.Get(), t.producer_state);
             t.written = true;
             return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            t.written = false;
+            SuspendTransparencyProducer("waiting for GPU memory", true);
+            return false;
         } catch (const std::exception &e) {
             t.written = false;
-            transparency_producer_suspended = true;
-            Log(e.what());
+            SuspendTransparencyProducer(e.what());
             return false;
         }
     }

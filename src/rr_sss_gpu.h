@@ -133,7 +133,7 @@ struct Gpu {
         }
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
         if (!rtv)
-            Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv)),
+            rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv)),
                   "SSS RTV heap allocation failed");
         D3D12_RENDER_TARGET_VIEW_DESC view{};
         view.Format = DXGI_FORMAT_R16_FLOAT;
@@ -142,7 +142,7 @@ struct Gpu {
                                          rtv->GetCPUDescriptorHandleForHeapStart());
         hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
         if (!heap)
-            Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
+            rrprivate::CheckAllocation(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
                   "SSS resolve heap allocation failed");
         stride = p.stride;
         const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();

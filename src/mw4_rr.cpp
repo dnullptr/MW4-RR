@@ -13,14 +13,17 @@
 #include "rr_live.h"
 #include "rr_live_proof.h"
 #include "rr_sss_pipeline.h"
+#include "rr_oit_signature.h"
+#include "rr_transparency_coverage_pipeline.h"
 #include "rr_scene_shape.h"
 #include "rr_vrs_config.h"
+#include "rr_game_config.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 extern "C" __declspec(dllexport) const char *NAME = "MW4 Ray Reconstruction";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Beta 1: Ray Reconstruction with Subsurface Scattering and transparency guides.";
+    "Beta 2: Ray Reconstruction with Subsurface Scattering and transparency guides.";
 static void WriteLog(const char *text) {
     rrtrace::LastError preserve;
     reshade::log::message(reshade::log::level::warning, text);
@@ -39,10 +42,13 @@ static rrlive::Controller &LiveRR() {
     return *p;
 }
 static bool SharedOutputCoverage(ID3D12GraphicsCommandList *);
+static void CoverageAfterIndirect(const rrcompute::IndirectCall &call) noexcept;
 static rrcompute::Tracker &ComputeState() {
     static auto *p = []() {
         auto *v = new rrcompute::Tracker;
         v->UseSharedOutputContext(&SharedOutputCoverage);
+        if (!v->SetAfterIndirect(&CoverageAfterIndirect, &WriteLog))
+            WriteLog("Transparency albedo blend unavailable: indirect draw observer not installed");
         return v;
     }();
     return *p;
@@ -58,6 +64,7 @@ static rrsparsecopy::Pool &SparsePool() {
     static auto *p = []() {
         auto *v = new rrsparsecopy::Pool;
         v->failure = &SparseFailure;
+        v->logger = &WriteLog;
         return v;
     }();
     return *p;
@@ -69,6 +76,14 @@ static rrshader::DispatchTracker &ShaderDispatches() {
 static rrsss::PipelineRegistry &SssPipelines() {
     static auto *p = []() {
         auto *v = new rrsss::PipelineRegistry;
+        v->logger = &WriteLog;
+        return v;
+    }();
+    return *p;
+}
+static rrblend::CoveragePipelineRegistry &CoveragePipelines() {
+    static auto *p = []() {
+        auto *v = new rrblend::CoveragePipelineRegistry;
         v->logger = &WriteLog;
         return v;
     }();
@@ -118,7 +133,7 @@ static void FrameBarriers(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RES
     try {
         SparseLayouts().Observe(cl, n, b);
     } catch (...) {
-        SparseLayouts().Reset(cl);
+        SparseLayouts().Lose(cl);
         SparseFailure("Resource-state observation failed");
     }
 }
@@ -148,7 +163,7 @@ static rrbuffer::Inspector &AlbedoInspector() {
         v->on_barriers = &FrameBarriers;
         v->on_unknown_states = [](ID3D12GraphicsCommandList *cl) {
             LiveRR().TransparencyProducerUnknown(cl);
-            SparseLayouts().Reset(cl);
+            SparseLayouts().Lose(cl);
         };
         v->on_execute = &FrameSubmit;
         v->on_execute_end = &FrameSubmitEnd;
@@ -201,13 +216,19 @@ static void AfterNgxShutdown(HMODULE m, ID3D12Device *d, bool ok) {
 }
 static void SrCompleted(ID3D12GraphicsCommandList *cl, rrtrace::Kind k,
                         const NVSDK_NGX_Parameter *p, NVSDK_NGX_Result r) {
+    // Frame generation is counted for the health line only, lock-free: never the controller.
+    if (k == rrtrace::Kind::FG) {
+        rrhealth::presentation.fg_evaluations.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (k != rrtrace::Kind::SR)
         return;
     auto n = fg::NativeObject<ID3D12GraphicsCommandList>(cl);
     LiveRR().AfterSR(cl, p, rrtrace::Probe::CurrentCall(), r, rrtrace::Probe::CurrentRuntime(),
                      rrtrace::Probe::RuntimeEpoch(),
                      n && AlbedoInspector().SafeCopies(n.Get()) &&
-                         AlbedoInspector().StateCoverage(n.Get()));
+                         AlbedoInspector().StateCoverage(n.Get()),
+                     false);
     ComputeState().Invalidate(n.Get());
 }
 static rrtrace::Probe &Observer() {
@@ -237,6 +258,13 @@ static void OnDevice(reshade::api::device *d) {
             if (!rrsss::PipelineProof::Attach(reinterpret_cast<ID3D12Device *>(d->get_native())))
                 WriteLog("RR optional native SSS PSO proof hooks unavailable; unproven SSS "
                          "pipelines stay off");
+            // Before the game creates its command signatures: earlier ones read as Unknown.
+            const bool signatures = rrsig::Attach(reinterpret_cast<ID3D12Device *>(d->get_native()),
+                                                  ComputeState(), &WriteLog);
+            CoveragePipelines().SignatureHook(d, signatures);
+            if (!signatures)
+                WriteLog("Transparency albedo blend unavailable: command signature hook not "
+                         "installed");
         }
         Observer().Poll();
     } catch (...) {
@@ -246,6 +274,7 @@ static void OnDevice(reshade::api::device *d) {
 }
 static void OnDestroyDevice(reshade::api::device *d) {
     SssPipelines().ForgetDevice(d);
+    CoveragePipelines().ForgetDevice(d);
     rrbypass::Forget(d);
     if (rrbindings::State(d))
         d->destroy_private_data<rrbindings::DeviceState>();
@@ -328,9 +357,20 @@ static void OnSecondary(reshade::api::command_list *caller, reshade::api::comman
     // secondary-list state, so require fresh caller bindings/pipeline afterwards.
     OnResetList(caller);
 }
+// The command signature hook reads root-constant counts from these layouts, so a
+// recycled root signature address must never keep an earlier one, whatever the
+// binding tracker's health.
+static void ForgetRootLayout(reshade::api::pipeline_layout layout) noexcept {
+    try {
+        ComputeState().ForgetRoot(reinterpret_cast<ID3D12RootSignature *>(layout.handle));
+    } catch (...) {
+        WriteLog("root signature layout could not be forgotten");
+    }
+}
 static void OnLayout(reshade::api::device *d, uint32_t count,
                      const reshade::api::pipeline_layout_param *params,
                      reshade::api::pipeline_layout layout) {
+    ForgetRootLayout(layout);
     WithGraphicsBindings(d, [&](auto &t) { t.Layout(layout.handle, count, params); });
     WithBindings(d, [&](auto &t) {
         t.Layout(layout.handle, count, params);
@@ -395,11 +435,9 @@ static void OnLayout(reshade::api::device *d, uint32_t count,
     });
 }
 static void OnDestroyLayout(reshade::api::device *d, reshade::api::pipeline_layout layout) {
+    ForgetRootLayout(layout);
     WithGraphicsBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
-    WithBindings(d, [&](auto &t) {
-        t.DestroyLayout(layout.handle);
-        ComputeState().ForgetRoot(reinterpret_cast<ID3D12RootSignature *>(layout.handle));
-    });
+    WithBindings(d, [&](auto &t) { t.DestroyLayout(layout.handle); });
 }
 static void OnTables(reshade::api::command_list *list, reshade::api::shader_stage stages,
                      reshade::api::pipeline_layout layout, uint32_t first, uint32_t count,
@@ -498,6 +536,7 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
                        reshade::api::pipeline pipeline) {
     rrtrace::LastError preserve_error;
     SssPipelines().Initialize(device, layout, count, objects, pipeline);
+    CoveragePipelines().Initialize(device, layout, count, objects, pipeline);
     try {
         uint64_t hash = 14695981039346656037ull;
         bool found = false, compute = false;
@@ -528,6 +567,7 @@ static void OnPipeline(reshade::api::device *device, reshade::api::pipeline_layo
 }
 static void OnDestroyPipeline(reshade::api::device *, reshade::api::pipeline pipeline) {
     SssPipelines().Forget(pipeline.handle);
+    CoveragePipelines().Forget(pipeline.handle);
     rrbypass::Removed(pipeline);
     std::lock_guard lock(pipeline_mutex);
     shader_hashes.erase(pipeline.handle);
@@ -595,14 +635,17 @@ static bool SssOwnedDraw(reshade::api::command_list *list,
     }
 }
 #include "rr_glass_render.inl"
+#include "rr_blend_render.inl"
 static bool AuditDraw(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                       uint32_t fi) {
     GlassDraw(l, false, c, i);
+    CoverageDraw(l, {false, c, i, f, 0, fi});
     return SssOwnedDraw(l, {false, c, i, f, 0, fi});
 }
 static bool AuditDrawIndexed(reshade::api::command_list *l, uint32_t c, uint32_t i, uint32_t f,
                              int32_t b, uint32_t fi) {
     GlassDraw(l, true, c, i);
+    CoverageDraw(l, {true, c, i, f, b, fi});
     return SssOwnedDraw(l, {true, c, i, f, b, fi});
 }
 #include "rr_sparse_render.h"
@@ -705,6 +748,99 @@ static bool PreservePrepass(reshade::api::command_list *list, uint32_t x, uint32
     }
     return false;
 }
+static rrspecular::Diagnostics &DistanceStats() {
+    static auto *p = new rrspecular::Diagnostics;
+    return *p;
+}
+// Copies the native specular hit distance read by cs_ray_hit_distance_blur.
+// Only the used tables are proven, as for the sparse copies: a full restore
+// snapshot would wrongly require unused roots after ExecuteIndirect. Another
+// shader with the same bindings is only logged, once, so a game update that
+// changes the blur's hash can be recognized without copying unknown data.
+static void PreserveSpecularDistance(reshade::api::command_list *list, uint32_t x, uint32_t y,
+                                     uint32_t z) {
+    if (list->get_device()->get_api() != reshade::api::device_api::d3d12 ||
+        !LiveRR().Enabled() || !LiveRR().SpecularHitEnabled())
+        return;
+    const auto binding = ShaderDispatches().Get(list->get_native());
+    if (!binding.shader)
+        return;
+    const bool known = rrspecular::DistanceBlur(binding.shader);
+    auto native = fg::NativeObject<ID3D12GraphicsCommandList>(
+        reinterpret_cast<ID3D12GraphicsCommandList *>(list->get_native()));
+    if (!native)
+        return;
+    using S = rrspecular::Stage;
+    auto &stats = DistanceStats();
+    if (known)
+        stats.Dispatch();
+    // Unknown shaders are examined once each, and only inside a live prepass recording.
+    // The native spatial denoiser also binds an R16 t10 and the prepass t13; skip it.
+    else if (rrbypass::Spatial == rrversion::Canonical(binding.shader) ||
+             !LiveRR().CanRaw(native.Get()) || !stats.Scan(binding.shader))
+        return;
+    auto reject = [&](S stage) {
+        if (known)
+            stats.Observe(stage);
+    };
+    auto *state = rrbindings::State(list->get_device());
+    if (!state || !state->tracker.Healthy() || !AlbedoInspector().SafeCopies(native.Get()) ||
+        !AlbedoInspector().StateCoverage(native.Get()))
+        return reject(S::Context);
+    const auto root = state->tracker.CurrentLayout(list->get_native());
+    if (!root)
+        return reject(S::Context);
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> resources;
+    std::array<rrbindings::Value, 2> values;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto loc = state->tracker.Find(list->get_native(), {false, i ? 13u : 10u});
+        if (!loc.known ||
+            !ComputeState().TableBound(native.Get(),
+                                       reinterpret_cast<ID3D12PipelineState *>(binding.pipeline),
+                                       reinterpret_cast<ID3D12RootSignature *>(root),
+                                       loc.parameter, loc.table))
+            return reject(S::Table);
+        auto slot = rrbindings::Resolve(list->get_device(), {loc.table}, loc.offset);
+        if (!slot.heap)
+            return reject(S::Table);
+        auto &v = values[i] = state->tracker.Get(slot);
+        if (!v.known || v.buffer || !v.resource ||
+            v.view_type != unsigned(reshade::api::resource_view_type::texture_2d) ||
+            v.first_level || v.levels != 1 || v.first_layer || v.layers > 1)
+            return reject(S::View);
+        resources[i] =
+            fg::NativeObject<ID3D12Resource>(reinterpret_cast<ID3D12Resource *>(v.resource));
+        if (!resources[i])
+            return reject(S::View);
+    }
+    const auto &distance = values[0], &surface = values[1];
+    if (distance.format != unsigned(DXGI_FORMAT_R16_FLOAT) ||
+        distance.view_format != unsigned(DXGI_FORMAT_R16_FLOAT) ||
+        surface.view_format != unsigned(DXGI_FORMAT_R32G32B32A32_UINT) ||
+        distance.width != surface.width || distance.height != surface.height ||
+        !rrspecular::DispatchShape(distance.width, distance.height, x, y, z))
+        return reject(S::Shape);
+    if (!known) {
+        if (LiveRR().PrepassSurface(native.Get(), resources[1].Get()) &&
+            stats.Candidate(binding.shader)) {
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "Specular hit distance: unrecognized blur candidate shader %016llx "
+                     "(t10 R16 %llux%u, t13 prepass surface); not used",
+                     static_cast<unsigned long long>(binding.shader),
+                     static_cast<unsigned long long>(distance.width), distance.height);
+            WriteLog(line);
+        }
+        return;
+    }
+    D3D12_RESOURCE_STATES source_state{};
+    if (!SparseLayouts().Get(native.Get(), resources[0].Get(), source_state))
+        return reject(S::Layout);
+    reject(LiveRR().SpecularDistance(native.Get(), resources[1].Get(), resources[0].Get(),
+                                     source_state)
+               ? S::Copied
+               : S::Slot);
+}
 static void RestoreLightingPipeline(reshade::api::command_list *list) {
     const auto b = ShaderDispatches().Get(list->get_native());
     if (!rrbypass::Target(b.shader) || !b.pipeline)
@@ -719,6 +855,13 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
         return false;
     try {
         RestoreLightingPipeline(list);
+        try {
+            PreserveSpecularDistance(list, x, y, z);
+        } catch (...) {
+            static std::atomic<bool> warned{};
+            if (!warned.exchange(true))
+                WriteLog("Specular hit distance validation failed; RR continues without it");
+        }
         const bool live_prepass = PreservePrepass(list, x, y, z);
         if (live_prepass)
             return true;
@@ -744,10 +887,11 @@ static bool OnDispatch(reshade::api::command_list *list, uint32_t x, uint32_t y,
             LiveRR().RawCorrected(native.Get(), UINT64(device), health.revision);
             return true;
         }
-        // Only later spatial passes in this successfully corrected recording use
-        // passthrough. Missing guides, proof failure and OFF all execute native.
+        // Only later spatial passes in a successfully corrected recording use
+        // passthrough, unless the diagnostic explicitly retains those filters.
+        // Missing guides, proof failure and OFF all execute native.
         if (b.shader == rrbypass::Spatial && !rrbypass::Health(device).failed &&
-            LiveRR().RawWasCorrected(native.Get()))
+            LiveRR().RawSpatialPassthrough(native.Get()))
             rrbypass::Bind(list, reshade::api::pipeline_stage::all_compute, {b.pipeline});
     } catch (...) {
         RestoreLightingPipeline(list);
@@ -761,26 +905,52 @@ static bool OnIndirect(reshade::api::command_list *l, reshade::api::indirect_com
     if (t == reshade::api::indirect_command::unknown || t == reshade::api::indirect_command::draw ||
         t == reshade::api::indirect_command::draw_indexed)
         OitSceneDraw(l);
+    CoverageIndirectArm(l, t);
     WithGraphicsBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     WithBindings(l->get_device(), [&](auto &b) { b.Reset(l->get_native()); });
     return false;
 }
-static bool VrsConfigAllowsRR() {
+// The campaign settings file: read-only flag and text, for the RR gate and the config report.
+static rrgameconfig::File ReadGameConfig() {
+    rrgameconfig::File file;
     wchar_t local[32768]{};
     auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
     if (!size || size >= 32768)
-        return false;
+        return file;
     const auto path =
         std::filesystem::path(local) / L"Activision/Call of Duty/players/s.1.0.cod26.txt";
     const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_READONLY))
-        return false;
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return file;
+    file.readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+    file.state = rrgameconfig::FileState::Unreadable;
     std::ifstream input(path);
     if (!input)
-        return false;
+        return file;
     std::ostringstream text;
     text << input.rdbuf();
-    return rrvrsconfig::Allowed(text.str(), true, true);
+    file.text = text.str();
+    file.state = rrgameconfig::FileState::Read;
+    return file;
+}
+static bool VrsGateAllows(const rrgameconfig::File &file) {
+    return file.state == rrgameconfig::FileState::Read &&
+           rrvrsconfig::Allowed(file.text, file.readonly, true);
+}
+static bool VrsConfigAllowsRR() { return VrsGateAllows(ReadGameConfig()); }
+// Once per session, from LoadSettings, with the file the RR gate read and its answer. Logs and
+// counts only: RR is never blocked by it.
+static unsigned ReportGameConfig(const rrgameconfig::File &file, bool gate_allows) {
+    try {
+        std::vector<std::string> lines;
+        const auto warnings = rrgameconfig::Report(file, gate_allows, lines);
+        for (const auto &line : lines)
+            WriteLog(line.c_str());
+        return warnings;
+    } catch (...) {
+        WriteLog("Game config check failed; RR is not affected");
+        return 0;
+    }
 }
 #include "rr_settings.inl"
 static bool RegisterRuntimeCallbacks(HMODULE module) {
@@ -813,7 +983,7 @@ static bool RegisterRuntimeCallbacks(HMODULE module) {
     reshade::register_event<reshade::addon_event::draw>(&AuditDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(&AuditDrawIndexed);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&OnRuntime);
-    reshade::register_event<reshade::addon_event::reshade_present>(&OnRuntime);
+    reshade::register_event<reshade::addon_event::reshade_present>(&OnPresent);
     return true;
 }
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

@@ -3,19 +3,20 @@
 namespace rrstatus {
 enum class State { Off, Active, Waiting, Fallback, ParentOff, Error, Unavailable };
 struct Flags {
-    bool rr{}, sss{}, glass{}, failed{}, retired{}, sss_failed{}, glass_failed{};
+    bool rr{}, sss{}, glass{}, failed{}, retired{}, sss_failed{}, glass_failed{}, hit{};
 };
 enum class Route { Unknown, NativeSR, Replacement, SpatialFallback };
 struct Snapshot {
     State rr{}, sss{}, glass{};
     Route route{};
+    State hit{};
 };
 // UI-only telemetry: consumes results already read by the normal completion
 // poll. It never waits for the GPU or reads a GPU resource itself.
 class Telemetry {
     std::uint32_t generation{}, serial{};
     std::uint64_t completed_at{}, fallback_at{};
-    bool completed{}, fallback{}, displayed{}, sss{}, glass{};
+    bool completed{}, fallback{}, displayed{}, sss{}, glass{}, hit{};
     Route route{};
 
   public:
@@ -30,7 +31,8 @@ class Telemetry {
         }
     }
     void Completed(std::uint32_t number, std::uint32_t gen, std::uint64_t now, bool good,
-                   bool used_sss, bool used_glass, bool replaced_sr = false) {
+                   bool used_sss, bool used_glass, bool replaced_sr = false,
+                   bool used_hit = false) {
         if (gen != generation)
             return;
         if (!good)
@@ -45,6 +47,7 @@ class Telemetry {
             replaced_sr ? (good ? Route::Replacement : Route::SpatialFallback) : Route::NativeSR;
         sss = good && used_sss;
         glass = good && used_glass;
+        hit = good && used_hit;
         if (!good)
             Fallback(gen, now);
     }
@@ -65,7 +68,8 @@ class Telemetry {
                                                     : State::Waiting;
         };
         return {rr, guide(f.sss, f.sss_failed, sss), guide(f.glass, f.glass_failed, glass),
-                fresh && f.rr && !f.failed && !f.retired ? route : Route::Unknown};
+                fresh && f.rr && !f.failed && !f.retired ? route : Route::Unknown,
+                guide(f.hit, false, hit)};
     }
 };
 inline const char *RouteLabel(Route route) {

@@ -11,6 +11,10 @@
 #include "rr_resolution_limits.h"
 namespace rrprivate {
 using Microsoft::WRL::ComPtr;
+// Allocation admission can fail temporarily without invalidating recorded work.
+struct AllocationDeferred : std::runtime_error {
+    AllocationDeferred() : std::runtime_error("GPU allocation temporarily unavailable") {}
+};
 inline D3D12_RESOURCE_DESC Buffer(UINT64 bytes) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -27,6 +31,11 @@ inline void Require(bool valid, const char *error) {
 }
 inline void Check(HRESULT hr, const char *error) {
     Require(SUCCEEDED(hr), error);
+}
+inline void CheckAllocation(HRESULT hr, const char *error) {
+    if (hr == E_OUTOFMEMORY)
+        throw AllocationDeferred();
+    Check(hr, error);
 }
 // Immutable submission snapshot. A shutdown observer can wait independently
 // of Gpu::Wait without touching its event, serial or pending state.

@@ -3,15 +3,22 @@
 #include "rr_evaluation_params.h"
 #include "feed_fg_identity.h"
 #include "../build/rr_convert_guides.generated.h"
+#include "../build/rr_weapon_depth.generated.h"
+#include "rr_weapon_depth.h"
 #include "../build/rr_live_begin.generated.h"
 #include "../build/rr_live_validate.generated.h"
 #include "../build/rr_live_display.generated.h"
 #include "../build/rr_vrrt_native.generated.h"
+#include "../build/rr_water_masks.generated.h"
 #include "rr_vrrt_data.h"
 #include "rr_sss_gpu.h"
 #include "rr_transparency_guide.h"
+#include "rr_transparency_coverage.h"
 #include <dxgi1_4.h>
 #include "rr_sparse_copy.h"
+#include "rr_specular_distance.h"
+#include "rr_water.h"
+#include "rr_gate_stats.h"
 namespace rrlive {
 using Microsoft::WRL::ComPtr;
 using rrprivate::Check;
@@ -42,16 +49,19 @@ inline void Order(ID3D12GraphicsCommandList *cl) {
     cl->ResourceBarrier(1, &b);
 }
 struct Budget {
-    static constexpr UINT64 Minimum = 1024ull * 1024 * 1024;
+    static constexpr UINT64 Minimum = 1024ull * 1024 * 1024, OverBudget = 3 * Minimum;
     UINT64 limit = Minimum, bytes{};
     // A pool projection is not a DXGI reservation. Recheck each actual new
     // allocation; matching retained resources never enter this path.
+    // RR's own ledger (limit, see Reserve) is the cap; the process budget alone no longer
+    // refuses. Over or near budget (another add-on's VRAM, for one: DLSS5 NR runs it to three
+    // times the budget) a refusal keeps nothing resident; it only drops RR to native frames
+    // and resets its history every retry. A real E_OUTOFMEMORY still defers.
     template <class Query> bool AdmitAllocation(UINT64 needed, Query query) const {
         if (!needed || needed == UINT64_MAX || needed > limit || bytes > limit - needed)
             return false;
         UINT64 available_budget{}, usage{};
-        return query(available_budget, usage) && usage <= available_budget &&
-               needed <= available_budget - usage;
+        return query(available_budget, usage);
     }
     static DXGI_MEMORY_SEGMENT_GROUP Segment(bool uma, D3D12_HEAP_TYPE type) {
         return uma || type == D3D12_HEAP_TYPE_DEFAULT ? DXGI_MEMORY_SEGMENT_GROUP_LOCAL
@@ -89,8 +99,13 @@ struct Budget {
         DXGI_QUERY_VIDEO_MEMORY_INFO info{};
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
             FAILED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) ||
-            FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) ||
-            info.CurrentUsage > info.Budget || required - bytes > info.Budget - info.CurrentUsage)
+            FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+            return false;
+        // The ledger grows into what the budget has left, and in any case to OverBudget (see
+        // AdmitAllocation), so RR near or over budget keeps running at a fixed cap.
+        const bool fits = info.CurrentUsage <= info.Budget &&
+                          required - bytes <= info.Budget - info.CurrentUsage;
+        if (!fits && required > OverBudget)
             return false;
         limit = required;
         return true;
@@ -99,8 +114,13 @@ struct Budget {
 struct Pipelines {
     rrsss::ResolvePipeline sss;
     ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root;
-    ComPtr<ID3D12PipelineState> converter, probability;
+    // The game's device as ReShade wraps it: a resource created through it is announced to other
+    // add-ons (init_resource). DLSS5 NR admits a DLSS call only when its output, depth and motion
+    // are all in the registry it fills from those events, so RR's output and depth go through it.
+    ComPtr<ID3D12Device> announced;
+    ComPtr<ID3D12RootSignature> converter_root, gate_root, probability_root, weapon_root,
+        water_root;
+    ComPtr<ID3D12PipelineState> converter, probability, water, weapon_depth;
     std::array<ComPtr<ID3D12PipelineState>, 3> gate;
     UINT stride{};
     void Initialize(ID3D12Device *d) {
@@ -109,14 +129,18 @@ struct Pipelines {
         stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, 0}};
-        D3D12_ROOT_PARAMETER p[4]{};
+        // u4 water classification (heap WaterSlot).
+        D3D12_DESCRIPTOR_RANGE water_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 4, 0, 0};
+        D3D12_ROOT_PARAMETER p[5]{};
         for (unsigned i = 0; i < 2; ++i) {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             p[i].DescriptorTable = {1, &ranges[i]};
             p[i + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             p[i + 2].Descriptor.ShaderRegister = i;
         }
-        D3D12_ROOT_SIGNATURE_DESC rd{4, p};
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[4].DescriptorTable = {1, &water_range};
+        D3D12_ROOT_SIGNATURE_DESC rd{5, p};
         Root(rd, converter_root);
         Pipeline(converter_root.Get(), RRGuideShader, sizeof(RRGuideShader), converter);
         ranges[0].NumDescriptors = 3;
@@ -134,12 +158,25 @@ struct Pipelines {
         Pipeline(gate_root.Get(), RRLiveBegin, sizeof(RRLiveBegin), gate[0]);
         Pipeline(gate_root.Get(), RRLiveValidate, sizeof(RRLiveValidate), gate[1]);
         Pipeline(gate_root.Get(), RRLiveDisplay, sizeof(RRLiveDisplay), gate[2]);
+        // Weapon depth: depth SRV table, depth copy UAV table, 8 root constants.
+        ranges[0].NumDescriptors = 1;
+        ranges[1].NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER e[3]{};
+        for (unsigned i = 0; i < 2; ++i) {
+            e[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            e[i].DescriptorTable = {1, &ranges[i]};
+        }
+        e[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        e[2].Constants = {0, 0, 8};
+        rd = {3, e};
+        Root(rd, weapon_root);
+        Pipeline(weapon_root.Get(), RRWeaponDepth, sizeof(RRWeaponDepth), weapon_depth);
     }
     void Root(const D3D12_ROOT_SIGNATURE_DESC &rd, ComPtr<ID3D12RootSignature> &r) {
         ComPtr<ID3DBlob> b, e;
-        Check(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e),
+        rrprivate::CheckAllocation(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &b, &e),
               "live root serialization failed");
-        Check(device->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(),
+        rrprivate::CheckAllocation(device->CreateRootSignature(0, b->GetBufferPointer(), b->GetBufferSize(),
                                           IID_PPV_ARGS(&r)),
               "live root creation failed");
     }
@@ -159,12 +196,25 @@ struct Pipelines {
         Root(desc, probability_root);
         Pipeline(probability_root.Get(), RRVrrtProbability, sizeof(RRVrrtProbability), probability);
     }
+    void WaterPipeline() {
+        if (water)
+            return;
+        // u0 responsivity, u1 the water classification.
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0};
+        D3D12_ROOT_PARAMETER p[2]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable = {1, &range};
+        D3D12_ROOT_SIGNATURE_DESC desc{2, p};
+        Root(desc, water_root);
+        Pipeline(water_root.Get(), RRWaterMasks, sizeof(RRWaterMasks), water);
+    }
     void Pipeline(ID3D12RootSignature *r, const void *code, size_t bytes,
                   ComPtr<ID3D12PipelineState> &p) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC d{};
         d.pRootSignature = r;
         d.CS = {code, bytes};
-        Check(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p)),
+        rrprivate::CheckAllocation(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p)),
               "live pipeline creation failed");
     }
 };
@@ -189,13 +239,16 @@ struct GpuFrame {
                 return 0;
         if (!add(TextureDesc(w, h, DXGI_FORMAT_R32_UINT)))
             return 0;
-        auto buffer = rrprivate::Buffer(256);
+        if (!add(TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT))) // specular hit distance copy
+            return 0;
+        auto buffer = rrprivate::Buffer(HeaderBytes); // header
         if (!add(buffer))
             return 0;
+        buffer = rrprivate::Buffer(StatsBytes); // stats
         buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (!add(buffer))
             return 0;
-        buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+        buffer.Flags = D3D12_RESOURCE_FLAG_NONE; // readback
         if (!add(buffer))
             return 0;
         buffer = rrprivate::Buffer(rrvrrt::Bytes(w, h));
@@ -212,6 +265,7 @@ struct GpuFrame {
     }
     rrsss::Gpu sss;
     rrtrans::Gpu transparency;
+    rrblend::Gpu coverage;
     std::array<ComPtr<ID3D12Resource>, 4> sources, guides;
     std::array<ComPtr<ID3D12Resource>, 2> constants;
     std::array<UINT64, 2> offsets{};
@@ -220,33 +274,70 @@ struct GpuFrame {
     rrvrrt::Inputs probability_inputs;
     std::array<ComPtr<ID3D12Resource>, 4> sr;
     ComPtr<ID3D12Resource> rr_output, depth, depth_buffer, header, stats, readback;
+    // Owned copy of the native specular hit distance; hit_source is retained until that
+    // recording retires.
+    ComPtr<ID3D12Resource> specular_hit, hit_source;
+    // Heap slots after the gate's: weapon depth's source and target (WeaponDepth), then the
+    // guide shader's u4 water classification (WaterTarget).
+    static constexpr UINT DepthSource = 12, WeaponTarget = 13, WaterSlot = 14, HeapSize = 15;
+    // The header (the gate's constants): the CPU writes bytes 0..HeaderWritten-1 every frame
+    // (Header, WaterHeader). Then the stats UAV with its readback (layout at Prepare,
+    // rr_gate_stats.h).
+    static constexpr UINT HeaderBytes = 256, HeaderWritten = 64,
+                          StatsBytes = rrgatestats::StatsBytes;
+    static constexpr UINT FiniteOffset = RR_STATS_NON_FINITE_COLOR;
+    // The whole stats layout, disjoint and inside StatsBytes: 0..15 health (the gate's),
+    // 256..263 non-finite.
+    static_assert(RR_STATS_NON_FINITE_COLOR == 256 &&
+                      RR_STATS_NON_FINITE_OUTPUT == RR_STATS_NON_FINITE_COLOR + 4 &&
+                      RR_STATS_NON_FINITE_OUTPUT + 4 <= StatsBytes,
+                  "stats ranges are disjoint and fit the buffer");
+    // Water storage (rr_water.h), allocated only once the water responsivity mask wants it:
+    // the guide shader's classification and the mask rr_water_masks.hlsl writes. bytes is
+    // their own optional term in the pool reservations, like SSS.
+    struct Water {
+        ComPtr<ID3D12Resource> mask, responsivity;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        UINT64 bytes{};
+        bool ready{};
+    } water;
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_fp{};
     UINT64 bytes{};
     UINT w{}, h{}, ow{}, oh{};
     UINT *header_map{};
-    bool use_depth{};
+    bool use_depth{}, hit_ready{}, water_written{};
     ComPtr<ID3D12Resource> Allocate(Pipelines &p, Budget &b, D3D12_RESOURCE_DESC d,
-                                    D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
+                                    D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT,
+                                    const D3D12_CLEAR_VALUE *clear = nullptr,
+                                    bool announce = false) {
+        ID3D12Device *device = announce && p.announced ? p.announced.Get() : p.device.Get();
         auto info = p.device->GetResourceAllocationInfo(0, 1, &d);
         Require(info.SizeInBytes && info.SizeInBytes <= b.limit &&
                     b.bytes <= b.limit - info.SizeInBytes,
                 "live frame-pool memory reserve exceeded");
-        Require(b.AdmitAllocation(p.device.Get(), info.SizeInBytes, type),
-                "live allocation exceeds current device memory budget or query unavailable");
+        if (!b.AdmitAllocation(p.device.Get(), info.SizeInBytes, type))
+            throw rrprivate::AllocationDeferred();
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
         ComPtr<ID3D12Resource> r;
-        Check(p.device->CreateCommittedResource(
-                  &hp, D3D12_HEAP_FLAG_NONE, &d,
-                  type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
-                  : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
-                                                     : D3D12_RESOURCE_STATE_COMMON,
-                  nullptr, IID_PPV_ARGS(&r)),
-              "live resource allocation failed");
+        rrprivate::CheckAllocation(
+            device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &d,
+                type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                : type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                   : D3D12_RESOURCE_STATE_COMMON,
+                clear, IID_PPV_ARGS(&r)),
+            "live resource allocation failed");
         b.bytes += info.SizeInBytes;
         bytes += info.SizeInBytes;
         return r;
+    }
+    // Gives back what this frame allocated since `before` (bytes), after a failed preparation
+    // has dropped those resources: nothing references them yet.
+    void Unwind(Budget &b, UINT64 before) {
+        b.bytes -= bytes - before;
+        bytes = before;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(const Pipelines &p, UINT at) const {
         return {heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T(at) * p.stride};
@@ -277,6 +368,8 @@ struct GpuFrame {
     void Prepare(Pipelines &p, Budget &b, const std::array<ComPtr<ID3D12Resource>, 4> &in,
                  const std::array<ComPtr<ID3D12Resource>, 2> &cb,
                  const std::array<UINT64, 2> &off) {
+        hit_ready = false;
+        hit_source.Reset();
         if (heap) {
             Require(w == in[3]->GetDesc().Width && h == in[3]->GetDesc().Height,
                     "live guide generation was not retired before size change");
@@ -292,7 +385,29 @@ struct GpuFrame {
         offsets = off;
         w = UINT(in[3]->GetDesc().Width);
         h = in[3]->GetDesc().Height;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 12,
+        const UINT64 before = bytes;
+        try {
+            Allocations(p, b);
+        } catch (...) {
+            // A new slot that cannot be prepared (GPU memory pressure) is left unprepared, so
+            // a later frame prepares it from the start.
+            heap.Reset();
+            guides = {};
+            specular_hit.Reset();
+            header.Reset();
+            header_map = nullptr;
+            stats.Reset();
+            readback.Reset();
+            sources = {};
+            constants = {};
+            offsets = {};
+            w = h = 0;
+            Unwind(b, before);
+            throw;
+        }
+    }
+    void Allocations(Pipelines &p, Budget &b) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, HeapSize,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Check(p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)),
               "live immutable descriptor heap failed");
@@ -304,18 +419,109 @@ struct GpuFrame {
             UAV(p, guides[i].Get(), 4 + i);
         }
         SRV(p, guides[3].Get(), 8);
-        header = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_UPLOAD);
+        specular_hit = Allocate(p, b, TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT));
+        header = Allocate(p, b, rrprivate::Buffer(HeaderBytes), D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RANGE empty{};
         void *m{};
         Check(header->Map(0, &empty, &m), "live association upload map failed");
         header_map = (UINT *)m;
-        memset(m, 0, 256);
-        auto bd = rrprivate::Buffer(256);
+        memset(m, 0, HeaderBytes);
+        // stats bytes (rr_live_gate.hlsl), StatsBytes long: 0 bad, 4 copied, 8 isolated, 12
+        // sanitized SSS (ReadStats); 256 non-finite color, 260 non-finite displayed output
+        // (rr_gate_stats.h, ReadFinite). The views are root UAVs.
+        auto bd = rrprivate::Buffer(StatsBytes);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         stats = Allocate(p, b, bd);
-        readback = Allocate(p, b, rrprivate::Buffer(256), D3D12_HEAP_TYPE_READBACK);
+        readback = Allocate(p, b, rrprivate::Buffer(StatsBytes), D3D12_HEAP_TYPE_READBACK);
+    }
+    // Water storage for a w x h guide: the classification and the responsivity mask.
+    static UINT64 WaterBytes(ID3D12Device *device, UINT w, UINT h) {
+        if (!device)
+            return 0;
+        const D3D12_RESOURCE_DESC descs[] = {TextureDesc(w, h, DXGI_FORMAT_R8_UNORM),
+                                             TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT)};
+        UINT64 total{};
+        for (const auto &d : descs) {
+            const auto n = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
+                return 0;
+            total += n;
+        }
+        return total;
+    }
+    // Optional water storage, after Prepare. The caller reserves the pool-wide
+    // budget first; this rechecks this frame's share and returns false on a
+    // shortage, or throws AllocationDeferred under GPU memory pressure. The
+    // controller then keeps the water mask waiting and retries later.
+    bool PrepareWater(Pipelines &p, Budget &b) {
+        if (water.ready)
+            return true;
+        const auto mask = TextureDesc(w, h, DXGI_FORMAT_R8_UNORM),
+                   value = TextureDesc(w, h, DXGI_FORMAT_R16_FLOAT);
+        UINT64 need{};
+        auto add = [&](const ComPtr<ID3D12Resource> &r, const D3D12_RESOURCE_DESC &d) {
+            if (r)
+                return true;
+            const auto n = p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || need > UINT64_MAX - n)
+                return false;
+            need += n;
+            return true;
+        };
+        if (!add(water.mask, mask) || !add(water.responsivity, value) ||
+            need > UINT64_MAX - b.bytes ||
+            !b.Reserve(p.device.Get(), b.bytes + need))
+            return false;
+        p.WaterPipeline();
+        auto take = [&](ComPtr<ID3D12Resource> &r, const D3D12_RESOURCE_DESC &d) {
+            if (r)
+                return;
+            r = Allocate(p, b, d);
+            water.bytes += p.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        };
+        take(water.mask, mask);
+        take(water.responsivity, value);
+        if (!water.heap) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+            rrprivate::CheckAllocation(
+                p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&water.heap)),
+                "water descriptor heap failed");
+        }
+        water.ready = true;
+        return true;
+    }
+    // The guide shader's u4 (heap WaterSlot): the classification, or a null view that
+    // drops its writes when the water mask is off this frame.
+    void WaterTarget(Pipelines &p, bool wanted) {
+        water_written = wanted && water.ready;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.Format = DXGI_FORMAT_R8_UNORM;
+        v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(water_written ? water.mask.Get() : nullptr, nullptr,
+                                            &v, Cpu(p, WaterSlot));
     }
 
+    // Copy-only: records no shader state. Caller proves the native dispatch,
+    // its bindings and the recording; this checks extent, format and state.
+    bool CopySpecularDistance(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *source,
+                              D3D12_RESOURCE_STATES source_state) {
+        if (!cl || !source || !specular_hit || hit_ready ||
+            !rrspecular::ValidSource(source->GetDesc(), w, h, source_state))
+            return false;
+        ComPtr<ID3D12Device> device;
+        if (FAILED(source->GetDevice(IID_PPV_ARGS(&device))) ||
+            !fg::SameNativeObject(device.Get(), p.device.Get()))
+            return false;
+        hit_source = source;
+        hit_ready = true;
+        Change(cl, source, source_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(specular_hit.Get(), source);
+        Change(cl, specular_hit.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        Change(cl, source, D3D12_RESOURCE_STATE_COPY_SOURCE, source_state);
+        return true;
+    }
     void Convert(ID3D12GraphicsCommandList *cl, Pipelines &p) {
         Order(cl);
         for (unsigned i = 2; i < 4; ++i)
@@ -323,6 +529,9 @@ struct GpuFrame {
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for (auto &r : guides)
             Change(cl, r.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (water_written)
+            Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap *heaps[] = {heap.Get()};
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetComputeRootSignature(p.converter_root.Get());
@@ -332,9 +541,13 @@ struct GpuFrame {
         for (unsigned i = 0; i < 2; ++i)
             cl->SetComputeRootConstantBufferView(2 + i,
                                                  constants[i]->GetGPUVirtualAddress() + offsets[i]);
+        cl->SetComputeRootDescriptorTable(4, Gpu(p, WaterSlot));
         cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         for (auto &r : guides)
             Change(cl, r.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        if (water_written)
+            Change(cl, water.mask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COMMON);
         for (unsigned i = 2; i < 4; ++i)
             Change(cl, sources[i].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -347,7 +560,7 @@ struct GpuFrame {
         if (!probability) {
             auto desc = rrprivate::Buffer(rrvrrt::Bytes(w, h));
             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            probability = Allocate(p, b, desc);
+            probability = Allocate(p, b, desc); // Nothing else allocated: no unwind needed.
         }
         if (!probability_heap) {
             D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
@@ -406,13 +619,34 @@ struct GpuFrame {
                    const std::array<ComPtr<ID3D12Resource>, 4> &in) {
         sr = in;
         use_depth = sr[1]->GetDesc().Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        const UINT64 before = bytes;
+        const bool had_output = bool(rr_output), had_depth = bool(depth);
+        try {
+            SRAllocations(p, b, o);
+        } catch (...) {
+            // Under GPU memory pressure: drop what this call allocated, so a later frame
+            // starts over (nothing references it yet).
+            if (!had_output) {
+                rr_output.Reset();
+                ow = oh = 0;
+            }
+            if (!had_depth) {
+                depth_buffer.Reset();
+                depth.Reset();
+            }
+            Unwind(b, before);
+            throw;
+        }
+    }
+    void SRAllocations(Pipelines &p, Budget &b, const rreval::Options &o) {
         if (rr_output)
             Require(ow == o.out_width && oh == o.out_height,
                     "live output generation was not retired before size change");
         else {
             ow = o.out_width;
             oh = o.out_height;
-            rr_output = Allocate(p, b, TextureDesc(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT));
+            rr_output = Allocate(p, b, TextureDesc(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                 D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
             SRV(p, rr_output.Get(), 9);
         }
         SRV(p, sr[0].Get(), 10);
@@ -433,7 +667,7 @@ struct GpuFrame {
             depth_buffer = Allocate(p, b, rrprivate::Buffer(size));
             auto d = TextureDesc(UINT(native.Width), native.Height, DXGI_FORMAT_R32_FLOAT);
             d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            depth = Allocate(p, b, d);
+            depth = Allocate(p, b, d, D3D12_HEAP_TYPE_DEFAULT, nullptr, true);
         }
     }
     void Depth(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES source_state) {
@@ -487,6 +721,43 @@ struct GpuFrame {
         Change(cl, rr_output.Get(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    // Fills a shared texture (weapon depth's) from this frame's inputs between GateBegin and
+    // GateEnd, where RR's depth is a shader resource. The descriptors are written on this
+    // slot's own heap before the dispatch that reads them. Leaves the texture readable by RR;
+    // TestFinish returns it to COMMON.
+    void TestPass(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12RootSignature *root,
+                  ID3D12PipelineState *pso, UINT source, ID3D12Resource *target, UINT slot,
+                  const UINT *constants, UINT count) {
+        UAV(p, target, slot);
+        Change(cl, target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(root);
+        cl->SetPipelineState(pso);
+        cl->SetComputeRootDescriptorTable(0, Gpu(p, source));
+        cl->SetComputeRootDescriptorTable(1, Gpu(p, slot));
+        cl->SetComputeRoot32BitConstants(2, count, constants, 0);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        Change(cl, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void TestFinish(ID3D12GraphicsCommandList *cl, ID3D12Resource *target) {
+        Change(cl, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+    }
+    // RR's depth (the private copy, or the game's R32_FLOAT depth) with the weapon slice
+    // remapped (R32_FLOAT, w x h), read from the depth subrect at (x, y); see
+    // rrweapondepth::Hardware.
+    void WeaponDepth(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *linear, UINT x,
+                     UINT y, const rrweapondepth::Mapping &m) {
+        SRV(p, use_depth ? depth.Get() : sr[1].Get(), DepthSource);
+        UINT c[8] = {w, h, x, y};
+        const float f[] = {m.scale, m.offset, m.sky, rrweapondepth::Knee};
+        memcpy(&c[4], f, sizeof(f));
+        TestPass(cl, p, p.weapon_root.Get(), p.weapon_depth.Get(), DepthSource, linear,
+                 WeaponTarget, c, 8);
+    }
     void GateEnd(ID3D12GraphicsCommandList *cl, Pipelines &p, ID3D12Resource *history,
                  bool inference_ok) {
         if (inference_ok) {
@@ -510,24 +781,77 @@ struct GpuFrame {
         Change(cl, history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, 8);
+        cl->CopyBufferRegion(readback.Get(), 0, stats.Get(), 0, StatsBytes);
         Change(cl, stats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
+    // SR time. Writes the responsivity mask from this frame's classification and leaves it
+    // readable for RR until WaterFinish.
+    void WaterPass(ID3D12GraphicsCommandList *cl, Pipelines &p) {
+        Require(water.ready && water_written && p.water, "water masks unavailable");
+        auto cpu = water.heap->GetCPUDescriptorHandleForHeapStart();
+        const auto gpu = water.heap->GetGPUDescriptorHandleForHeapStart();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R16_FLOAT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        p.device->CreateUnorderedAccessView(water.responsivity.Get(), nullptr, &uav, cpu);
+        uav.Format = DXGI_FORMAT_R8_UNORM;
+        p.device->CreateUnorderedAccessView(water.mask.Get(), nullptr, &uav,
+                                            {cpu.ptr + p.stride});
+        for (auto *r : {water.mask.Get(), water.responsivity.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap *heaps[] = {water.heap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetComputeRootSignature(p.water_root.Get());
+        cl->SetPipelineState(p.water.Get());
+        cl->SetComputeRootConstantBufferView(0, header->GetGPUVirtualAddress());
+        cl->SetComputeRootDescriptorTable(1, gpu);
+        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        Order(cl);
+        for (auto *r : {water.mask.Get(), water.responsivity.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    void WaterFinish(ID3D12GraphicsCommandList *cl) {
+        for (auto *r : {water.mask.Get(), water.responsivity.Get()})
+            Change(cl, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COMMON);
+    }
+    // Header words 14-15 for rr_water_masks.hlsl; Header() clears them each frame.
+    void WaterHeader(float strength, UINT flags) {
+        memcpy(&header_map[14], &strength, sizeof(strength));
+        header_map[15] = flags;
+    }
+    // tolerate: count isolated unusable guide pixels instead of rejecting the frame.
     void Header(UINT serial, bool reset, bool replacement = false, UINT color_x = 0,
-                UINT color_y = 0) {
+                UINT color_y = 0, bool tolerate = false) {
         UINT c[] = {w,       h,       ow, oh, serial, reset ? 1u : 0u, 0, 0, replacement ? 1u : 0u,
-                    color_x, color_y, 0};
+                    color_x, color_y, tolerate ? 1u : 0u, 0, 0, 0, 0};
+        static_assert(sizeof(c) <= HeaderWritten, "the header holds the gate's constants");
         memcpy(header_map, c, sizeof(c));
     }
     void Accept(bool yes) {
         header_map[6] = yes ? 1u : 0u;
     }
-    std::array<UINT, 2> ReadStats() {
+    // bad frame, copied frame, isolated guide pixels, sanitized SSS samples
+    std::array<UINT, 4> ReadStats() {
+        std::array<UINT, 4> v{};
+        void *m{};
+        D3D12_RANGE r{0, 16};
+        Check(readback->Map(0, &r, &m), "live stats map failed");
+        memcpy(v.data(), m, 16);
+        r = {0, 0};
+        readback->Unmap(0, &r);
+        return v;
+    }
+    // Pixels with a non-finite channel: in the color RR receives, in the RR output the gate
+    // displays (none if rejected or blocked).
+    static_assert(RR_STATS_NON_FINITE_OUTPUT == FiniteOffset + 4 && FiniteOffset + 8 <= StatsBytes);
+    std::array<UINT, 2> ReadFinite() {
         std::array<UINT, 2> v{};
         void *m{};
-        D3D12_RANGE r{0, 8};
-        Check(readback->Map(0, &r, &m), "live stats map failed");
-        memcpy(v.data(), m, 8);
+        D3D12_RANGE r{FiniteOffset, FiniteOffset + sizeof(v)};
+        Check(readback->Map(0, &r, &m), "live finite statistics map failed");
+        memcpy(v.data(), static_cast<const char *>(m) + FiniteOffset, sizeof(v));
         r = {0, 0};
         readback->Unmap(0, &r);
         return v;
@@ -537,12 +861,16 @@ struct GpuFrame {
         constants = {};
         sr = {};
         probability_inputs = {};
+        hit_source.Reset();
+        hit_ready = false;
+        water_written = false;
     }
     void Release(Budget &b) {
         if (header_map)
             header->Unmap(0, nullptr);
         Require(b.bytes >= bytes, "live allocation ledger underflow");
         b.bytes -= bytes;
+        coverage.Release();
         *this = {};
     }
 };

@@ -1,17 +1,26 @@
 #pragma once
 #include "rr_live_gpu.h"
 #include "rr_live_policy.h"
+#include "rr_guide_health.h"
+#include "rr_water.h"
+#include "rr_weapon_depth.h"
 #include "rr_status.h"
 #include "rr_compute_state.h"
 #include "rr_sparse_copy.h"
 #include "rr_sss_producer.h"
+#include "rr_sss_mask.h"
 #include "rr_inputs.h"
 #include "rr_internal.h"
+#include "rr_lock.h"
 #include "rr_ngx_api.h"
+#include "rr_ngx_log.h"
 #include "rr_trace.h"
 #include "rr_sr_eligibility.h"
+#include <atomic>
 #include <mutex>
 #include <deque>
+#include <initializer_list>
+#include <vector>
 namespace rrlive {
 // Private resources remain retained until native recordings retire and every
 // submitted producer and consumer completes on the tracked fence.
@@ -23,11 +32,16 @@ class Controller {
     };
     struct Slot {
         rrsss::Producer sss;
-        bool sss_used{}, awaiting_prepass{};
+        bool sss_used{}, awaiting_prepass{}, hit_used{}, water_used{};
         rrtrans::Ticket transparency;
         bool transparency_used{}, transparency_accepted{};
+        bool responsivity_used{}; // RR was given the water responsivity mask
         GpuFrame gpu;
         bool busy{};
+        // This frame's coverage captures, read by CoverageBlend in AfterSR and reset
+        // only with the slot.
+        rrblend::Ticket coverage;
+        bool blend_used{};
         ComPtr<ID3D12GraphicsCommandList> pre, sr;
         bool pre_live{}, sr_live{}, pending_sr{}, recorded{}, sealed{}, inference_ok{}, reported{},
             poisoned{};
@@ -45,7 +59,11 @@ class Controller {
         std::vector<bool> touched;
     };
     static inline thread_local std::vector<Call> submissions;
-    std::recursive_mutex mutex;
+    rrlock::Recursive mutex;
+    // An NGX call into the add-ons beneath RR is running with the lock released (Foreign).
+    bool foreign_call{};
+    // Objects a timed-out initialization left to the GPU: kept for the process.
+    std::vector<ComPtr<IUnknown>> stranded;
     std::deque<Slot> slots{6};
     Pipelines pipelines;
     Budget budget;
@@ -56,7 +74,31 @@ class Controller {
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandQueue> last_queue;
     UINT64 signaled{};
-    bool enabled{}, failed{}, initialized{}, history_queued{}, retired{};
+    bool enabled{}, failed{}, initialized{}, retired{};
+    // A new RR allocation found no GPU memory: native frames until memory_retry_after (ms), and
+    // one log line per wait.
+    ULONGLONG memory_retry_after{};
+    bool memory_logged{};
+    bool MemoryWait() {
+        if (!memory_retry_after)
+            return false;
+        if (GetTickCount64() < memory_retry_after)
+            return true;
+        memory_retry_after = 0;
+        return false;
+    }
+    void MemoryDeferred(const char *what) {
+        memory_retry_after = GetTickCount64() + 1000;
+        if (memory_logged)
+            return;
+        memory_logged = true;
+        const std::string line = std::string(what) + " waiting for GPU memory; native frames "
+                                                     "until it fits, retried every second";
+        Log(line.c_str());
+    }
+    bool replace_sr = true;      // skip the game's SR when RR can take its place (ReplaceNativeSR)
+    unsigned replace_refusals{}; // replacement frames RR refused in a row
+    bool replace_paused{};       // after 3 refusals, until the setting changes
     UINT generation{}, camera_frame = UINT_MAX, camera_view = UINT_MAX, selected_view = UINT_MAX,
                        next_serial{};
     rrtrace::CameraInfo latest;
@@ -66,35 +108,296 @@ class Controller {
     bool layout_pending{};
     rreval::Options observed_options;
     HistoryPolicy policy;
+    rrhealth::Tracker health;
+    bool tolerate_isolated = true;
+    // Weapon depth's depth copy, shared by every slot, created on first use and
+    // released by Reconfigure. It sits in the persistent ledger, so pool projections count it
+    // once, and the reserve grows by exactly its size (test_reserve, given back on release).
+    struct DevTest {
+        ComPtr<ID3D12Resource> texture;
+        bool active{};     // the latest evaluation used it
+        bool blocked{};    // no GPU memory: retried once its setting changes
+        unsigned changes{}; // the setting's change count when it was blocked
+    };
+    // weapon_test: the remapped depth copy RR reads while weapon depth is on.
+    DevTest weapon_test;
+    UINT64 test_reserve{};
+    // Weapon depth (rrweapondepth): weapon_linear is whether the current RR feature was
+    // created to read the weapon depth copy; weapon_hold says why weapon depth stays off until
+    // the setting next changes. The hold outlives Reconfigure, so weapon depth that cannot
+    // run restarts RR once, never over and over.
+    using WeaponHold = rrweapondepth::Hold;
+    bool weapon_linear{};
+    WeaponHold weapon_hold{};
+    unsigned weapon_hold_changes{};
+    rrweapondepth::Mapping weapon_logged{}; // The mapping last written to the log.
+    // Water responsivity mask (rr_water.h).
+    rrwater::Settings water;
+    rrwater::Status water_status;
+    bool water_failed{};
+    UINT64 water_retry_after{};
     bool transparency_enabled{}, transparency_failed{};
     rrtrans::Pipeline transparency_pipeline;
     ComPtr<ID3D12Resource> transparency_source;
     bool sss_enabled{}, sss_failed{};
+    UINT64 sss_retry_after{};
+    // An error turns RR or an optional guide off for a pause, not for the session: 5 s,
+    // doubling for repeats up to 60 s, back to 5 s after 5 minutes without one. RR itself
+    // restarts through Reconfigure, which waits for its outstanding GPU work and never retires
+    // a poisoned slot, so RR stays off when that work cannot be accounted for. fatal: GPU
+    // objects were stranded or NGX refused to release them, and RR stays off.
+    struct Pause {
+        UINT64 at{}, lifted{};
+        unsigned repeats{};
+        UINT64 Schedule(UINT64 now) {
+            if (now - lifted > 300000)
+                repeats = 0;
+            const UINT64 delay = (std::min)(5000ull << (std::min)(repeats, 4u), 60000ull);
+            at = now + delay;
+            return delay;
+        }
+    };
+    Pause rr_pause, sss_pause, transparency_pause, water_pause, blend_pause;
+    bool fatal{};
+    // Latest guide an admitted SR submission resolves, for SSS-masked lighting.
+    rrsssmask::Record sss_mask;
+    ComPtr<ID3D12Resource> sss_mask_guide;
+    bool hit_enabled{};
+    unsigned hit_reports{};
     HMODULE runtime{};
     UINT64 runtime_epoch{};
     ComPtr<ID3D12Device> public_device;
+    // A creation attempt's runtime, logged by Poll after it releases the mutex: module and DXGI
+    // queries never run under it. The probe pins the NGX core module.
+    struct RuntimeReport {
+        HMODULE core{};
+        ComPtr<ID3D12Device> device;
+    } runtime_report;
     rreval::Api api;
     NVSDK_NGX_Parameter *parameters{};
     NVSDK_NGX_Handle *feature{};
     rreval::Options key;
     rreval::Api (*resolve)(HMODULE) = &rreval::Api::Load;
+    // A call into NGX, where an add-on beneath RR (DLSS5 NR) may wait for another thread's NGX
+    // call, Frame Generation's, which records barriers RR observes under this lock. The call runs
+    // with every hold released. The slot being recorded stays live (sr_live), so no
+    // reconfiguration, shutdown or slot reuse retires what the call uses, and foreign_call
+    // refuses another SR call meanwhile.
+    template <class F> auto Foreign(F &&f) -> decltype(f()) {
+        struct Flag {
+            bool &v;
+            ~Flag() {
+                v = false;
+            }
+        } flag{foreign_call = true};
+        return rrlock::Released(mutex, f);
+    }
     void Log(const char *s) {
         if (logger)
             logger(s);
     }
 
-    bool Complete(const Slot &s) const {
+    // Whether a shared texture (weapon depth's) is used in this evaluation; creates it on
+    // first use. The reserve first grows by the texture's size on top of everything it
+    // already holds, so the texture never takes room the pool or the SSS and transparency
+    // guides counted on (Reconfigure gives the growth back). This needs free VRAM for the
+    // whole unused reserve, so it can stay off on a tight card; a failure only keeps it off
+    // (RR keeps running) until its setting changes.
+    bool UseTest(DevTest &t, bool wanted, unsigned changes, UINT w, UINT h, DXGI_FORMAT format,
+                 const char *name) {
+        t.active = false;
+        if (!wanted)
+            return false;
+        if (t.blocked && t.changes == changes)
+            return false;
+        t.blocked = false;
+        if (!t.texture) {
+            const auto d = TextureDesc(w, h, format);
+            const UINT64 n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            const UINT64 old = budget.limit;
+            bool ok = n && n != UINT64_MAX && old <= UINT64_MAX - n &&
+                      budget.Reserve(pipelines.device.Get(), old + n);
+            if (ok) {
+                try {
+                    // Weapon depth is the depth RR hands DLSS: announced like RR's own depth.
+                    t.texture = persistent.Allocate(pipelines, budget, d, D3D12_HEAP_TYPE_DEFAULT,
+                                                    nullptr, true);
+                    test_reserve += budget.limit - old;
+                } catch (const std::exception &) {
+                    budget.limit = old;
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                t.blocked = true;
+                t.changes = changes;
+                char line[160];
+                snprintf(line, sizeof(line),
+                         "%s: not enough GPU memory; off until its setting changes", name);
+                Log(line);
+                return false;
+            }
+        }
+        const auto d = t.texture->GetDesc();
+        if (d.Width != w || d.Height != h || d.Format != format)
+            return false;
+        return t.active = true;
+    }
+
+    template <class Prepare>
+    bool PrepareSssAllocation(UINT64 now, bool ready, Prepare prepare) {
+        // Preparation records no GPU commands. Retain partial allocations and
+        // retry them after budget pressure subsides; ready slots remain usable.
+        if (!ready && now < sss_retry_after)
+            return false;
+        try {
+            prepare();
+            if (!ready)
+                sss_retry_after = 0;
+            return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            if (!sss_retry_after)
+                Log("Subsurface Scattering guide waiting for GPU memory; allocation will retry");
+            sss_retry_after = now + 1000;
+            return false;
+        }
+    }
+    // The mandatory depth copy for a w x h input, as the SSS and glass
+    // reservations protect it.
+    UINT64 DepthCopyBytes(UINT w, UINT h) const {
+        if (!pipelines.device)
+            return 0;
+        auto texture = TextureDesc(w, h, DXGI_FORMAT_R32_FLOAT);
+        texture.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto buffer = rrprivate::Buffer(((UINT64(w) * 4 + 255) & ~255ull) * h);
+        UINT64 total{};
+        for (const auto &d : {texture, buffer}) {
+            const auto n = pipelines.device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+            if (!n || n == UINT64_MAX || total > UINT64_MAX - n)
+                return 0;
+            total += n;
+        }
+        return total;
+    }
+    // Water storage is optional and all or nothing: a slot runs the water mask
+    // only while every prepared slot holds the storage, so RR never sees them
+    // switch on and off from frame to frame. Like the SSS storage it waits for
+    // a mandatory SR allocation, then reserves the whole pool with water
+    // storage on every slot plus the prepass and depth copy the SSS and glass
+    // reservations protect, so no later mandatory reservation needs more memory
+    // because of it. A slot used for the first time later gets its storage at
+    // that first prepass. A budget or memory shortage leaves the water mask
+    // waiting and retries a second later; any other failure turns them off for
+    // the session instead of turning RR off.
+    bool PrepareWater(GpuFrame &frame, UINT64 now) {
+        bool complete = frame.water.ready, warm = frame.rr_output != nullptr;
+        for (const auto &s : slots) {
+            complete = complete && (!s.gpu.heap || s.gpu.water.ready);
+            warm = warm || s.gpu.rr_output != nullptr;
+        }
+        if (complete)
+            return true;
+        if (!warm || now < water_retry_after)
+            return false;
+        try {
+            const auto need = GpuFrame::WaterBytes(pipelines.device.Get(), frame.w, frame.h);
+            const auto depth = need ? DepthCopyBytes(frame.w, frame.h) : 0;
+            bool ready = depth && ReservePool(slots.size(), nullptr, nullptr, frame.w, frame.h,
+                                              0, need, depth);
+            for (auto &s : slots)
+                if (ready && s.gpu.heap && !s.gpu.water.ready)
+                    ready = s.gpu.PrepareWater(pipelines, budget);
+            if (ready) {
+                water_retry_after = 0;
+                return true;
+            }
+            if (!water_retry_after)
+                Log("Water mask waiting for GPU budget; allocation will retry");
+        } catch (const rrprivate::AllocationDeferred &) {
+            if (!water_retry_after)
+                Log("Water mask waiting for GPU memory; allocation will retry");
+        } catch (const std::exception &e) {
+            water_failed = true;
+            const std::string line = std::string("Water mask unavailable: ") + e.what();
+            Log(line.c_str());
+            return false;
+        }
+        water_retry_after = now + 1000;
+        return false;
+    }
+    // done is the fence's completed value, which PollLocked reads once for every slot.
+    bool Complete(const Slot &s, UINT64 done) const {
         if (s.poisoned)
             return false;
         if (!s.fence_value)
             return !s.sealed;
-        const auto v = fence->GetCompletedValue();
-        return v != UINT64_MAX && v >= s.fence_value;
+        return done != UINT64_MAX && done >= s.fence_value;
     }
-    void Failure(const char *why) {
+    bool Complete(const Slot &s) const {
+        return Complete(s, (s.poisoned || !s.fence_value) ? 0 : fence->GetCompletedValue());
+    }
+    void Failure(const char *why, bool permanent = false) {
+        const bool first = !failed;
         failed = true;
+        fatal |= permanent;
+        // A poisoned slot never retires: its GPU work is unaccounted for.
+        for (const auto &s : slots)
+            fatal |= s.poisoned;
         policy.Reject();
-        Log(why);
+        if (!first || fatal || retired) {
+            Log(why);
+            return;
+        }
+        char line[320];
+        snprintf(line, sizeof(line), "%s; RR restarts in %llu s", why,
+                 (unsigned long long)(rr_pause.Schedule(GetTickCount64()) / 1000));
+        Log(line);
+    }
+    // At a native rendering boundary: restart RR once its pause is over and every slot retires.
+    bool Recover() {
+        if (!failed)
+            return true;
+        const UINT64 now = GetTickCount64();
+        if (fatal || retired || !rr_pause.at || now < rr_pause.at)
+            return false;
+        layout_pending = true;
+        if (!Reconfigure() || fatal)
+            return false;
+        failed = false;
+        rr_pause.at = 0;
+        rr_pause.lifted = now;
+        ++rr_pause.repeats;
+        Log("RR restarted after an error");
+        return true;
+    }
+    // In PollLocked: an optional guide turned off by an error comes back after its pause.
+    void Resume(bool &off, Pause &p, UINT64 now, const char *what) {
+        if (!off)
+            return;
+        if (!p.at) {
+            p.Schedule(now);
+            return;
+        }
+        if (now < p.at)
+            return;
+        off = false;
+        p.at = 0;
+        p.lifted = now;
+        ++p.repeats;
+        char line[128];
+        snprintf(line, sizeof(line), "%s: retrying after an error", what);
+        Log(line);
+    }
+    // A failed retirement call logs its NGX result; a missing export has none.
+    bool RetirementFailed(const char *what, bool exported, NVSDK_NGX_Result result) {
+        char line[160];
+        if (exported)
+            snprintf(line, sizeof(line), "%s (%s); allocations retained", what,
+                     rrngxlog::Code(result).text);
+        else
+            snprintf(line, sizeof(line), "%s (export missing); allocations retained", what);
+        Failure(line, true);
+        return false;
     }
     void Initialize(ID3D12Device *d) {
         if (initialized) {
@@ -102,6 +405,23 @@ class Controller {
                     "live device generation was not retired before device change");
             return;
         }
+        const UINT64 before = persistent.bytes;
+        try {
+            InitializeLocked(d);
+        } catch (...) {
+            // Under GPU memory pressure, for one: back to uninitialized, so a later frame
+            // initializes from the start.
+            history.Reset();
+            zero.Reset();
+            persistent.Unwind(budget, before);
+            init_list.Reset();
+            init_allocator.Reset();
+            fence.Reset();
+            pipelines = {};
+            throw;
+        }
+    }
+    void InitializeLocked(ID3D12Device *d) {
         pipelines.Initialize(d);
         auto bd = rrprivate::Buffer(256);
         bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -126,10 +446,64 @@ class Controller {
         Check(init_list->Close(), "live init close failed");
         Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
               "live timeline fence failed");
+        // Clear the history on a private queue and wait for it here, not from inside the
+        // game's ExecuteCommandLists: a nested submission there can reach a compute queue, and
+        // another add-on's submit hook (DLSS5 NR's) loses track of the outer submission.
+        ComPtr<ID3D12CommandQueue> setup_queue;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        Check(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&setup_queue)), "live init queue failed");
+        ComPtr<ID3D12Fence> setup_fence;
+        Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&setup_fence)),
+              "live init fence failed");
+        {
+            rrinternal::Scope guard;
+            ID3D12CommandList *setup = init_list.Get();
+            setup_queue->ExecuteCommandLists(1, &setup);
+        }
+        Check(setup_queue->Signal(setup_fence.Get(), 1), "live init signal failed");
+        if (!rrprivate::FencePoint{setup_fence, 1}.Wait(5000)) {
+            // The GPU may still run the clear: what it uses is never released, and RR stays off.
+            for (IUnknown *object : std::initializer_list<IUnknown *>{
+                     history.Get(), zero.Get(), init_list.Get(), init_allocator.Get(),
+                     setup_queue.Get(), setup_fence.Get()})
+                stranded.emplace_back(object);
+            failed = true;
+            fatal = true;
+            throw std::runtime_error("live init unfinished; RR off");
+        }
         initialized = true;
     }
     bool NeedsReconfigure() const {
-        return layout_pending || (preset.has_effective && preset.desired != preset.effective);
+        return layout_pending || (preset.has_effective && preset.desired != preset.effective) ||
+               (feature && weapon_linear != WeaponDepthWanted());
+    }
+    // The weapon depth setting, unless held off since its last change. RR's depth
+    // type is fixed at creation, so a new feature takes it and a change restarts RR.
+    bool WeaponDepthWanted() const {
+        return rrweapondepth::enabled.load(std::memory_order_relaxed) &&
+               (weapon_hold == WeaponHold::None ||
+                weapon_hold_changes != rrweapondepth::changes.load(std::memory_order_relaxed));
+    }
+    // outcome (Refused): why NGX refused, an rrngxlog::Code text, "null handle" or "threw".
+    void HoldWeaponDepth(WeaponHold why, unsigned changes, const char *outcome = nullptr) {
+        // Frames already in flight on the same RR repeat the same hold: log it once.
+        if (weapon_hold == why && weapon_hold_changes == changes)
+            return;
+        weapon_hold = why;
+        weapon_hold_changes = changes;
+        // UseTest already logged a memory failure.
+        if (why == WeaponHold::Projection)
+            Log("Weapon depth: the game's projection is not supported; off until "
+                "the setting changes, RR runs without it");
+        else if (why == WeaponHold::Refused) {
+            char line[200];
+            snprintf(line, sizeof(line),
+                     "Weapon depth: RR failed with the weapon depth copy%s%s%s; off until the "
+                     "setting changes, RR runs without it",
+                     outcome ? " (" : "", outcome ? outcome : "", outcome ? ")" : "");
+            Log(line);
+        }
     }
     void QueueReconfigure() {
         layout_pending = true;
@@ -141,12 +515,15 @@ class Controller {
     bool Reconfigure() {
         if (!NeedsReconfigure())
             return true;
+        if (foreign_call)
+            return false;
         for (const auto &s : slots)
             if (!rrpreset::CanRetire(
-                    s.poisoned, s.pre_live, s.sr_live, s.sss.live, s.transparency.Live(),
-                    s.pending_sr, s.recorded && !s.sealed && s.sr_live,
+                    s.poisoned, s.pre_live, s.sr_live, s.sss.live,
+                    s.transparency.Live() || s.coverage.Live(), s.pending_sr,
+                    s.recorded && !s.sealed && s.sr_live,
                     (s.pre_submitted || s.sss.submitted || s.transparency.prep_submitted ||
-                     s.transparency.anchor_submitted) &&
+                     s.transparency.anchor_submitted || s.coverage.submitted) &&
                         !s.fence_value,
                     Complete(s)))
                 return false;
@@ -158,27 +535,38 @@ class Controller {
         rrinternal::Scope copies;
         rrcompute::Tracker::Internal state;
         if (feature) {
-            if (!api.release || NVSDK_NGX_FAILED(api.release(feature))) {
-                Failure("RR feature retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.release != nullptr;
+            const auto r = exported ? api.release(feature) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR feature retirement failed", exported, r);
             feature = nullptr;
             preset.Retired();
         }
         if (parameters) {
-            if (!api.destroy || NVSDK_NGX_FAILED(api.destroy(parameters))) {
-                Failure("RR parameter retirement failed; allocations retained");
-                return false;
-            }
+            const bool exported = api.destroy != nullptr;
+            const auto r = exported ? api.destroy(parameters) : NVSDK_NGX_Result_Fail;
+            if (!exported || NVSDK_NGX_FAILED(r))
+                return RetirementFailed("RR parameter retirement failed", exported, r);
             parameters = nullptr;
         }
         for (auto &s : slots) {
             s.gpu.Release(budget);
             s = {};
         }
+        water_retry_after = 0;
+        sss_mask = {};
+        sss_mask_guide.Reset();
         history.Reset();
         zero.Reset();
         persistent.Release(budget);
+        // The weapon depth texture was in the persistent ledger; give back the reserve it added
+        // (test_reserve, saturating), never below what is still allocated.
+        weapon_test = {};
+        weapon_linear = false;
+        weapon_logged = {};
+        budget.limit = (std::max)(
+            {Budget::Minimum, budget.bytes, budget.limit - (std::min)(test_reserve, budget.limit)});
+        test_reserve = 0;
         init_list.Reset();
         init_allocator.Reset();
         fence.Reset();
@@ -187,7 +575,8 @@ class Controller {
         transparency_pipeline = {};
         transparency_source.Reset();
         transparency_composition = {};
-        initialized = history_queued = false;
+        CoverageReconfigured();
+        initialized = false;
         signaled = 0;
         runtime = nullptr;
         runtime_epoch = 0;
@@ -196,7 +585,7 @@ class Controller {
         selected_view = UINT_MAX;
         key = {};
         if (++generation == 0) {
-            Failure("RR feature generation overflow");
+            Failure("RR feature generation overflow", true);
             return false;
         }
         status.Reset(generation);
@@ -224,19 +613,28 @@ class Controller {
         return result;
     }
     void PollLocked() {
+        // One read for both checks of every slot, so a slot never retires a frame it did not
+        // report. Only a signaled slot has a fence value, and only with a fence.
+        const UINT64 done = fence ? fence->GetCompletedValue() : 0;
         for (auto &s : slots) {
-            if (s.recorded && s.sealed && !s.reported && Complete(s)) {
-                auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 2>{1, 0};
+            if (s.recorded && s.sealed && !s.reported && Complete(s, done)) {
+                auto v = s.gate_recorded ? s.gpu.ReadStats() : std::array<UINT, 4>{1, 0, 0, 0};
                 s.reported = true;
+                // After reported, as the readers below: a failed map is then reported once.
+                const auto finite = s.gate_recorded ? s.gpu.ReadFinite() : std::array<UINT, 2>{};
+                const bool sss = s.sss_used && s.sss.admission.accepted;
+                const bool glass = s.transparency_used && s.transparency_accepted;
+                // A frame whose gate never ran never reached RR: no guide counts for it.
+                health.Frame(v, {finite[0], finite[1], sss, glass, s.gate_recorded && s.hit_used,
+                                 s.gate_recorded && s.responsivity_used});
                 status.Completed(s.serial, s.generation, GetTickCount64(), v[0] == 0 && v[1] != 0,
-                                 s.sss_used && s.sss.admission.accepted,
-                                 s.transparency_used && s.transparency_accepted, s.replaced_sr);
+                                 sss, glass, s.replaced_sr, s.hit_used);
                 if (v[0] || !v[1]) {
                     policy.Reject();
                 }
             }
             if (s.busy && !s.pre_live && !s.sr_live && !s.sss.live && !s.transparency.Live() &&
-                !s.pending_sr && Complete(s)) {
+                !s.pending_sr && Complete(s, done)) {
                 auto cache = std::move(s.gpu);
                 cache.Retire();
                 s = {};
@@ -244,26 +642,188 @@ class Controller {
                 s.busy = false;
             }
         }
+        const UINT64 now = GetTickCount64();
+        Resume(sss_failed, sss_pause, now, "Subsurface Scattering guide");
+        Resume(transparency_failed, transparency_pause, now, "Transparency guide");
+        Resume(water_failed, water_pause, now, "Water responsivity mask");
+        Resume(blend_failed, blend_pause, now, "Transparency albedo blend");
+        std::string report;
+        if (health.Report(now, report))
+            Log(report.c_str());
     }
+    // A submitted SR recording that resolves its guide hands it to later
+    // SSS-masked lighting if admitted. A rejected one writes zeros, so a record
+    // of that same guide is dropped. A discarded recording never gets here.
+    void SealSssMask(const Slot &s, bool accepted) {
+        if (accepted) {
+            sss_mask = {true, s.frame, s.generation, s.gpu.w, s.gpu.h};
+            sss_mask_guide = s.gpu.sss.guide;
+        } else if (sss_mask_guide && sss_mask_guide == s.gpu.sss.guide) {
+            sss_mask = {};
+            sss_mask_guide.Reset();
+        }
+    }
+
 #include "rr_live_pool.inl"
   public:
     explicit Controller(rreval::Api (*loader)(HMODULE) = &rreval::Api::Load) : resolve(loader) {}
 #include "rr_live_transparency.inl"
+#include "rr_live_coverage.inl"
 
     bool SssEnabled() {
         std::lock_guard lock(mutex);
         return sss_enabled;
     }
+    // Isolated unusable guide pixels are counted instead of rejecting the frame.
+    void SetTolerateIsolated(bool value) {
+        std::lock_guard lock(mutex);
+        tolerate_isolated = value;
+    }
+    // Weapon depth state for the panel. Restarting: RR is being recreated with the
+    // depth type the setting asks for (the change takes effect once in-flight frames retire).
+    enum class WeaponState { Off, Active, Waiting, Restarting, NoMemory, Unsupported, Refused };
+    WeaponState WeaponDepthState() {
+        std::lock_guard lock(mutex);
+        const bool running = enabled && !failed && !retired && feature;
+        if (!rrweapondepth::enabled.load(std::memory_order_relaxed))
+            return running && weapon_linear ? WeaponState::Restarting : WeaponState::Off;
+        if (!WeaponDepthWanted())
+            return weapon_hold == WeaponHold::Memory       ? WeaponState::NoMemory
+                   : weapon_hold == WeaponHold::Projection ? WeaponState::Unsupported
+                                                           : WeaponState::Refused;
+        if (!running)
+            return WeaponState::Waiting;
+        if (!weapon_linear)
+            return WeaponState::Restarting;
+        return weapon_test.active ? WeaponState::Active : WeaponState::Waiting;
+    }
+    bool Running() {
+        std::lock_guard lock(mutex);
+        return enabled && !failed && !retired && feature;
+    }
+    // Water responsivity mask (rr_water.h). Nothing is allocated or sent to RR until it
+    // is wanted; then each slot keeps its water storage until the next rebuild
+    // (Reconfigure), like the SSS storage. It applies from the first prepass that has
+    // that storage. A nonzero colour subrect origin drops it, as it drops the SSS and
+    // glass guides.
+    void SetWater(const rrwater::Settings &value) {
+        std::lock_guard lock(mutex);
+        water = value;
+        water.strength = rrwater::Clamp(value.strength);
+        if (!WaterWanted())
+            water_retry_after = 0;
+    }
+    // The water classification is wanted this frame: the preset RR runs, or the one it
+    // is being recreated with.
+    bool WaterWanted() const {
+        return rrwater::Wanted(water,
+                               (preset.has_effective ? preset.effective : preset.desired) == 6);
+    }
+    // What the latest evaluation sent, limited to what would still be sent now.
+    rrwater::Status WaterStatus() {
+        std::lock_guard lock(mutex);
+        auto v = water_status;
+        v.wanted = WaterWanted();
+        v.unavailable = water_failed;
+        const bool live = v.wanted && enabled && !failed && !retired && !water_failed;
+        v.waiting_memory = live && water_retry_after != 0;
+        v.ready = v.ready && live;
+        v.responsivity = v.responsivity && v.ready &&
+                         rrwater::UseResponsivity(water, true, preset.has_effective,
+                                                  preset.effective);
+        return v;
+    }
     void SetSssEnabled(bool value) {
         std::lock_guard lock(mutex);
         if (sss_enabled != value) {
             sss_enabled = value;
+            sss_mask = {};
+            sss_mask_guide.Reset();
             policy.Reject();
         }
+    }
+    // The SSS guide an SSS-masked first spatial pass on cl's frame reads, or null
+    // for raw lighting; age is how many frames older it is. A guide is resolved
+    // after its own frame's first spatial pass, so this is an earlier frame's,
+    // submitted before cl; that recording leaves it COMMON.
+    ComPtr<ID3D12Resource> SssMask(ID3D12GraphicsCommandList *cl, unsigned *age = nullptr) {
+        std::lock_guard lock(mutex);
+        if (!sss_enabled || sss_failed || !sss_mask_guide)
+            return {};
+        const Slot *match{};
+        for (const auto &s : slots)
+            if (RawSlot(s, cl) && s.native_sampling) {
+                if (match)
+                    return {};
+                match = &s;
+            }
+        if (!match ||
+            !rrsssmask::Usable(sss_mask, match->frame, generation, match->gpu.w, match->gpu.h))
+            return {};
+        if (age)
+            *age = match->frame - sss_mask.frame;
+        return sss_mask_guide;
     }
     void ToggleSss() {
         std::lock_guard lock(mutex);
         SetSssEnabled(!sss_enabled);
+    }
+    bool SpecularHitEnabled() {
+        std::lock_guard lock(mutex);
+        return hit_enabled;
+    }
+    void SetSpecularHitEnabled(bool value) {
+        std::lock_guard lock(mutex);
+        if (hit_enabled != value) {
+            hit_enabled = value;
+            policy.Reject();
+        }
+    }
+    bool PrepassSurface(ID3D12GraphicsCommandList *cl, ID3D12Resource *surface) {
+        std::lock_guard lock(mutex);
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.gpu.sources[3].Get() == surface)
+                return true;
+        return false;
+    }
+    // The native distance blur runs after the prepass on the same recording and
+    // reads that prepass's PackedSurface. Only a copy is recorded; the caller has
+    // proven the dispatch, tables, views and the source's tracked state.
+    bool SpecularDistance(ID3D12GraphicsCommandList *cl, ID3D12Resource *surface,
+                          ID3D12Resource *source, D3D12_RESOURCE_STATES source_state) {
+        std::lock_guard lock(mutex);
+        if (!enabled || !hit_enabled || failed || retired || !cl || !surface || !source)
+            return false;
+        Slot *match{};
+        for (auto &s : slots)
+            if (RawSlot(s, cl) && s.gpu.sources[3].Get() == surface) {
+                if (match)
+                    return false;
+                match = &s;
+            }
+        if (!match)
+            return false;
+        try {
+            rrinternal::Scope copy_guard;
+            rrcompute::Tracker::Internal state_guard;
+            const bool copied =
+                match->gpu.CopySpecularDistance(cl, pipelines, source, source_state);
+            if (hit_reports < 2) {
+                ++hit_reports;
+                const auto d = source->GetDesc();
+                char line[192];
+                snprintf(line, sizeof(line),
+                         "Specular hit distance %s: source=%llux%u format=%u state=0x%x "
+                         "guides=%ux%u",
+                         copied ? "copied" : "rejected", d.Width, d.Height, unsigned(d.Format),
+                         unsigned(source_state), match->gpu.w, match->gpu.h);
+                Log(line);
+            }
+            return copied;
+        } catch (const std::exception &e) {
+            Failure(e.what());
+            return false;
+        }
     }
 
     bool OwnedSssDraw(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *variant,
@@ -327,15 +887,17 @@ class Controller {
             if (!s.gpu.rr_output) {
                 return false;
             }
-            UINT64 base = 0, depth = 0;
+            UINT64 base = 0, depth = 0, water_bytes = 0;
             for (const auto &slot : slots) {
                 UINT64 b{}, d{};
                 if (!SlotReservationParts(pipelines.device.Get(), slot.gpu, budget.limit, b, d) ||
-                    b < slot.gpu.sss.bytes)
+                    b < slot.gpu.sss.bytes || b - slot.gpu.sss.bytes < slot.gpu.water.bytes)
                     return false;
-                base = (std::max)(base, b - slot.gpu.sss.bytes);
+                base = (std::max)(base, b - slot.gpu.sss.bytes - slot.gpu.water.bytes);
                 depth = (std::max)(depth, d);
+                water_bytes = (std::max)(water_bytes, slot.gpu.water.bytes);
             }
+            const UINT64 kept = persistent.bytes;
             auto texture = TextureDesc(s.gpu.w, s.gpu.h, DXGI_FORMAT_R32_FLOAT);
             texture.Flags = D3D12_RESOURCE_FLAG_NONE;
             auto buffer = rrprivate::Buffer(((UINT64(s.gpu.w) * 4 + 255) & ~255ull) * s.gpu.h);
@@ -350,11 +912,12 @@ class Controller {
             UINT64 required{};
             const auto optional_sss = rrsss::Gpu::RequiredBytes(pipelines.device.Get(), s.gpu.w,
                                                                 s.gpu.h, stencil.samples);
-            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, 0,
-                                        persistent.bytes, required) ||
+            // Water storage (rr_water.h) takes the otherwise unused hit term.
+            if (!rrtrans::RequiredSlots(slots.size(), base, depth, optional_sss, 0, water_bytes,
+                                        kept, required) ||
                 !budget.Reserve(pipelines.device.Get(), required) ||
-                !rrsss::FitsOwnedBudget(base, depth, persistent.bytes, optional_sss, 0,
-                                        budget.limit, slots.size())) {
+                !rrsss::FitsOwnedBudget(base, depth, kept, optional_sss, water_bytes, budget.limit,
+                                        slots.size())) {
                 return false;
             }
         }
@@ -364,7 +927,10 @@ class Controller {
             Check(cl->GetDevice(IID_PPV_ARGS(&d)), "SSS producer device missing");
             Require(fg::SameNativeObject(d.Get(), pipelines.device.Get()),
                     "SSS producer device mismatch");
-            s.gpu.sss.Prepare(s.gpu, pipelines, budget, stencil.samples);
+            if (!PrepareSssAllocation(GetTickCount64(), s.gpu.sss.ready, [&] {
+                    s.gpu.sss.Prepare(s.gpu, pipelines, budget, stencil.samples);
+                }))
+                return false;
             if (early) {
                 s.busy = true;
                 s.awaiting_prepass = true;
@@ -408,16 +974,35 @@ class Controller {
     }
     void (*logger)(const char *){};
     bool (*lighting_valid)(UINT64, UINT64){};
+  private:
+    bool LightingValid(const Slot &s) const {
+        return s.raw_corrected && lighting_valid && lighting_valid(s.lighting_device, s.lighting_revision);
+    }
+  public:
 
     rrstatus::Snapshot Status() {
         std::lock_guard lock(mutex);
         return status.Read({enabled, sss_enabled, transparency_enabled, failed, retired, sss_failed,
-                            transparency_failed},
+                            transparency_failed, hit_enabled},
                            GetTickCount64());
     }
     bool Enabled() {
         std::lock_guard lock(mutex);
         return enabled;
+    }
+    // Native SR history is reset when its evaluations resume (rrtrace::Probe).
+    // Changing the setting also clears a pause after refused replacement frames.
+    void SetReplaceSR(bool value) {
+        std::lock_guard lock(mutex);
+        if (replace_sr == value)
+            return;
+        replace_sr = value;
+        replace_paused = false;
+        replace_refusals = 0;
+    }
+    bool ReplaceSRPaused() {
+        std::lock_guard lock(mutex);
+        return replace_sr && replace_paused;
     }
     void SetEnabled(bool value) {
         std::lock_guard lock(mutex);
@@ -425,7 +1010,7 @@ class Controller {
             return;
         enabled = value;
         if (++generation == 0) {
-            Failure("RR enable generation overflow");
+            Failure("RR enable generation overflow", true);
             return;
         }
         status.Reset(generation);
@@ -457,12 +1042,22 @@ class Controller {
     }
 
     void Poll() {
-        std::lock_guard lock(mutex);
-        try {
-            PollLocked();
-        } catch (const std::exception &e) {
-            Failure(e.what());
+        RuntimeReport report;
+        {
+            std::lock_guard lock(mutex);
+            try {
+                PollLocked();
+            } catch (const std::exception &e) {
+                Failure(e.what());
+            }
+            report = std::exchange(runtime_report, {});
         }
+        if (report.core)
+            try {
+                Log(rrngxlog::RuntimeLine(report.core, report.device.Get()).c_str());
+            } catch (...) {
+                // A line that cannot be built is dropped: nothing may escape into ReShade.
+            }
     }
     // All native identity/binding/view/constant/context proofs are required at
     // the call site. Prepare completes before dispatch; once native dispatch is
@@ -473,11 +1068,13 @@ class Controller {
                  const std::array<UINT64, 2> &offsets, const rrcompute::Snapshot &restore, UINT x,
                  UINT y, UINT z) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired)
+        if (!enabled || retired)
             return false;
         bool dispatched = false;
         try {
             PollLocked();
+            if (!Recover())
+                return false;
             if (!restore.valid || !restore.heap_restore_valid || restore.command != cl ||
                 camera_frame == UINT_MAX || camera_view == UINT_MAX || !latest.readable ||
                 !latest.basis_valid || !latest.projection_valid ||
@@ -536,16 +1133,39 @@ class Controller {
             }
             ComPtr<ID3D12Device> d;
             Check(cl->GetDevice(IID_PPV_ARGS(&d)), "live prepass device missing");
-            Initialize(d.Get());
             const auto guide_extent = textures[3]->GetDesc();
-            Require(
-                guide_extent.Width <= UINT_MAX &&
-                    (free->gpu.heap || ReservePool(slots.size(), nullptr, nullptr,
-                                                   UINT(guide_extent.Width), guide_extent.Height)),
-                "live prepass pool exceeds available GPU budget");
+            Require(guide_extent.Width <= UINT_MAX, "live prepass guide extent unsupported");
             auto &s = *free;
+            // Only a new slot (or a new RR) allocates. Under GPU memory pressure (another
+            // add-on's VRAM, for one) Initialize and Prepare leave nothing behind, this frame
+            // stays native and a later one retries.
+            const bool fresh = !initialized || !s.gpu.heap;
+            if (fresh && MemoryWait()) {
+                status.Fallback(generation, GetTickCount64());
+                policy.Reject();
+                return false;
+            }
+            try {
+                Initialize(d.Get());
+                if (!s.gpu.heap && !ReservePool(slots.size(), nullptr, nullptr,
+                                                UINT(guide_extent.Width), guide_extent.Height))
+                    throw rrprivate::AllocationDeferred();
+                s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+                if (fresh) {
+                    memory_logged = false;
+                    ReserveSlots(s, textures, cb, offsets);
+                }
+            } catch (const rrprivate::AllocationDeferred &) {
+                MemoryDeferred("RR frame slot");
+                status.Fallback(generation, GetTickCount64());
+                policy.Reject();
+                return false;
+            }
             s.busy = true;
-            s.gpu.Prepare(pipelines, budget, textures, cb, offsets);
+            // A null classification view unless a water test wants it this frame.
+            // The guide mode follows it, so every water test waits and fails together.
+            s.gpu.WaterTarget(pipelines, WaterWanted() && !water_failed &&
+                                             PrepareWater(s.gpu, GetTickCount64()));
             s.pre = cl;
             s.pre_live = true;
             s.awaiting_prepass = false;
@@ -612,6 +1232,8 @@ class Controller {
             }
         if (!match)
             return false;
+        if (!match->gpu.probability && MemoryWait())
+            return false;
         try {
             rrinternal::Scope copies;
             rrcompute::Tracker::Internal state;
@@ -619,6 +1241,9 @@ class Controller {
             restore.Restore(cl, true);
             match->native_sampling = true;
             return true;
+        } catch (const rrprivate::AllocationDeferred &) {
+            MemoryDeferred("RR sampling buffer"); // Allocated before anything is recorded.
+            return false;
         } catch (const std::exception &e) {
             Failure(e.what());
             return false;
@@ -638,10 +1263,12 @@ class Controller {
     bool SamplingReady(ID3D12GraphicsCommandList *cl) {
         return bool(SamplingData(cl).buffer);
     }
-    bool RawWasCorrected(ID3D12GraphicsCommandList *cl) {
+    // Only while the correction still holds: a proof skipped later in the recording (rrbypass::Skip)
+    // leaves the native filters running for the frame RR will reject.
+    bool RawSpatialPassthrough(ID3D12GraphicsCommandList *cl) {
         std::lock_guard lock(mutex);
         for (auto &s : slots)
-            if (RawSlot(s, cl) && s.raw_corrected)
+            if (RawSlot(s, cl) && LightingValid(s))
                 return true;
         return false;
     }
@@ -669,9 +1296,11 @@ class Controller {
             return;
         }
         try {
-            Require(safe && s->raw_corrected && lighting_valid &&
-                        lighting_valid(s->lighting_device, s->lighting_revision),
-                    "RR SR rejected: raw lighting correction or pipeline revision unproven");
+            // A refused call must not leave an earlier call's list and states to match.
+            s->pending_sr = false;
+            s->states = {};
+            Require(safe && LightingValid(*s),
+                    "RR SR rejected: lighting route or pipeline revision unproven");
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
             Require(bool(cl), "live native SR list missing");
             s->options = actual;
@@ -717,28 +1346,78 @@ class Controller {
                       rrtrace::SlCall scope, HMODULE mod, UINT64 epoch, bool safe,
                       rrsparsecopy::Layouts &layouts) {
         std::lock_guard lock(mutex);
-        if (!enabled || failed || retired || NeedsReconfigure() || !safe || !scope.valid)
+        // Each refusal names itself for the health line (rrsr::counters).
+        const auto skip = [this](unsigned why) {
+            rrsr::Note(why);
+            if (why != rrsr::Rejected)
+                replace_refusals = 0; // an SR call between refusals: not in a row
             return false;
+        };
+        if (!replace_sr || replace_paused)
+            return skip(rrsr::Off);
+        if (foreign_call)
+            return skip(rrsr::Scope);
+        if (!enabled)
+            return skip(rrsr::Disabled);
+        if (failed || retired)
+            return skip(rrsr::Failed);
+        if (NeedsReconfigure())
+            return skip(rrsr::Reconfigure);
+        if (!safe)
+            return skip(rrsr::Unsafe);
+        if (!scope.valid)
+            return skip(rrsr::Scope);
         auto native = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
         auto *s = Match(scope);
-        if (!native || !s || !s->pending_sr || s->sr.Get() != native.Get())
-            return false;
+        if (!s || !s->pending_sr)
+            return skip(rrsr::Scope);
+        if (!native || s->sr.Get() != native.Get())
+            return skip(rrsr::List);
+        if (!rrsr::ReplaceUnderForeignHook && rrtrace::Probe::ForeignBeneath())
+            return skip(rrsr::Foreign);
         rrsr::StateProof proof;
+        bool untracked = false;
         for (unsigned i = 0; i < 4; ++i) {
             proof.resources[i] = reinterpret_cast<uintptr_t>(s->gpu.sr[i].Get());
-            proof.known[i] = layouts.Get(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            const auto seen = layouts.Status(native.Get(), s->gpu.sr[i].Get(), proof.states[i]);
+            proof.known[i] = seen == rrsparsecopy::Layouts::Seen::Known;
+            untracked |= seen == rrsparsecopy::Layouts::Seen::Untracked;
         }
-        if (!rrsr::Eligible(proof))
-            return false;
+        // Only an input no barrier on this list named may take the contract state: one whose
+        // transition was split, per subresource or unrecorded has no state RR can start from.
+        const bool eligible = !untracked && rrsr::Eligible(proof);
+        if (untracked)
+            return skip(rrsr::Untracked);
+        if (!eligible)
+            return skip(rrsr::Ineligible);
+        // An input the list never named stays unknown: AfterSR takes its contract state.
         for (unsigned i = 0; i < 4; ++i)
-            s->states[i] = {proof.states[i], true, true};
-        return AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true);
+            if (proof.known[i])
+                s->states[i] = {proof.states[i], true, true};
+        if (!AfterSR(public_cl, p, scope, NVSDK_NGX_Result_Success, mod, epoch, safe, true)) {
+            // Waiting for GPU memory is no refusal: native SR upscales the frame meanwhile.
+            if (memory_retry_after)
+                return skip(rrsr::Memory);
+            // A refused frame loses RR (native SR runs, AfterSR does not run again), so a
+            // check that keeps refusing pauses replacement until the setting changes.
+            if (++replace_refusals == 3) {
+                replace_paused = true;
+                Log("SR replacement off: RR refused 3 replacement frames in a row (reason "
+                    "above); the game's SR runs until the setting is turned off and on");
+            }
+            return skip(rrsr::Rejected);
+        }
+        replace_refusals = 0;
+        rrsr::Note(rrsr::None);
+        return true;
     }
     bool AfterSR(ID3D12GraphicsCommandList *public_cl, const NVSDK_NGX_Parameter *p,
                  rrtrace::SlCall scope, NVSDK_NGX_Result result, HMODULE mod, UINT64 epoch,
                  bool safe, bool replacement = false) {
 
         std::lock_guard lock(mutex);
+        if (foreign_call)
+            return false;
         Slot *s{};
         for (auto &v : slots)
             if (v.pending_sr && v.frame == scope.frame && v.viewport == scope.viewport) {
@@ -755,13 +1434,21 @@ class Controller {
             return false;
         try {
             auto cl = fg::NativeObject<ID3D12GraphicsCommandList>(public_cl);
-            Require(s->raw_corrected && lighting_valid &&
-                        lighting_valid(s->lighting_device, s->lighting_revision) && safe &&
+            Require(LightingValid(*s) && safe &&
                         NVSDK_NGX_SUCCEED(result) && cl.Get() == s->sr.Get() && scope.valid &&
                         scope.feature == sl::kFeatureDLSS && mod,
                     "live original SR failed or scope changed");
             ComPtr<ID3D12Device> pub;
             Check(public_cl->GetDevice(IID_PPV_ARGS(&pub)), "live public device missing");
+            if (rrsr::ReplaceUnderForeignHook && !pipelines.announced &&
+                fg::SameNativeObject(pub.Get(), pipelines.device.Get())) {
+                pipelines.announced = pub;
+                Log(pub.Get() != fg::NativeObject<ID3D12Device>(pub.Get()).Get()
+                        ? "RR's output and depth are created through ReShade's device, announced "
+                          "to other add-ons"
+                        : "RR's output and depth are created on the native device: other add-ons "
+                          "are not told of them");
+            }
             if (!Key(s->options, mod, epoch, pub.Get(), scope.viewport)) {
                 QueueReconfigure();
                 return false;
@@ -814,11 +1501,7 @@ class Controller {
             std::array<D3D12_RESOURCE_STATES, 3> states;
             for (unsigned i = 0; i < 3; ++i) {
                 auto &v = s->states[i];
-                constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                Require(!v.known || (v.complete &&
-                                     (v.state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) &&
-                                     !(v.state & ~read)),
+                Require(!v.known || (v.complete && rrsr::ReadOnly(v.state)),
                         "live post-SR observed input state conflicts");
                 states[i] = v.known ? v.state : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             }
@@ -832,11 +1515,26 @@ class Controller {
                     return false;
                 }
             }
-            if (!s->gpu.rr_output ||
-                (native_depth.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && !s->gpu.depth))
-                Require(ReservePool(slots.size(), &o, &native_depth),
-                        "live frame pool exceeds available GPU budget");
-            s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+            const bool sr_allocates =
+                !s->gpu.rr_output ||
+                (native_depth.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT && !s->gpu.depth);
+            if (sr_allocates && MemoryWait()) {
+                policy.Reject();
+                return false;
+            }
+            try {
+                if (sr_allocates && !ReservePool(slots.size(), &o, &native_depth))
+                    throw rrprivate::AllocationDeferred();
+                s->gpu.PrepareSR(pipelines, budget, o, sr_inputs);
+                if (sr_allocates) {
+                    memory_logged = false;
+                    ReserveOutputs(*s, o, sr_inputs);
+                }
+            } catch (const rrprivate::AllocationDeferred &) {
+                MemoryDeferred("RR output");
+                policy.Reject();
+                return false;
+            }
             Require(next_serial < UINT_MAX, "live serial overflow");
             s->serial = ++next_serial;
             const unsigned availability = !sss_enabled               ? 0
@@ -862,9 +1560,41 @@ class Controller {
 
             // An optional per-evaluation hint may be NULL without invalidating native
             // radiance/history. Explicit toggles and real frame rejection still Reject.
+            s->hit_used = hit_enabled && s->gpu.hit_ready && s->gpu.specular_hit &&
+                          !o.color_x && !o.color_y;
+            // The water mask reads the classification this slot's prepass wrote.
+            s->water_used = WaterWanted() && !water_failed && s->gpu.water_written &&
+                            !o.color_x && !o.color_y;
+
+            auto projection = s->projection;
+            // Weapon depth: RR's depth type is fixed when RR is created, so a frame follows
+            // the feature's type and a new feature takes the setting's (rrweapondepth::Choose).
+            // The weapon slice is remapped with the projection RR is given.
+            const auto weapon_changes = rrweapondepth::changes.load(std::memory_order_relaxed);
+            const bool weapon_wanted = WeaponDepthWanted();
+            rrweapondepth::Mapping weapon_map;
+            const bool weapon_mapped =
+                rrweapondepth::Wants(feature, weapon_linear, weapon_wanted) &&
+                rrweapondepth::Map(projection, weapon_map);
+            const bool weapon_texture =
+                UseTest(weapon_test, weapon_mapped, weapon_changes, s->gpu.w, s->gpu.h,
+                        DXGI_FORMAT_R32_FLOAT, "Weapon depth");
+            const auto weapon_frame =
+                rrweapondepth::Choose(feature, weapon_linear, weapon_wanted, weapon_mapped,
+                                      weapon_texture, weapon_test.blocked);
+            bool weapon_on = weapon_frame.linear;
+            if (weapon_frame.hold != WeaponHold::None)
+                HoldWeaponDepth(weapon_frame.hold, weapon_changes);
+            if (weapon_frame.restart) {
+                QueueReconfigure();
+                return false;
+            }
+
             const bool reset =
                 policy.Next(s->frame, s->generation, o.reset == 1 || s->camera.reset == 1);
-            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y);
+            if (reset)
+                health.Reset(policy.LastReason());
+            s->gpu.Header(s->serial, reset, replacement, o.color_x, o.color_y, tolerate_isolated);
             rrinternal::Scope copy_guard;
             rrcompute::Tracker::Internal state_guard;
             s->recorded = true;
@@ -872,22 +1602,54 @@ class Controller {
                 runtime = mod;
                 runtime_epoch = epoch;
                 public_device = pub;
+                // Logged by the next Poll whether or not this attempt creates RR.
+                runtime_report = {mod, pub};
                 selected_view = scope.viewport;
                 key = o;
                 api = resolve(mod);
                 Require(api.Valid(), "live NGX exports missing");
-                Require(NVSDK_NGX_SUCCEED(api.allocate(&parameters)) && parameters,
-                        "live NGX parameter allocation failed");
-                rreval::CreateParameters(*parameters, o, preset.desired);
-                Require(rrpreset::Requested(*parameters, preset.desired),
+                const auto allocated = api.allocate(&parameters);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(allocated) && parameters,
+                                  "live NGX parameter allocation failed",
+                                  rrngxlog::Returned(allocated, parameters));
+                // The preset RR is created with: a request during the creation call below waits
+                // for the next RR.
+                const auto created_preset = preset.desired;
+                rreval::CreateParameters(*parameters, o, created_preset);
+                Require(rrpreset::Requested(*parameters, created_preset),
                         "live RR preset parameter readback failed");
-                auto created = api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction,
-                                          parameters, &feature);
-                Require(NVSDK_NGX_SUCCEED(created) && feature, "live RR feature creation failed");
-                preset.Created();
+                NVSDK_NGX_Handle *created_feature{};
+                auto created = Foreign([&] {
+                    return api.create(public_cl, NVSDK_NGX_Feature_RayReconstruction, parameters,
+                                      &created_feature);
+                });
+                feature = created_feature;
+                char line[200];
+                rrngxlog::CapabilityLine(api, line, sizeof(line));
+                Log(line);
+                rrngxlog::Require(NVSDK_NGX_SUCCEED(created) && feature,
+                                  "live RR feature creation failed",
+                                  rrngxlog::Returned(created, feature));
+                preset.Created(created_preset);
+                weapon_linear = weapon_on;
+                rrngxlog::DescribeCreation(o, created_preset, line, sizeof(line));
+                Log(line);
+                if (weapon_on)
+                    Log("Weapon depth: on (RR reads the weapon-remapped depth copy)");
             }
+            // Water responsivity mask, written by WaterPass below.
+            const bool water_responsivity = rrwater::UseResponsivity(
+                water, s->water_used, preset.has_effective, preset.effective);
+            if (s->water_used)
+                s->gpu.WaterHeader(rrwater::Clamp(water.strength),
+                                   rrwater::Flags(water_responsivity));
+            water_status = {};
+            water_status.ready = s->water_used;
+            water_status.responsivity = water_responsivity;
             rreval::Resources resources{s->gpu.sr[0].Get(),
-                                        s->gpu.use_depth ? s->gpu.depth.Get() : s->gpu.sr[1].Get(),
+                                        weapon_on          ? weapon_test.texture.Get()
+                                        : s->gpu.use_depth ? s->gpu.depth.Get()
+                                                           : s->gpu.sr[1].Get(),
                                         s->gpu.sr[2].Get(),
                                         s->gpu.rr_output.Get(),
                                         s->gpu.guides[0].Get(),
@@ -895,9 +1657,29 @@ class Controller {
                                         s->gpu.guides[2].Get(),
                                         s->sss_used ? s->gpu.sss.guide.Get() : nullptr,
                                         s->transparency_used ? s->gpu.transparency.guide.Get()
-                                                             : nullptr};
-            rreval::EvaluateParameters(*parameters, o, resources, s->view.data(),
-                                       s->projection.data());
+                                                             : nullptr,
+                                        water_responsivity ? s->gpu.water.responsivity.Get()
+                                                           : nullptr,
+                                        s->hit_used ? s->gpu.specular_hit.Get() : nullptr};
+            s->responsivity_used = resources.responsivity != nullptr;
+            // The weapon depth copy is read at its own origin.
+            auto evaluated = o;
+            if (weapon_on)
+                evaluated.depth_x = evaluated.depth_y = 0;
+            if (weapon_on && (weapon_map.scale != weapon_logged.scale ||
+                              weapon_map.offset != weapon_logged.offset ||
+                              weapon_map.sky != weapon_logged.sky)) {
+                weapon_logged = weapon_map;
+                char line[224];
+                snprintf(line, sizeof(line),
+                         "Weapon depth: world depth %.7g / (depth + %.7g), sky %.7g, weapon "
+                         "slice in front of %.7g",
+                         weapon_map.scale, weapon_map.offset, weapon_map.sky,
+                         weapon_map.scale / (1 + weapon_map.offset));
+                Log(line);
+            }
+            rreval::EvaluateParameters(*parameters, evaluated, resources, s->view.data(),
+                                       projection.data());
             parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
             s->gpu.Depth(cl.Get(), states[1]);
             for (unsigned i = 0; i < 3; ++i)
@@ -909,16 +1691,35 @@ class Controller {
                 s->gpu.sss.Resolve(cl.Get(), pipelines, s->gpu.header.Get(), s->gpu.stats.Get(),
                                    history.Get());
             }
+            CoverageBlend(*s, cl.Get(), o.width, o.height);
             if (s->transparency_used)
                 s->gpu.transparency.Resolve(cl.Get(), transparency_pipeline, s->gpu.header.Get());
+            if (s->water_used)
+                s->gpu.WaterPass(cl.Get(), pipelines);
+            if (s->hit_used)
+                Change(cl.Get(), s->gpu.specular_hit.Get(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (weapon_on)
+                s->gpu.WeaponDepth(cl.Get(), pipelines, weapon_test.texture.Get(), o.depth_x,
+                                   o.depth_y, weapon_map);
 
             NVSDK_NGX_Result evaluated_result = NVSDK_NGX_Result_FAIL_PlatformError;
+            bool threw = false; // then evaluated_result is the sentinel above, not NGX's
             try {
-                evaluated_result = api.evaluate(public_cl, feature, parameters, nullptr);
+                evaluated_result =
+                    Foreign([&] { return api.evaluate(public_cl, feature, parameters, nullptr); });
             } catch (...) {
+                threw = true;
                 Log("RR evaluation threw; restoring resources for native SR");
             }
             s->inference_ok = NVSDK_NGX_SUCCEED(evaluated_result);
+            if (s->hit_used)
+                Change(cl.Get(), s->gpu.specular_hit.Get(),
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            if (weapon_test.active)
+                s->gpu.TestFinish(cl.Get(), weapon_test.texture.Get());
+            if (s->water_used)
+                s->gpu.WaterFinish(cl.Get());
             if (s->transparency_used)
                 s->gpu.transparency.Finish(cl.Get());
             if (s->sss_used)
@@ -931,8 +1732,21 @@ class Controller {
                     Change(cl.Get(), s->gpu.sr[i].Get(),
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, states[i], 0);
             s->recorded = true;
-            if (!s->inference_ok)
-                Failure("RR inference failed; native SR retained");
+            if (!s->inference_ok) {
+                const rrngxlog::Code code(evaluated_result);
+                const char *outcome = threw ? "threw" : code.text;
+                // A linear-depth RR that fails: restart it with hardware depth rather than
+                // turning RR off.
+                if (weapon_on) {
+                    HoldWeaponDepth(WeaponHold::Refused, weapon_changes, outcome);
+                    QueueReconfigure();
+                } else {
+                    char line[128];
+                    snprintf(line, sizeof(line), "RR inference failed (%s); native SR retained",
+                             outcome);
+                    Failure(line);
+                }
+            }
             return s->inference_ok;
         } catch (const std::exception &e) {
             Failure(e.what());
@@ -950,6 +1764,7 @@ class Controller {
                 s.transparency.prep_live = false;
             if (s.transparency.anchor.Get() == cl)
                 s.transparency.anchor_live = false;
+            CoverageReset(s, cl);
             if (s.sr.Get() == cl) {
                 s.sr_live = false;
                 s.pending_sr = false;
@@ -968,7 +1783,7 @@ class Controller {
         submissions.back().locked = true;
         submissions.back().touched.resize(slots.size());
         std::vector<int> pre(slots.size(), -1), producer(pre), consumer(pre), glass_pre(pre),
-            glass_anchor(pre);
+            glass_anchor(pre), cover(pre);
         bool any = false;
         auto index = [&](ID3D12CommandList *c) { return rrsss::RecordingIndex(n, lists, c); };
         for (unsigned k = 0; k < slots.size(); ++k) {
@@ -978,9 +1793,10 @@ class Controller {
             consumer[k] = s.sr_live ? index(s.sr.Get()) : -1;
             glass_pre[k] = s.transparency.prep_live ? index(s.transparency.preparation.Get()) : -1;
             glass_anchor[k] = s.transparency.anchor_live ? index(s.transparency.anchor.Get()) : -1;
+            cover[k] = s.coverage.Live() ? index(s.coverage.capture.Get()) : -1;
             if (rrsss::Present(pre[k]) || rrsss::Present(producer[k]) ||
                 rrsss::Present(consumer[k]) || rrsss::Present(glass_pre[k]) ||
-                rrsss::Present(glass_anchor[k])) {
+                rrsss::Present(glass_anchor[k]) || rrsss::Present(cover[k])) {
                 submissions.back().touched[k] = true;
                 any = true;
             }
@@ -996,14 +1812,6 @@ class Controller {
             if (last_queue && last_queue.Get() != q && signaled) {
                 const auto wait_result = q->Wait(fence.Get(), signaled);
                 Check(wait_result, "live cross-queue GPU wait failed");
-            }
-            if (!history_queued) {
-                rrinternal::Scope guard;
-                ID3D12CommandList *setup = init_list.Get();
-                {
-                    q->ExecuteCommandLists(1, &setup);
-                }
-                history_queued = true;
             }
             last_queue = q;
             queue_ready = q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1022,13 +1830,14 @@ class Controller {
                 s.sealed = true;
                 const bool baseline = queue_ready && a >= 0 && b >= a && !s.pre_submitted &&
                                       !failed && s.gate_recorded && s.inference_ok &&
-                                      s.raw_corrected && lighting_valid &&
-                                      lighting_valid(s.lighting_device, s.lighting_revision);
+                                      LightingValid(s);
                 const bool sss_accept =
                     s.sss_used && s.sss.written &&
                     rrsss::Admit(a, c, b, s.pre_submitted, s.sss.submitted, baseline);
                 s.sss.admission.Seal(b, sss_accept);
                 s.gpu.header_map[7] = sss_accept ? 1u : 0u;
+                if (s.sss_used)
+                    SealSssMask(s, sss_accept);
                 s.transparency_accepted =
                     s.transparency_used && s.transparency.written && s.transparency.anchored &&
                     (s.transparency.producer_copy
@@ -1042,10 +1851,14 @@ class Controller {
                          : rrtrans::Admit(a, glass_pre[k], glass_anchor[k], b,
                                           s.transparency.prep_submitted,
                                           s.transparency.anchor_submitted, baseline));
-                if (s.transparency_used && s.transparency.producer_copy &&
-                    !s.transparency_accepted) {
-                    transparency_producer_suspended = true;
+                if (s.transparency_used && s.transparency.producer_copy) {
+                    if (s.transparency_accepted)
+                        transparency_backoff = 0;
+                    else if (!transparency_producer_suspended)
+                        SuspendTransparencyProducer(nullptr);
                 }
+                // Never part of acceptance: an unadmitted blend only reads no coverage.
+                SealCoverage(s, a, cover[k], b, baseline);
                 const bool accepted = baseline && (!s.sss_used || sss_accept) &&
                                       (!s.transparency_used || s.transparency_accepted);
                 s.gpu.Accept(accepted);
@@ -1065,6 +1878,8 @@ class Controller {
                 s.transparency.prep_submitted = true;
             if (rrsss::Present(glass_anchor[k]))
                 s.transparency.anchor_submitted = true;
+            if (rrsss::Present(cover[k]))
+                s.coverage.submitted = true;
         }
     }
     void After(ID3D12CommandQueue *q) {
@@ -1102,16 +1917,20 @@ class Controller {
         if (runtime != mod || (d && !fg::SameNativeObject(public_device.Get(), d)))
             return true;
         enabled = false;
+        if (foreign_call) {
+            Log("RR shutdown deferred: an RR evaluation is in NGX");
+            return false;
+        }
         for (const auto &s : slots)
             if (s.poisoned || s.pre_live || s.sr_live || s.sss.live || s.transparency.Live() ||
-                s.pending_sr) {
+                s.coverage.Live() || s.pending_sr) {
                 Log("RR shutdown deferred: an RR command recording remains replayable; "
                     "reset/dispose required");
                 return false;
             }
         rrprivate::FencePoint point{fence, signaled};
         if (!point.Wait(30000)) {
-            Failure("RR shutdown deferred: live GPU inference unfinished");
+            Failure("RR shutdown deferred: live GPU inference unfinished", true);
             return false;
         }
         return true;

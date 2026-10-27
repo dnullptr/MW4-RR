@@ -54,21 +54,35 @@ def main():
 
     header(out / 'rr_sparse.generated.h', [
         ('RRSpatialPassthrough', compile_hlsl('rr_spatial_passthrough.hlsl', 'rr_spatial_passthrough'), True)])
+    header(out / 'rr_transparency_blend.generated.h', [
+        ('RRTransparencyBlend', compile_hlsl('rr_transparency_blend.hlsl', 'rr_transparency_blend'), False)])
     header(out / 'rr_vrrt_native.generated.h', [
         ('RRVrrtProbability', compile_hlsl('rr_vrrt_probability.hlsl', 'rr_vrrt_probability', flags=('-Ges',)), False),
         ('RRVrrtScale', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt', flags=('-Ges',)), False),
-        ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False)])
-
+        ('RRVrrtScaleFloat', compile_hlsl('rr_sparse_scale_vrrt.hlsl', 'rr_sparse_scale_vrrt_float', flags=('-Ges', '-D', 'RR_PACKED_FLOAT=1')), False),
+        # SSS lighting (src/rr_lighting_source.h SssHistory2): on SSS pixels lobe 2 from native
+        # temporal wherever it has history, else fresh unboosted, else this frame's spatial mean.
+        *[(f'RRVrrtScaleSssHistory2{suffix}',
+           compile_hlsl('rr_sparse_scale_vrrt.hlsl', f'rr_sparse_scale_vrrt{leaf}_ssshistory2',
+                        flags=('-Ges', '-D', 'RR_NATIVE_LOBE=2', '-D', 'RR_NATIVE_FILL=1',
+                               '-D', 'RR_SSS_MASK=1', '-D', 'RR_FILL_HISTORY=1',
+                               '-D', 'RR_FILL_SPATIAL=1', '-D', 'RR_FILL_PREFER_NATIVE=1',
+                               *extra)), False)
+          for suffix, leaf, extra in (('', '', ()), ('Float', '_float', ('-D', 'RR_PACKED_FLOAT=1')))]])
     header(out / 'sss-owned-shader/rr_sss_deinterleave.generated.h', [
         ('RRSSSDeinterleave', compile_hlsl('rr_sss_deinterleave.hlsl', 'rr_sss_deinterleave'), False)])
     header(out / 'sss-owned-shader/rr_sss_stencil.generated.h', [
         ('RRSSSStencilVS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_vs', 'vs_6_0', 'vs'), False),
         ('RRSSSStencilPS', compile_hlsl('rr_sss_stencil.hlsl', 'rr_sss_stencil_ps', 'ps_6_0', 'ps'), False)])
+    # Water responsivity mask (src/rr_water.h).
+    header(out / 'rr_water_masks.generated.h', [
+        ('RRWaterMasks', compile_hlsl('rr_water_masks.hlsl', 'rr_water_masks'), False)])
     for source, entry, symbol, leaf in [
         ('rr_convert_guides.hlsl', 'main', 'RRGuideShader', 'rr_convert_guides'),
         ('rr_live_gate.hlsl', 'BeginFrame', 'RRLiveBegin', 'rr_live_begin'),
         ('rr_live_gate.hlsl', 'Validate', 'RRLiveValidate', 'rr_live_validate'),
-        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display')]:
+        ('rr_live_gate.hlsl', 'Display', 'RRLiveDisplay', 'rr_live_display'),
+        ('rr_weapon_depth.hlsl', 'main', 'RRWeaponDepth', 'rr_weapon_depth')]:
         subprocess.run(['fxc', '/nologo', '/T', 'cs_5_0', '/E', entry,
                         '/Fh', str(out / (leaf + '.generated.h')), '/Vn', symbol,
                         str(ROOT / 'shaders' / source)], check=True)

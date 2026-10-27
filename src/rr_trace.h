@@ -25,6 +25,8 @@
 #include <atomic>
 #include "rr_trace_model.h"
 #include "rr_sr_reset.h"
+#include "rr_sr_eligibility.h"
+#include "rr_foreign_hook.h"
 #include <optional>
 
 namespace rrtrace {
@@ -356,6 +358,14 @@ class Probe {
     static HMODULE CurrentRuntime() {
         return current_runtime;
     }
+    // Another add-on hooked NGX evaluation before RR (rrforeign::Beneath): it sees only the
+    // calls RR passes down, so RR keeps the game's SR call. Set once, read lock-free.
+    static bool ForeignBeneath() {
+        return foreign_beneath.load(std::memory_order_acquire);
+    }
+    static const char *ForeignOwner() {
+        return ForeignBeneath() ? foreign_owner : "";
+    }
     static CreationInfo CurrentCreation() {
         return current_creation;
     }
@@ -393,6 +403,16 @@ class Probe {
         if (create)
             installed =
                 Hook(create, CreateHooks()[n], reinterpret_cast<void **>(&s.create)) || installed;
+        if (eval && module) {
+            char owner[64]{};
+            if (rrforeign::Beneath(eval, module, owner, sizeof(owner)) &&
+                !foreign_beneath.exchange(true)) {
+                strncpy_s(foreign_owner, owner[0] ? owner : "unknown code", _TRUNCATE);
+                Log("DLSS evaluation was hooked before RR by %s; RR's output and depth are "
+                    "announced to it",
+                    foreign_owner);
+            }
+        }
         if (eval)
             installed = Hook(eval, EvalHooks()[n], reinterpret_cast<void **>(&s.eval)) || installed;
         if (eval_c && eval_c != eval)
@@ -458,8 +478,7 @@ class Probe {
                     wcscmp(leaf, L"_nvngx.dll") == 0 || wcscmp(leaf, L"nvngx.dll") == 0;
                 const bool sr =
                     wcscmp(leaf, L"nvngx_dlss.dll") == 0 || wcsstr(path, L"\\ngx\\models\\dlss\\");
-                const bool rr = wcscmp(leaf, L"nvngx_dlssd.dll") == 0 ||
-                                wcsstr(path, L"\\ngx\\models\\dlssd\\");
+                const bool rr = RrModelPath(path);
                 const bool slmod = wcscmp(leaf, L"sl.interposer.dll") == 0;
                 if (!core && !sr && !rr && !slmod)
                     continue;
@@ -509,6 +528,8 @@ class Probe {
     static inline thread_local HMODULE current_runtime{};
     static inline thread_local CreationInfo current_creation{};
     static inline std::atomic<uint64_t> runtime_epoch{};
+    static inline std::atomic<bool> foreign_beneath{};
+    static inline char foreign_owner[64]{};
     std::mutex poll_mutex;
     bool ready{};
     ULONGLONG last_poll{};
@@ -632,10 +653,14 @@ class Probe {
                 self->Log("pre-evaluate observer failed; original NGX call preserved");
             }
         std::optional<rrsr::ResetParameter> reset_parameter;
+        if (kind == Kind::SR && self->replace_evaluate && (cb || !creation.valid))
+            rrsr::Note(cb ? rrsr::Callback : rrsr::Creation);
         if (kind == Kind::SR && !cb && creation.valid && self->replace_evaluate) {
             try {
                 rrsr::ResetParameter availability(p);
                 NVSDK_NGX_Result replacement_result = NVSDK_NGX_Result_FAIL_PlatformError;
+                if (!availability.Ready())
+                    rrsr::Note(rrsr::Reset);
                 if (availability.Ready() && self->replace_evaluate(cl, p, replacement_result) &&
                     NVSDK_NGX_SUCCEED(replacement_result)) {
                     std::lock_guard lock(self->mutex);
